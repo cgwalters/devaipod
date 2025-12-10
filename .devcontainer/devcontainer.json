@@ -1,0 +1,39 @@
+{
+  "name": "devaipod-dev",
+  "image": "localhost/devaipod:latest",
+  "runArgs": [
+    "--privileged"
+  ],
+  "mounts": [
+    {
+      "source": "${localEnv:HOME}/.config/gcloud",
+      "target": "/home/devenv/.config/gcloud",
+      "type": "bind"
+    }
+  ],
+  "containerEnv": {
+    "GOOGLE_CLOUD_PROJECT": "${localEnv:GOOGLE_CLOUD_PROJECT}"
+  },
+  "secrets": {
+    "GEMINI_API_KEY": {
+      "description": "API key for Google Gemini (used by opencode)"
+    },
+    "GOOGLE_API_KEY": {
+      "description": "Google API key (alternative for Gemini)"
+    }
+  },
+  "postCreateCommand": {
+    "devenv-init": "sudo /usr/local/bin/devenv-init.sh || echo 'devenv-init failed (may be expected in some environments)'"
+  },
+  "remoteUser": "devenv",
+  "remoteEnv": {
+    "PATH": "${containerEnv:PATH}:/usr/local/cargo/bin"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  }
+}

@@ -1,0 +1,85 @@
+# devaipod
+
+**Sandboxed AI coding agents in reproducible dev environments**
+
+Run AI agents with confidence: your code in a devcontainer, the agent in an additional sandbox with only the access it needs.
+
+## Quick Start
+
+```bash
+# Build
+git clone https://github.com/cgwalters/devc && cd devc
+podman build -t localhost/devaipod:latest -f .devcontainer/Containerfile .
+cargo build --release
+
+# Configure (Vertex AI example)
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+devpod context set-options -o DOTFILES_URL=https://github.com/your/dotfiles
+
+# Run
+./target/release/devaipod run --git . "find typos in the docs"
+```
+
+See [Secret Management](docs/secrets.md) for detailed setup instructions.
+
+## How It Works
+
+devaipod combines [DevPod](https://devpod.sh/) with [bubblewrap](https://github.com/containers/bubblewrap) sandboxing:
+
+1. **DevPod** creates a reproducible devcontainer with your code
+2. **bubblewrap** runs the AI agent in a minimal sandbox inside that container
+
+The agent can read your code and propose changes, but can't access your credentials or modify system files. Network access is currently unrestricted (needed for LLM API calls).
+
+## Usage
+
+```bash
+# Run on local repo
+devaipod run --git . "explain the main function"
+
+# Run on GitHub issue (auto-clones repo)
+devaipod run --issue https://github.com/org/repo/issues/123
+
+# Allow agent to create PRs in specific repos
+devaipod run --git . --repo owner/repo "fix the bug and create a PR"
+```
+
+Inside a devcontainer:
+```bash
+devaipod tmux    # Split view: agent + shell
+devaipod enter   # Shell into sandbox
+```
+
+## Security
+
+The sandbox isolates the agent from:
+- Your home directory credentials (SSH keys, tokens, etc.)
+- System files (read-only `/usr`, `/etc`, `/lib`)
+- Other processes (PID namespace isolation)
+
+The agent can only write to:
+- The workspace (`/workspaces/<name>`)
+- Its isolated home (`$HOME/ai` mounted over `$HOME`)
+
+For controlled operations (like creating PRs), the agent uses an upcall mechanism with allowlisted binaries (`gh-restricted`). See [Sandboxing Model](docs/sandboxing.md) for details.
+
+## Status
+
+**Early MVP** - Core sandboxing works.
+
+| Feature | Status |
+|---------|--------|
+| Sandbox isolation | ✅ Working |
+| GitHub PR creation (draft) | ✅ Working |
+| Network isolation | 🟡 Not yet (full network access) |
+
+## Documentation
+
+- [Sandboxing Model](docs/sandboxing.md) - How the bwrap sandbox works
+- [Secret Management](docs/secrets.md) - Handling API keys and credentials
+- [OpenCode Agent](docs/opencode.md) - Configuring the default AI agent
+
+## License
+
+Apache-2.0 OR MIT
