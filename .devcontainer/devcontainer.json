@@ -1,0 +1,25 @@
+{
+  "name": "devc-devenv",
+  "image": "ghcr.io/bootc-dev/devenv-debian",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "golang.Go"
+      ]
+    }
+  },
+  "features": {},
+  "runArgs": [
+    "--privileged"
+  ],
+  "containerUser": "root",
+  "postCreateCommand": {
+    "devenv-init": "/usr/local/bin/devenv-init.sh || true"
+  },
+  "remoteEnv": {
+    "PATH": "${containerEnv:PATH}:/usr/local/cargo/bin"
+  }
+}
+

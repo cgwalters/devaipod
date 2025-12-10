@@ -1,0 +1,45 @@
+schemaVersion: 2.2.0
+metadata:
+  name: devc-devenv
+  version: 1.0.0
+  description: Development environment for aidevc
+
+components:
+  - name: devenv
+    container:
+      image: ghcr.io/bootc-dev/devenv-debian
+      command: ['/bin/bash']
+      args: ['-c', 'sleep infinity']
+      # mountSources defaults to true per devfile 2.x spec
+      env:
+        - name: PATH
+          value: /usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # Equivalent to devcontainer's --privileged
+      # Note: This requires container.podman.io/privileged annotation in practice
+
+commands:
+  - id: init
+    exec:
+      component: devenv
+      commandLine: /usr/local/bin/devenv-init.sh || true
+      group:
+        kind: run
+        isDefault: false
+
+  - id: build
+    exec:
+      component: devenv
+      commandLine: cargo build
+      workingDir: ${PROJECT_SOURCE}
+      group:
+        kind: build
+        isDefault: true
+
+  - id: test
+    exec:
+      component: devenv
+      commandLine: cargo test
+      workingDir: ${PROJECT_SOURCE}
+      group:
+        kind: test
+        isDefault: true

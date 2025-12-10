@@ -1,0 +1,35 @@
+[workspace]
+members = [".", "crates/integration-tests"]
+
+[package]
+name = "devc"
+version = "0.1.0"
+edition = "2021"
+description = "Opinionated devcontainer and devfile workflow manager with git worktree integration"
+repository = "https://github.com/cgwalters/aidevc"
+readme = "README.md"
+keywords = ["devcontainer", "devfile", "worktree", "development", "containers"]
+categories = ["development-tools", "command-line-utilities"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+color-eyre = "0.6"
+comfy-table = "7"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0"
+terminal_size = "0.4"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "forbid"

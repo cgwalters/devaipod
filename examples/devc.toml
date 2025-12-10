@@ -1,0 +1,39 @@
+# Example devc configuration file
+# Place this at ~/.config/devc.toml
+
+[sidecar]
+# Enable sidecar container by default
+enabled = false
+
+# Default sidecar image
+image = "ghcr.io/block/goose:latest"
+
+# Mount sources as read-only in sidecar
+mount_sources_readonly = true
+
+# Named sidecar profiles
+[sidecar.profiles.goose]
+image = "ghcr.io/block/goose:latest"
+mount_sources_readonly = true
+
+[sidecar.profiles.custom]
+image = "docker.io/my-sidecar:latest"
+mount_sources_readonly = false
+
+# Secret mappings
+# These map podman secrets to environment variables in containers
+
+[secrets.anthropic]
+secret = "anthropic-key"
+env = "ANTHROPIC_API_KEY"
+container = "sidecar"  # Options: main, sidecar, all
+
+[secrets.github]
+secret = "github-token"
+env = "GITHUB_TOKEN"
+container = "all"
+
+[secrets.openai]
+secret = "openai-key"
+env = "OPENAI_API_KEY"
+container = "main"  # Default if not specified
