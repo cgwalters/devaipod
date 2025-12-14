@@ -1,10 +1,68 @@
-# devc - Opinionated devcontainer and devfile runner
+# devc - Opinionated devcontainer and devfile runner with support for agentic AI
 
-`devc` is an opinionated CLI wrapper for running development containers using
+This project make it easy to spawn multiple concurrent isolated containers
+locally, each with their own git worktree building on the
 [devcontainer](https://containers.dev/) or [devfile](https://devfile.io/)
 specifications via the Docker/Podman API.
 
-## Rationale
+There is explicit design for having a "sidecar" container run an agentic AI tool
+of your choice (Goose, Gemini CLI, Claude Code, etc.) but with more restricted capabilities
+such as read-only access to a git forge by default.
+
+## devc vs agentic CLIs
+
+Some agentic AI CLI tools like Gemini CLI and Claude Code implement their own sandboxing.
+But the provided environment is still really important - and container images
+are a great way to ensure that humans, CI and AI tools have reproducible
+environments. The devcontainer and devfile specifications already exist and
+so this project uses them.
+
+Also, `devc` aims to have a very streamlined experience for managing credentials
+provided to these environments.
+
+## devc vs IDEs
+
+There are a huge variety of IDEs with container and AI capability. For example,
+Zed has integrated remote conections and AI tooling. VS Code (or one of its forks)
+has support for "remote connections" and a wide variety of FOSS (and proprietary)
+agentic AI GUIs.
+
+But devc is oriented around the idea of defaulting to asynchonous lightweight agentic AI
+invocation each with their own more fully sandboxed environment that may run
+to completion on a specific task:
+
+```
+$ devc new https://github.com/org/repo/issue/1234
+```
+
+would (depending on your configuration) spawn an isolated AI tool to work on that
+issue autonomously. But you can still `devc enter` and interact with the agent
+on the CLI, or edit the code.
+
+Further, it is a goal for `devc` to natively support IDEs that have remote connections
+such as Zed, VS Code, etc. 
+
+A simple way to say this is that most IDEs are designed for working on one task
+at once. devc is more designed to default to having many (5, 10, or even more)
+more parallel sessions that run with full autonomy by default.
+
+Now, some IDEs like Cursor are also aiming to support features like this,
+e.g. [Cursor worktrees](https://cursor.com/docs/configuration/worktrees).
+
+## Model
+
+Each devc session defaults to cloning a git repository and having an arbitarry
+description.
+
+```
+$ devc new -E https://github.com/org/repo "work on issue 1234"
+```
+
+The `-E` option automatically runs `devc enter` on the resulting container.
+If you have configured
+A tmux interface is spawned with two panes
+This 
+
 
 The [devcontainer CLI](https://github.com/devcontainers/cli) is pretty raw, and there isn't a standalone podman/docker implementation for devfile.
 
@@ -137,25 +195,10 @@ Future goals include exploring unprivileged alternatives using:
 - Custom seccomp profiles
 - Podman socket forwarding from host
 
-### KVM/Virtualization Support
+### Defaults to mounting `/dev/kvm`
 
-When creating containers with devfiles, `devc` automatically detects and passes
-through `/dev/kvm` for hardware virtualization support. This is essential for
-bootc workflows and other use cases that require running VMs inside containers.
-
-Behavior:
-- **Automatic detection**: If `/dev/kvm` exists on the host, it's automatically
-  bound to the container via `--device /dev/kvm`
-- **Disable with flag**: Use `--no-kvm` to disable automatic KVM device binding:
-  ```bash
-  devc new my-workspace --no-kvm
-  devc run-ephemeral --no-kvm
-  ```
-- **Logging**: When KVM is passed through, a log message confirms:
-  `Passing through /dev/kvm for virtualization support`
-
-This feature works seamlessly with privileged containers and enables running
-QEMU/KVM-based workloads inside development environments.
+Spawned containers always have `/dev/kvm` - the rationale here is the KVM device is very
+safe.
 
 ### Secret Passthrough
 
