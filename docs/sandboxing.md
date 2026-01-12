@@ -87,3 +87,6 @@ The agent connects to `/run/devaipod.sock` and can execute binaries from `/usr/l
 - `gh-restricted`: Configurable GitHub CLI wrapper. Set `allow-read-all = true` in 
   `~/.config/gh-restricted.toml` for read-only mode, or leave default for restricted
   write operations (draft PRs only for allowed repos).
+
+For future work on interactive permission prompts (similar to XDG Desktop Portal),
+see [todo/upcalls-portals.md](todo/upcalls-portals.md).
