@@ -26,8 +26,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::state;
 
-/// Socket path for the upcall service
+/// Socket path inside the sandbox (always /run/devaipod.sock for consistency)
 pub const UPCALL_SOCKET_PATH: &str = "/run/devaipod.sock";
+
+/// Socket path on the host side (always /tmp for universal write access)
+pub const HOST_SOCKET_PATH: &str = "/tmp/devaipod.sock";
+
+/// Get the actual socket path for the host side.
+/// Uses /tmp which is universally writable.
+/// Inside the sandbox, this is bind-mounted to /run/devaipod.sock.
+pub fn get_host_socket_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(HOST_SOCKET_PATH)
+}
 
 /// Directory containing allowlisted binaries (can be symlinks)
 pub const UPCALL_BINARIES_DIR: &str = "/usr/lib/devaipod/upcalls";

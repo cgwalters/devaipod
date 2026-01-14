@@ -505,16 +505,17 @@ impl Drop for UpcallListenerHandle {
         // Signal the listener to shut down
         self.shutdown.store(true, Ordering::SeqCst);
         // Connect to the socket to unblock the listener's accept() call
-        let socket_path = Path::new(upcall::UPCALL_SOCKET_PATH);
-        let _ = std::os::unix::net::UnixStream::connect(socket_path);
+        let socket_path = upcall::get_host_socket_path();
+        let _ = std::os::unix::net::UnixStream::connect(&socket_path);
         tracing::debug!("Upcall listener shutdown signaled");
     }
 }
 
 /// Start the upcall listener in a background thread.
 /// Returns a handle that will shut down the listener when dropped.
-fn start_upcall_listener(workspace: &str) -> Result<UpcallListenerHandle> {
-    let socket_path = Path::new(upcall::UPCALL_SOCKET_PATH);
+/// Returns the socket path so it can be bind-mounted into the sandbox.
+fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::path::PathBuf)> {
+    let socket_path = upcall::get_host_socket_path();
 
     // Create the socket directory
     if let Some(parent) = socket_path.parent() {
@@ -523,10 +524,10 @@ fn start_upcall_listener(workspace: &str) -> Result<UpcallListenerHandle> {
     }
 
     // Remove existing socket if present
-    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(&socket_path);
 
     // Create the listener before spawning the thread so we can catch bind errors
-    let listener = std::os::unix::net::UnixListener::bind(socket_path)
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("Failed to bind upcall socket at {:?}", socket_path))?;
 
     // Set non-blocking so we can check for shutdown
@@ -563,7 +564,7 @@ fn start_upcall_listener(workspace: &str) -> Result<UpcallListenerHandle> {
         tracing::debug!("Upcall listener thread exiting");
     });
 
-    Ok(UpcallListenerHandle { thread, shutdown })
+    Ok((UpcallListenerHandle { thread, shutdown }, socket_path))
 }
 
 /// Build a bwrap command to sandbox the agent
@@ -614,11 +615,12 @@ fn build_bwrap_command(
         "/usr/sbin".to_string(),
         "/sbin".to_string(),
         // Device and proc filesystems
-        // --dev creates a minimal /dev with only safe devices (null, zero, random, etc.)
-        // --proc creates a private /proc showing only sandbox processes
-        "--dev".to_string(),
+        // Bind mount /dev and /proc from host (--dev/--proc require CAP_SYS_ADMIN which nested containers lack)
+        "--dev-bind".to_string(),
         "/dev".to_string(),
-        "--proc".to_string(),
+        "/dev".to_string(),
+        "--ro-bind".to_string(),
+        "/proc".to_string(),
         "/proc".to_string(),
         // Temporary filesystems (fresh, empty)
         "--tmpfs".to_string(),
@@ -627,7 +629,7 @@ fn build_bwrap_command(
         "/run".to_string(),
         // Upcall socket (bind-mounted from host for agent-to-host RPC)
         "--ro-bind".to_string(),
-        upcall::UPCALL_SOCKET_PATH.to_string(),
+        upcall::HOST_SOCKET_PATH.to_string(),
         upcall::UPCALL_SOCKET_PATH.to_string(),
         // Writable workspace
         "--bind".to_string(),
@@ -857,10 +859,12 @@ fn build_bwrap_shell_args(
         "--symlink".to_string(),
         "/usr/sbin".to_string(),
         "/sbin".to_string(),
-        // Device and proc filesystems
-        "--dev".to_string(),
+        // Bind mount /dev from host (--dev requires CAP_SYS_ADMIN which nested containers lack)
+        "--dev-bind".to_string(),
         "/dev".to_string(),
-        "--proc".to_string(),
+        "/dev".to_string(),
+        "--ro-bind".to_string(),
+        "/proc".to_string(),
         "/proc".to_string(),
         // Temporary filesystems (fresh, empty)
         "--tmpfs".to_string(),
@@ -869,7 +873,7 @@ fn build_bwrap_shell_args(
         "/run".to_string(),
         // Upcall socket (bind-mounted from host for agent-to-host RPC)
         "--ro-bind".to_string(),
-        upcall::UPCALL_SOCKET_PATH.to_string(),
+        upcall::HOST_SOCKET_PATH.to_string(),
         upcall::UPCALL_SOCKET_PATH.to_string(),
         // Writable workspace
         "--bind".to_string(),
@@ -941,7 +945,7 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
     // Start the upcall listener in a background thread
     // The listener allows the sandboxed agent to perform controlled operations
     // like creating PRs or pushing branches via RPC to this process.
-    let _upcall_listener = start_upcall_listener(workspace_name)?;
+    let (_upcall_listener, _socket_path) = start_upcall_listener(workspace_name)?;
     tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
 
     // Check if session already exists
@@ -1047,8 +1051,17 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
 /// Get a shell inside the bwrap sandbox (inside devcontainer)
 fn cmd_enter() -> Result<()> {
     let workspace_path = get_workspace_path()?;
+    // Extract workspace name from path (e.g., "/workspaces/myrepo" -> "myrepo")
+    let workspace_name = Path::new(&workspace_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
 
     tracing::info!("Entering bwrap sandbox (workspace: {})...", workspace_path);
+
+    // Start the upcall listener so the sandbox can perform controlled operations
+    let (_upcall_listener, _socket_path) = start_upcall_listener(workspace_name)?;
+    tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
 
     // Build bwrap args for a shell
     let (real_home, agent_home) = get_agent_home_dir()?;
@@ -1096,7 +1109,7 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
     }
 
     // Start the upcall listener in a background thread
-    let _upcall_listener = start_upcall_listener(workspace_name)?;
+    let (_upcall_listener, _socket_path) = start_upcall_listener(workspace_name)?;
     tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
 
     // Collect DEVAIPOD_AGENT_* prefixed env vars to forward into sandbox
