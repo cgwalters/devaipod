@@ -1,4 +1,4 @@
-name: "Release dev container features"
+name: Publish Dev Container Feature
 
 on:
   push:
