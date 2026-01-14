@@ -498,6 +498,7 @@ struct UpcallListenerHandle {
     #[allow(dead_code)]
     thread: thread::JoinHandle<()>,
     shutdown: Arc<AtomicBool>,
+    socket_path: std::path::PathBuf,
 }
 
 impl Drop for UpcallListenerHandle {
@@ -505,8 +506,9 @@ impl Drop for UpcallListenerHandle {
         // Signal the listener to shut down
         self.shutdown.store(true, Ordering::SeqCst);
         // Connect to the socket to unblock the listener's accept() call
-        let socket_path = upcall::get_host_socket_path();
-        let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+        let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
+        // Clean up the socket file
+        let _ = std::fs::remove_file(&self.socket_path);
         tracing::debug!("Upcall listener shutdown signaled");
     }
 }
@@ -515,7 +517,7 @@ impl Drop for UpcallListenerHandle {
 /// Returns a handle that will shut down the listener when dropped.
 /// Returns the socket path so it can be bind-mounted into the sandbox.
 fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::path::PathBuf)> {
-    let socket_path = upcall::get_host_socket_path();
+    let socket_path = upcall::create_host_socket_path();
 
     // Create the socket directory
     if let Some(parent) = socket_path.parent() {
@@ -564,7 +566,14 @@ fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::
         tracing::debug!("Upcall listener thread exiting");
     });
 
-    Ok((UpcallListenerHandle { thread, shutdown }, socket_path))
+    Ok((
+        UpcallListenerHandle {
+            thread,
+            shutdown,
+            socket_path: socket_path.clone(),
+        },
+        socket_path,
+    ))
 }
 
 /// Build a bwrap command to sandbox the agent
@@ -575,6 +584,7 @@ fn build_bwrap_command(
     agent: &str,
     task: &str,
     agent_env_vars: &[(String, String)],
+    socket_path: &Path,
 ) -> String {
     // Escape task for shell - replace single quotes with escaped version
     let escaped_task = task.replace('\'', "'\\''");
@@ -629,7 +639,7 @@ fn build_bwrap_command(
         "/run".to_string(),
         // Upcall socket (bind-mounted from host for agent-to-host RPC)
         "--ro-bind".to_string(),
-        upcall::HOST_SOCKET_PATH.to_string(),
+        socket_path.display().to_string(),
         upcall::UPCALL_SOCKET_PATH.to_string(),
         // Writable workspace
         "--bind".to_string(),
@@ -835,6 +845,7 @@ fn build_bwrap_shell_args(
     real_home: &str,
     agent_home: &str,
     agent_env_vars: &[(String, String)],
+    socket_path: &Path,
 ) -> Vec<String> {
     // Build a minimal root filesystem - only bind what's explicitly needed
     let mut bwrap_args = vec![
@@ -873,7 +884,7 @@ fn build_bwrap_shell_args(
         "/run".to_string(),
         // Upcall socket (bind-mounted from host for agent-to-host RPC)
         "--ro-bind".to_string(),
-        upcall::HOST_SOCKET_PATH.to_string(),
+        socket_path.display().to_string(),
         upcall::UPCALL_SOCKET_PATH.to_string(),
         // Writable workspace
         "--bind".to_string(),
@@ -945,7 +956,7 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
     // Start the upcall listener in a background thread
     // The listener allows the sandboxed agent to perform controlled operations
     // like creating PRs or pushing branches via RPC to this process.
-    let (_upcall_listener, _socket_path) = start_upcall_listener(workspace_name)?;
+    let (_upcall_listener, socket_path) = start_upcall_listener(workspace_name)?;
     tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
 
     // Check if session already exists
@@ -975,8 +986,13 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
         // Build the bwrap command for the agent
         let (real_home, agent_home) = get_agent_home_dir()?;
         let agent_env_vars = config::collect_agent_env_vars();
-        let mut bwrap_args =
-            build_bwrap_shell_args(&workspace_path, &real_home, &agent_home, &agent_env_vars);
+        let mut bwrap_args = build_bwrap_shell_args(
+            &workspace_path,
+            &real_home,
+            &agent_home,
+            &agent_env_vars,
+            &socket_path,
+        );
         bwrap_args.push("--".to_string());
         bwrap_args.push(agent_name.clone());
 
@@ -1060,14 +1076,19 @@ fn cmd_enter() -> Result<()> {
     tracing::info!("Entering bwrap sandbox (workspace: {})...", workspace_path);
 
     // Start the upcall listener so the sandbox can perform controlled operations
-    let (_upcall_listener, _socket_path) = start_upcall_listener(workspace_name)?;
+    let (_upcall_listener, socket_path) = start_upcall_listener(workspace_name)?;
     tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
 
     // Build bwrap args for a shell
     let (real_home, agent_home) = get_agent_home_dir()?;
     let agent_env_vars = config::collect_agent_env_vars();
-    let mut bwrap_args =
-        build_bwrap_shell_args(&workspace_path, &real_home, &agent_home, &agent_env_vars);
+    let mut bwrap_args = build_bwrap_shell_args(
+        &workspace_path,
+        &real_home,
+        &agent_home,
+        &agent_env_vars,
+        &socket_path,
+    );
     bwrap_args.push("--".to_string());
     bwrap_args.push("/bin/bash".to_string());
 
@@ -1109,7 +1130,7 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
     }
 
     // Start the upcall listener in a background thread
-    let (_upcall_listener, _socket_path) = start_upcall_listener(workspace_name)?;
+    let (_upcall_listener, socket_path) = start_upcall_listener(workspace_name)?;
     tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
 
     // Collect DEVAIPOD_AGENT_* prefixed env vars to forward into sandbox
@@ -1136,6 +1157,7 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
         agent,
         task,
         &agent_env_vars,
+        &socket_path,
     );
 
     tracing::debug!("Agent command: {}", agent_cmd);

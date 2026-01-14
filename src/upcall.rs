@@ -29,14 +29,13 @@ use crate::state;
 /// Socket path inside the sandbox (always /run/devaipod.sock for consistency)
 pub const UPCALL_SOCKET_PATH: &str = "/run/devaipod.sock";
 
-/// Socket path on the host side (always /tmp for universal write access)
-pub const HOST_SOCKET_PATH: &str = "/tmp/devaipod.sock";
+/// Create a new random socket path in /tmp.
+/// Returns a path like /tmp/devaipod-XXXXXXXXXXXXXXXX.sock
+pub fn create_host_socket_path() -> std::path::PathBuf {
+    use rand::Rng;
 
-/// Get the actual socket path for the host side.
-/// Uses /tmp which is universally writable.
-/// Inside the sandbox, this is bind-mounted to /run/devaipod.sock.
-pub fn get_host_socket_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(HOST_SOCKET_PATH)
+    let suffix: u64 = rand::rng().random();
+    std::path::PathBuf::from(format!("/tmp/devaipod-{:016x}.sock", suffix))
 }
 
 /// Directory containing allowlisted binaries (can be symlinks)
