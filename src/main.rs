@@ -499,6 +499,7 @@ struct UpcallListenerHandle {
     thread: thread::JoinHandle<()>,
     shutdown: Arc<AtomicBool>,
     socket_path: std::path::PathBuf,
+    workspace: String,
 }
 
 impl Drop for UpcallListenerHandle {
@@ -507,17 +508,43 @@ impl Drop for UpcallListenerHandle {
         self.shutdown.store(true, Ordering::SeqCst);
         // Connect to the socket to unblock the listener's accept() call
         let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
-        // Clean up the socket file
+        // Clean up the socket file and PID file
         let _ = std::fs::remove_file(&self.socket_path);
+        let _ = state::remove_pid_file(&self.workspace);
         tracing::debug!("Upcall listener shutdown signaled");
     }
 }
 
-/// Start the upcall listener in a background thread.
-/// Returns a handle that will shut down the listener when dropped.
-/// Returns the socket path so it can be bind-mounted into the sandbox.
-fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::path::PathBuf)> {
-    let socket_path = upcall::create_host_socket_path();
+/// Result of ensuring a listener is available for a workspace.
+enum ListenerResult {
+    /// Started a new listener (caller owns it)
+    Started(UpcallListenerHandle, PathBuf),
+    /// An existing listener is running (caller should just use the socket)
+    Existing(PathBuf),
+}
+
+/// Ensure an upcall listener is available for the workspace.
+///
+/// If a listener is already running (based on PID file check), returns
+/// the existing socket path. Otherwise, starts a new listener.
+fn ensure_upcall_listener(workspace: &str) -> Result<ListenerResult> {
+    // Check if a listener is already running
+    match state::check_listener_status(workspace)? {
+        state::ListenerStatus::Running { socket_path, pid } => {
+            tracing::info!(
+                "Upcall listener already running (pid {}) at {:?}",
+                pid,
+                socket_path
+            );
+            return Ok(ListenerResult::Existing(socket_path));
+        }
+        state::ListenerStatus::NotRunning => {
+            tracing::debug!("No existing listener, starting new one");
+        }
+    }
+
+    // Start a new listener
+    let socket_path = upcall::get_host_socket_path(workspace)?;
 
     // Create the socket directory
     if let Some(parent) = socket_path.parent() {
@@ -525,7 +552,7 @@ fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::
             .with_context(|| format!("Failed to create upcall socket directory: {:?}", parent))?;
     }
 
-    // Remove existing socket if present
+    // Remove existing socket if present (stale from previous run)
     let _ = std::fs::remove_file(&socket_path);
 
     // Create the listener before spawning the thread so we can catch bind errors
@@ -535,9 +562,12 @@ fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::
     // Set non-blocking so we can check for shutdown
     listener.set_nonblocking(true)?;
 
+    // Write PID file so other processes know we're running
+    state::write_pid_file(workspace)?;
+
     tracing::info!("Starting upcall listener at {:?}", socket_path);
 
-    let workspace = workspace.to_string();
+    let workspace_owned = workspace.to_string();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
 
@@ -547,7 +577,7 @@ fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::
                 Ok((stream, _)) => {
                     // Set blocking mode for the stream
                     let _ = stream.set_nonblocking(false);
-                    if let Err(e) = upcall::handle_connection(stream, &workspace) {
+                    if let Err(e) = upcall::handle_connection(stream, &workspace_owned) {
                         tracing::error!("Error handling upcall: {}", e);
                     }
                 }
@@ -566,11 +596,12 @@ fn start_upcall_listener(workspace: &str) -> Result<(UpcallListenerHandle, std::
         tracing::debug!("Upcall listener thread exiting");
     });
 
-    Ok((
+    Ok(ListenerResult::Started(
         UpcallListenerHandle {
             thread,
             shutdown,
             socket_path: socket_path.clone(),
+            workspace: workspace.to_string(),
         },
         socket_path,
     ))
@@ -953,11 +984,20 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
 
     let session_name = "devaipod";
 
-    // Start the upcall listener in a background thread
+    // Ensure an upcall listener is running for this workspace.
+    // If one already exists (from a previous devaipod tmux invocation that's still running),
+    // we reuse it. Otherwise, we start a new one.
     // The listener allows the sandboxed agent to perform controlled operations
     // like creating PRs or pushing branches via RPC to this process.
-    let (_upcall_listener, socket_path) = start_upcall_listener(workspace_name)?;
-    tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
+    let (maybe_listener, socket_path) = match ensure_upcall_listener(workspace_name)? {
+        ListenerResult::Started(handle, path) => (Some(handle), path),
+        ListenerResult::Existing(path) => (None, path),
+    };
+    tracing::debug!(
+        "Upcall listener ready for workspace: {} (socket: {:?})",
+        workspace_name,
+        socket_path
+    );
 
     // Check if session already exists
     let session_exists = ProcessCommand::new("tmux")
@@ -972,6 +1012,9 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
             .args(["attach-session", "-t", session_name])
             .status()
             .context("Failed to attach to tmux session")?;
+
+        // Keep the listener alive until we're done (if we started one)
+        drop(maybe_listener);
 
         if !status.success() {
             bail!("Failed to attach to tmux session");
@@ -1075,9 +1118,19 @@ fn cmd_enter() -> Result<()> {
 
     tracing::info!("Entering bwrap sandbox (workspace: {})...", workspace_path);
 
-    // Start the upcall listener so the sandbox can perform controlled operations
-    let (_upcall_listener, socket_path) = start_upcall_listener(workspace_name)?;
-    tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
+    // Ensure an upcall listener is running. If one already exists (e.g., from
+    // a running `devaipod tmux` session), we reuse it.
+    let (maybe_listener, socket_path) = match ensure_upcall_listener(workspace_name)? {
+        ListenerResult::Started(handle, path) => (Some(handle), path),
+        ListenerResult::Existing(path) => (None, path),
+    };
+    tracing::debug!(
+        "Upcall listener ready for workspace: {} (socket: {:?})",
+        workspace_name,
+        socket_path
+    );
+    // Suppress unused warning - we need to keep the listener alive
+    let _ = &maybe_listener;
 
     // Build bwrap args for a shell
     let (real_home, agent_home) = get_agent_home_dir()?;
@@ -1129,9 +1182,18 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
         }
     }
 
-    // Start the upcall listener in a background thread
-    let (_upcall_listener, socket_path) = start_upcall_listener(workspace_name)?;
-    tracing::debug!("Upcall listener started for workspace: {}", workspace_name);
+    // Ensure an upcall listener is running. If one already exists, we reuse it.
+    let (maybe_listener, socket_path) = match ensure_upcall_listener(workspace_name)? {
+        ListenerResult::Started(handle, path) => (Some(handle), path),
+        ListenerResult::Existing(path) => (None, path),
+    };
+    tracing::debug!(
+        "Upcall listener ready for workspace: {} (socket: {:?})",
+        workspace_name,
+        socket_path
+    );
+    // Suppress unused warning - we need to keep the listener alive
+    let _ = &maybe_listener;
 
     // Collect DEVAIPOD_AGENT_* prefixed env vars to forward into sandbox
     let agent_env_vars = config::collect_agent_env_vars();

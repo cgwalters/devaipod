@@ -29,13 +29,12 @@ use crate::state;
 /// Socket path inside the sandbox (always /run/devaipod.sock for consistency)
 pub const UPCALL_SOCKET_PATH: &str = "/run/devaipod.sock";
 
-/// Create a new random socket path in /tmp.
-/// Returns a path like /tmp/devaipod-XXXXXXXXXXXXXXXX.sock
-pub fn create_host_socket_path() -> std::path::PathBuf {
-    use rand::Rng;
-
-    let suffix: u64 = rand::rng().random();
-    std::path::PathBuf::from(format!("/tmp/devaipod-{:016x}.sock", suffix))
+/// Get the host socket path for a workspace.
+///
+/// This uses the workspace-specific state directory so the socket path
+/// is deterministic and can be reused across process restarts.
+pub fn get_host_socket_path(workspace: &str) -> color_eyre::eyre::Result<std::path::PathBuf> {
+    crate::state::get_socket_path(workspace)
 }
 
 /// Directory containing allowlisted binaries (can be symlinks)
