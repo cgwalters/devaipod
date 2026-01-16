@@ -4,6 +4,13 @@
 
 Run AI agents with confidence: your code in a devcontainer, the agent in an additional sandbox with only the access it needs.
 
+## On the topic of AI
+
+Note: This tool is primarily authored by @cgwalters who would "un-invent" large language models if he could because
+he believes the long term negatives are likely to outweigh the gains. But since that's not possible, this project
+is about maximizing the positive aspects of LLMs with a focus on software production (but not exclusively).
+We need use LLMs safely and responsibly, with efficient human-in-the-loop controls and auditability.
+
 ## Quick Start
 
 ```bash
