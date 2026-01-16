@@ -2,9 +2,36 @@
 //!
 //! Wraps the DevPod CLI to manage workspaces.
 
+use std::path::Path;
 use std::process::Command;
 
 use color_eyre::eyre::{bail, Context, Result};
+
+/// Configure a devpod command with appropriate environment.
+///
+/// Workaround for environments where `SSH_AUTH_SOCK` is set but the socket
+/// doesn't exist. This commonly happens when:
+/// - Using `machinectl shell` which spawns a partial user session
+/// - GNOME keyring SSH agent component isn't running
+/// - The session was configured with SSH agent support but it failed to start
+///
+/// DevPod will attempt to forward the SSH agent if `SSH_AUTH_SOCK` is set,
+/// even when `SSH_AGENT_FORWARDING=false` in the context, and fails with:
+///   "forward agent: dial unix /path/to/socket: connect: no such file or directory"
+///
+/// Rather than let devpod fail with a confusing error, we remove the invalid
+/// `SSH_AUTH_SOCK` from the environment.
+fn configure_devpod_env(cmd: &mut Command) {
+    if let Ok(socket_path) = std::env::var("SSH_AUTH_SOCK") {
+        if !Path::new(&socket_path).exists() {
+            tracing::debug!(
+                "SSH_AUTH_SOCK ({}) does not exist, removing from devpod environment",
+                socket_path
+            );
+            cmd.env_remove("SSH_AUTH_SOCK");
+        }
+    }
+}
 
 /// Run `devpod up` to create/start a workspace
 ///
@@ -22,6 +49,7 @@ pub fn up(
     secrets: &[(String, String)],
 ) -> Result<String> {
     let mut cmd = Command::new("devpod");
+    configure_devpod_env(&mut cmd);
     cmd.arg("up");
     cmd.arg(source);
 
@@ -61,6 +89,7 @@ pub fn up(
 /// Run `devpod ssh` to connect to a workspace
 pub fn ssh(workspace: &str, command: &[String]) -> Result<()> {
     let mut cmd = Command::new("devpod");
+    configure_devpod_env(&mut cmd);
     cmd.arg("ssh");
     cmd.arg(workspace);
 
