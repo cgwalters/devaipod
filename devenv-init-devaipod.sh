@@ -89,3 +89,51 @@ configure_nested_subuid() {
 }
 
 configure_nested_subuid devenv
+
+# Start a rootful podman service for container operations.
+#
+# Rootless podman doesn't work well in nested containers because newuidmap/newgidmap
+# setuid binaries fail. However, running "sudo podman" is safe here because:
+# - This container runs under rootless podman on the host
+# - "root" inside this container is actually an unprivileged UID on the real host
+# - Even "podman run --privileged" containers are constrained by the outer user namespace
+#
+# We start the service with a world-accessible socket so both the devenv user
+# and the AI agent sandbox can use it.
+start_podman_service() {
+    local socket_dir="/run/podman"
+    local socket_path="${socket_dir}/podman.sock"
+    
+    # Check if podman is available
+    if ! command -v podman &>/dev/null; then
+        echo "podman not found, skipping podman service setup"
+        return 0
+    fi
+    
+    mkdir -p "$socket_dir"
+    
+    # Clean up any existing socket
+    rm -f "$socket_path"
+    
+    # Start podman service in background with nohup so it survives script exit
+    nohup podman system service --time=0 "unix://${socket_path}" >/dev/null 2>&1 &
+    
+    # Wait for socket to appear and make it world-accessible
+    for i in $(seq 1 50); do
+        if [ -S "$socket_path" ]; then
+            chmod 666 "$socket_path"
+            echo "Podman service started at $socket_path"
+            break
+        fi
+        sleep 0.1
+    done
+    
+    # Create environment file for shells to source
+    cat > /etc/profile.d/podman-remote.sh << 'EOF'
+# Use rootful podman service (safe in rootless container)
+export CONTAINER_HOST="unix:///run/podman/podman.sock"
+EOF
+    chmod 644 /etc/profile.d/podman-remote.sh
+}
+
+start_podman_service

@@ -39,3 +39,21 @@ GitHub operations go through the `gh-restricted` upcall which only allows:
 - Read operations (pr list, issue view, etc.)
 - Draft PR creation (only to allowed repos)
 - PR comments/edits (only to PRs created by the agent)
+
+## Container Operations (Podman)
+
+The feature sets up a rootful podman service that both human developers and
+AI agents can use. This is safe because:
+- The devcontainer runs under rootless podman on the host
+- "root" inside the container is actually unprivileged on the real host
+- Even `podman run --privileged` is constrained by the outer user namespace
+
+Usage inside the container:
+```bash
+podman --remote run --rm --network=host --cgroups=disabled alpine echo hello
+```
+
+The init script (`devaipod-init.sh`) must be run at container start to:
+- Configure subuid/subgid for nested containers
+- Start the podman service at `/run/podman/podman.sock`
+- Set up the `CONTAINER_HOST` environment variable

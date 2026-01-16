@@ -616,6 +616,7 @@ fn build_bwrap_command(
     task: &str,
     agent_env_vars: &[(String, String)],
     socket_path: &Path,
+    podman_socket: Option<&Path>,
 ) -> String {
     // Escape task for shell - replace single quotes with escaped version
     let escaped_task = task.replace('\'', "'\\''");
@@ -698,6 +699,17 @@ fn build_bwrap_command(
         ]);
     }
 
+    // Bind-mount sandboxed podman socket if available
+    if let Some(podman_sock) = podman_socket {
+        bwrap_args.extend([
+            "--dir".to_string(),
+            "/run/podman".to_string(),
+            "--ro-bind".to_string(),
+            podman_sock.display().to_string(),
+            "/run/podman/podman.sock".to_string(),
+        ]);
+    }
+
     // Set environment variables
     bwrap_args.extend([
         "--setenv".to_string(),
@@ -710,6 +722,15 @@ fn build_bwrap_command(
         "USER".to_string(),
         std::env::var("USER").unwrap_or_else(|_| "user".to_string()),
     ]);
+
+    // Set CONTAINER_HOST if podman socket is available
+    if podman_socket.is_some() {
+        bwrap_args.extend([
+            "--setenv".to_string(),
+            "CONTAINER_HOST".to_string(),
+            "unix:///run/podman/podman.sock".to_string(),
+        ]);
+    }
 
     // Forward only DEVAIPOD_AGENT_* prefixed environment variables (with prefix stripped)
     // This is the security boundary - only these env vars are visible to the agent
@@ -870,6 +891,26 @@ fn get_workspace_path() -> Result<String> {
     bail!("Could not determine workspace path. Are you inside a devcontainer?")
 }
 
+/// Standard path for the podman socket (started by devaipod-init.sh)
+const PODMAN_SOCKET: &str = "/run/podman/podman.sock";
+
+/// Check if the podman socket is available.
+///
+/// The podman service should be started by the container init script
+/// (devaipod-init.sh). This runs `sudo podman system service` which is
+/// safe because in a rootless devcontainer, "root" is actually an
+/// unprivileged UID on the real host.
+fn get_podman_socket() -> Option<PathBuf> {
+    let socket_path = Path::new(PODMAN_SOCKET);
+    if socket_path.exists() {
+        tracing::debug!("Found podman socket at {:?}", socket_path);
+        Some(socket_path.to_path_buf())
+    } else {
+        tracing::debug!("Podman socket not found at {:?}", socket_path);
+        None
+    }
+}
+
 /// Build bwrap command arguments for a shell (without running an agent command)
 fn build_bwrap_shell_args(
     workspace_path: &str,
@@ -877,6 +918,7 @@ fn build_bwrap_shell_args(
     agent_home: &str,
     agent_env_vars: &[(String, String)],
     socket_path: &Path,
+    podman_socket: Option<&Path>,
 ) -> Vec<String> {
     // Build a minimal root filesystem - only bind what's explicitly needed
     let mut bwrap_args = vec![
@@ -950,6 +992,23 @@ fn build_bwrap_shell_args(
             "--ro-bind".to_string(),
             gcloud_config,
             format!("{}/.config/gcloud", real_home),
+        ]);
+    }
+
+    // Bind-mount sandboxed podman socket if available
+    // This allows the AI agent to use podman for container operations.
+    // The podman service itself runs in a separate bwrap sandbox as root,
+    // but since we're in a rootless container, "root" is unprivileged on the host.
+    if let Some(podman_sock) = podman_socket {
+        bwrap_args.extend([
+            "--dir".to_string(),
+            "/run/podman".to_string(),
+            "--ro-bind".to_string(),
+            podman_sock.display().to_string(),
+            "/run/podman/podman.sock".to_string(),
+            "--setenv".to_string(),
+            "CONTAINER_HOST".to_string(),
+            "unix:///run/podman/podman.sock".to_string(),
         ]);
     }
 
@@ -1029,12 +1088,17 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
         // Build the bwrap command for the agent
         let (real_home, agent_home) = get_agent_home_dir()?;
         let agent_env_vars = config::collect_agent_env_vars();
+
+        // Check for podman socket (started by devaipod-init.sh)
+        let podman_socket = get_podman_socket();
+
         let mut bwrap_args = build_bwrap_shell_args(
             &workspace_path,
             &real_home,
             &agent_home,
             &agent_env_vars,
             &socket_path,
+            podman_socket.as_deref(),
         );
         bwrap_args.push("--".to_string());
         bwrap_args.push(agent_name.clone());
@@ -1135,17 +1199,21 @@ fn cmd_enter() -> Result<()> {
     // Build bwrap args for a shell
     let (real_home, agent_home) = get_agent_home_dir()?;
     let agent_env_vars = config::collect_agent_env_vars();
+
+    // Check for podman socket (started by devaipod-init.sh)
+    let podman_socket = get_podman_socket();
+
     let mut bwrap_args = build_bwrap_shell_args(
         &workspace_path,
         &real_home,
         &agent_home,
         &agent_env_vars,
         &socket_path,
+        podman_socket.as_deref(),
     );
     bwrap_args.push("--".to_string());
     bwrap_args.push("/bin/bash".to_string());
 
-    // Execute bwrap directly
     let status = ProcessCommand::new(&bwrap_args[0])
         .args(&bwrap_args[1..])
         .status()
@@ -1212,6 +1280,10 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
 
     // Build and run the bwrap command
     let (real_home, agent_home) = get_agent_home_dir()?;
+
+    // Check for podman socket (started by devaipod-init.sh)
+    let podman_socket = get_podman_socket();
+
     let agent_cmd = build_bwrap_command(
         &workspace_path,
         &real_home,
@@ -1220,6 +1292,7 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
         task,
         &agent_env_vars,
         &socket_path,
+        podman_socket.as_deref(),
     );
 
     tracing::debug!("Agent command: {}", agent_cmd);

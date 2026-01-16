@@ -22,9 +22,9 @@ The agent runs inside **two layers of isolation**:
 ┌─────────────────────────────────────────────────────────────┐
 │  Host                                                       │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  DevPod Container (devcontainer)                      │  │
+│  │  DevPod Container (rootless podman on host)           │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │  bwrap Sandbox                                  │  │  │
+│  │  │  bwrap Sandbox (AI Agent)                       │  │  │
 │  │  │  • /usr, /lib, /etc (read-only)                 │  │  │
 │  │  │  • /workspaces/<name> (read-write)              │  │  │
 │  │  │  • $HOME → $HOME/ai (isolated)                  │  │  │
@@ -33,8 +33,14 @@ The agent runs inside **two layers of isolation**:
 │  │  │  ┌─────────────┐                                │  │  │
 │  │  │  │  AI Agent   │ ←── /run/devaipod.sock ──→     │  │  │
 │  │  │  │  (opencode) │      (JSON-RPC upcalls)        │  │  │
-│  │  │  └─────────────┘                                │  │  │
+│  │  │  │             │ ←── /run/podman/podman.sock    │  │  │
+│  │  │  └─────────────┘      (container operations)    │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
+│  │                                                         │  │
+│  │  Podman Service (sudo podman system service)          │  │
+│  │  • Runs as root - safe because container is rootless  │  │
+│  │  • Socket at /run/podman/podman.sock (world-readable) │  │
+│  │                                                         │  │
 │  │  Upcall Listener (runs outside sandbox)               │  │
 │  │  • Executes allowlisted binaries from                 │  │
 │  │    /usr/lib/devaipod/upcalls/                         │  │
@@ -54,8 +60,9 @@ The agent runs inside **two layers of isolation**:
 | `/tmp`, `/run` | Fresh tmpfs | Empty, not shared with container |
 | `/dev` | Minimal | Private `/dev` via bwrap `--dev` |
 | `/proc` | Isolated | Private `/proc` via bwrap `--proc` |
+| `/run/podman/podman.sock` | Read-only | Sandboxed podman API socket |
 
-**Not mounted:** `/var`, `/opt`, real `$HOME`, `/root`, container sockets
+**Not mounted:** `/var`, `/opt`, real `$HOME`, `/root`, other container sockets
 
 ## Home Directory Isolation
 
@@ -73,11 +80,48 @@ This prevents access to: SSH keys, git credentials, cloud tokens, API keys in do
 - `--unshare-pid`: Agent cannot see or signal other processes
 - `--die-with-parent`: Agent process dies when parent exits
 
+## Container Operations (Podman)
+
+AI agents (and human developers) can use podman for container operations while
+still confined to the sandbox. This works through a layered security model:
+
+1. **Rootful podman service**: A rootful podman API service (`sudo podman system service`)
+   is started by the container init script (`devaipod-init.sh`). It runs in the
+   devcontainer but outside the AI sandbox, listening at `/run/podman/podman.sock`.
+
+2. **Why rootful is safe**: The devcontainer itself runs under rootless podman on the
+   host. This means "root" inside the container is actually an unprivileged UID on the
+   real host. Even `podman run --privileged` containers are still constrained by the
+   outer user namespace.
+
+3. **Socket access**: The podman socket is bind-mounted into the AI sandbox at
+   `/run/podman/podman.sock` with `CONTAINER_HOST` set appropriately. Human users
+   in the devcontainer can also use podman directly (the profile sets `CONTAINER_HOST`).
+
+### Usage
+
+Inside the sandbox, use the `--remote` flag and disable cgroups (not available in
+nested containers):
+
+```bash
+podman --remote run --rm --network=host --cgroups=disabled alpine echo hello
+```
+
+### Security Properties
+
+- The AI agent cannot escape to the host via container operations
+- Container images are stored in the devcontainer's storage, not persisted to host
+- Network access from containers follows the same rules as the devcontainer
+- Even privileged containers cannot access real host resources
+
 ## Known Limitations
 
 1. **Full network access**: Network is NOT restricted. The agent can reach any endpoint. Future work will add network isolation via proxy or iptables.
 
 2. **Secrets in workspace**: If `.env` or other secrets exist in the workspace, the agent can read them.
+
+3. **Container cgroups**: Nested containers must use `--cgroups=disabled` and
+   `--network=host` due to user namespace constraints.
 
 ## Upcalls
 

@@ -17,11 +17,13 @@
         "agents",
         "sandbox",
         "devcontainer",
-        "security"
+        "security",
+        "podman"
     ],
     "containerEnv": {
         "PATH": "/usr/local/bin:${PATH}"
     },
+    "postStartCommand": "sudo /usr/local/bin/devaipod-init.sh || echo 'devaipod-init failed (may be expected in some environments)'",
     "installsAfter": [
         "ghcr.io/devcontainers/features/common-utils"
     ]
