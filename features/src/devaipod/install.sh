@@ -166,117 +166,22 @@ install_from_source() {
     fi
 }
 
-# Configure podman for nested container environments
-# This sets up:
-# 1. An init script to configure subuid/subgid for nested user namespaces
-# 2. A rootful podman service that's safe (because we're in a rootless container)
-# 3. Environment variables so podman commands work transparently
-configure_nested_podman() {
-    echo "Configuring podman for nested containers..."
-    
-    # Create the devaipod init script that runs at container start
+# Create wrapper script for devaipod configure-env
+# This is called from postStartCommand in devcontainer.json
+create_init_script() {
     cat > /usr/local/bin/devaipod-init.sh << 'INITSCRIPT'
 #!/bin/bash
 set -euo pipefail
-# devaipod container initialization script
-# Configures podman for nested container environments
-
-# Fix mount propagation - may fail in some environments, that's fine
-if mount -o remount --make-shared / 2>/dev/null; then
-    echo "Fixed mount propagation"
-fi
-
-# /dev/kvm access - safe to expose (like Fedora derivatives do)
-if [[ -e /dev/kvm ]]; then
-    chmod a+rw /dev/kvm 2>/dev/null || true
-fi
-
-# Configure cgroups for nested containers
-if [[ -f /usr/share/containers/containers.conf ]]; then
-    sed -i -e 's,^#cgroups =.*,cgroups = "no-conmon",' /usr/share/containers/containers.conf 2>/dev/null || true
-    sed -i -e 's,^#cgroup_manager =.*,cgroup_manager = "cgroupfs",' /usr/share/containers/containers.conf 2>/dev/null || true
-fi
-
-# Fix /etc/subuid and /etc/subgid for nested user namespaces
-configure_nested_subuid() {
-    local user=${1:-}
-    
-    # Find the container user if not specified
-    if [[ -z "$user" ]]; then
-        # Try common devcontainer user names
-        for u in vscode devenv codespace; do
-            if id "$u" &>/dev/null; then
-                user="$u"
-                break
-            fi
-        done
-    fi
-    
-    [[ -z "$user" ]] && return 0
-    ! id "$user" &>/dev/null && return 0
-    
-    # Parse uid_map to find max UID in this namespace
-    local max_uid=0
-    while read -r inside outside count; do
-        local end=$((inside + count))
-        (( end > max_uid )) && max_uid=$end
-    done < /proc/self/uid_map
-    
-    # If we have full UID range, default config should work
-    (( max_uid > 100000 )) && return 0
-    
-    # Check if current subuid config works
-    local current_start
-    current_start=$(grep "^${user}:" /etc/subuid 2>/dev/null | cut -d: -f2 || echo "0")
-    (( current_start > 0 && current_start < max_uid )) && return 0
-    
-    # Reconfigure for constrained namespace
-    local subuid_start=10000
-    local subuid_count=$((max_uid - subuid_start))
-    
-    if (( subuid_count < 1000 )); then
-        echo "Warning: Limited UID range (max=$max_uid), nested podman may not work" >&2
-        return 0
-    fi
-    
-    echo "Configuring subuid/subgid: ${user}:${subuid_start}:${subuid_count}"
-    echo "${user}:${subuid_start}:${subuid_count}" > /etc/subuid
-    echo "${user}:${subuid_start}:${subuid_count}" > /etc/subgid
-}
-
-configure_nested_subuid
-
-# Start rootful podman service
-# This is safe because the devcontainer runs under rootless podman on the host,
-# so "root" here is actually unprivileged on the real host.
-start_podman_service() {
-    local socket_dir="/run/podman"
-    local socket_path="${socket_dir}/podman.sock"
-    
-    command -v podman >/dev/null 2>&1 || return 0
-    
-    mkdir -p "$socket_dir"
-    rm -f "$socket_path"
-    
-    # Start podman service in background with nohup so it survives script exit
-    nohup podman system service --time=0 "unix://${socket_path}" >/dev/null 2>&1 &
-    
-    # Wait for socket to appear and make it world-accessible
-    for i in $(seq 1 50); do
-        if [ -S "$socket_path" ]; then
-            chmod 666 "$socket_path"
-            echo "Podman service started at $socket_path"
-            break
-        fi
-        sleep 0.1
-    done
-}
-
-start_podman_service
+# Wrapper script for devaipod configure-env
+# Preserve DEVPOD=true so devaipod knows it's in container mode
+exec env DEVPOD=true devaipod configure-env
 INITSCRIPT
     chmod +x /usr/local/bin/devaipod-init.sh
-    
-    # Create profile script to set CONTAINER_HOST
+    echo "Created /usr/local/bin/devaipod-init.sh"
+}
+
+# Legacy: Create profile script (configure-env will also create this)
+create_profile_script() {
     cat > /etc/profile.d/devaipod-podman.sh << 'PROFILE'
 # Use rootful podman service (safe in rootless devcontainer)
 if [ -S /run/podman/podman.sock ]; then
@@ -323,8 +228,9 @@ main() {
     # Install system packages (bubblewrap, tmux)
     install_system_packages "$pkg_manager" || true
     
-    # Configure podman for nested containers
-    configure_nested_podman
+    # Create init script and profile for podman
+    create_init_script
+    create_profile_script
     
     # Check for local binaries first (for testing)
     if [ -n "${DEVAIPOD_LOCAL_BINARIES}" ] && [ -d "${DEVAIPOD_LOCAL_BINARIES}" ]; then

@@ -100,12 +100,15 @@ still confined to the sandbox. This works through a layered security model:
 
 ### Usage
 
-Inside the sandbox, use the `--remote` flag and disable cgroups (not available in
-nested containers):
+Inside the sandbox, use the `--remote` flag:
 
 ```bash
-podman --remote run --rm --network=host --cgroups=disabled alpine echo hello
+podman --remote run --rm alpine echo hello
 ```
+
+The container's `/etc/containers/containers.conf` is pre-configured with
+`cgroups = "disabled"` and `netns = "host"` so you don't need to specify
+these flags manually.
 
 ### Security Properties
 
@@ -119,9 +122,6 @@ podman --remote run --rm --network=host --cgroups=disabled alpine echo hello
 1. **Full network access**: Network is NOT restricted. The agent can reach any endpoint. Future work will add network isolation via proxy or iptables.
 
 2. **Secrets in workspace**: If `.env` or other secrets exist in the workspace, the agent can read them.
-
-3. **Container cgroups**: Nested containers must use `--cgroups=disabled` and
-   `--network=host` due to user namespace constraints.
 
 ## Upcalls
 

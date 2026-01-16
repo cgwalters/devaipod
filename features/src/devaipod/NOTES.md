@@ -50,10 +50,14 @@ AI agents can use. This is safe because:
 
 Usage inside the container:
 ```bash
-podman --remote run --rm --network=host --cgroups=disabled alpine echo hello
+podman --remote run --rm alpine echo hello
 ```
 
 The init script (`devaipod-init.sh`) must be run at container start to:
+- Configure `/etc/containers/containers.conf` with nested-friendly defaults
 - Configure subuid/subgid for nested containers
 - Start the podman service at `/run/podman/podman.sock`
 - Set up the `CONTAINER_HOST` environment variable
+
+The containers.conf is pre-configured with `cgroups = "disabled"` and
+`netns = "host"` so you don't need to specify these flags manually.
