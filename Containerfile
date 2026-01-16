@@ -1,7 +1,7 @@
 FROM ghcr.io/bootc-dev/devenv-debian AS base
 
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap \
+RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Install opencode from anomalyco/opencode
