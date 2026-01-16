@@ -4,6 +4,10 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap tmux \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy our init script that handles nested podman setup
+COPY devenv-init-devaipod.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/devenv-init-devaipod.sh
+
 # Install opencode from anomalyco/opencode
 ARG OPENCODE_VERSION=1.1.12
 ARG TARGETARCH

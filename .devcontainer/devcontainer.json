@@ -23,7 +23,7 @@
     }
   },
   "postCreateCommand": {
-    "devenv-init": "sudo /usr/local/bin/devenv-init.sh || echo 'devenv-init failed (may be expected in some environments)'"
+    "devenv-init": "sudo /usr/local/bin/devenv-init-devaipod.sh || echo 'devenv-init failed (may be expected in some environments)'"
   },
   "remoteUser": "devenv",
   "remoteEnv": {
