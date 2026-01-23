@@ -14,9 +14,8 @@ We need use LLMs safely and responsibly, with efficient human-in-the-loop contro
 ## Quick Start
 
 ```bash
-# Build
-git clone https://github.com/cgwalters/devc && cd devc
-podman build -t localhost/devaipod:latest -f .devcontainer/Containerfile .
+# Clone and build
+git clone https://github.com/cgwalters/devaipod && cd devaipod
 cargo build --release
 
 # Configure (Vertex AI example)

@@ -100,7 +100,8 @@ install_from_github_release() {
     local tmp_dir
     
     tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "$tmp_dir"' EXIT
+    # Note: cleanup is done explicitly, not via trap, to avoid issues with
+    # set -u and the trap persisting after the function returns
     
     # Determine the release URL
     local base_url="https://github.com/${DEVAIPOD_REPO}/releases"
@@ -132,6 +133,13 @@ install_from_github_release() {
     echo "Extracting and installing..."
     tar -xzf "${tmp_dir}/devaipod.tar.gz" -C "${tmp_dir}"
     
+    # Check if the binary was extracted
+    if [ ! -f "${tmp_dir}/devaipod" ]; then
+        echo "ERROR: devaipod binary not found in tarball"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    
     # Install binaries
     install -D -m 0755 "${tmp_dir}/devaipod" /usr/local/bin/devaipod
     
@@ -140,6 +148,9 @@ install_from_github_release() {
         install -d -m 0755 /usr/lib/devaipod/upcalls
         install -D -m 0755 "${tmp_dir}/gh-restricted" /usr/lib/devaipod/upcalls/gh-restricted
     fi
+    
+    # Cleanup
+    rm -rf "$tmp_dir"
     
     echo "devaipod installed successfully!"
 }
@@ -156,10 +167,17 @@ install_from_source() {
     cargo install --git "https://github.com/${DEVAIPOD_REPO}" devaipod
     
     # Also build and install gh-restricted from the upcalls crate
-    cargo install --git "https://github.com/${DEVAIPOD_REPO}" --package devaipod-upcalls --bin gh-restricted
+    cargo install --git "https://github.com/${DEVAIPOD_REPO}" devaipod-upcalls --bin gh-restricted
+    
+    # Move binaries to standard locations
+    local cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+    
+    # Move devaipod to /usr/local/bin
+    if [ -f "${cargo_bin}/devaipod" ]; then
+        mv "${cargo_bin}/devaipod" /usr/local/bin/devaipod
+    fi
     
     # Move gh-restricted to upcalls directory
-    local cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
     if [ -f "${cargo_bin}/gh-restricted" ]; then
         install -d -m 0755 /usr/lib/devaipod/upcalls
         mv "${cargo_bin}/gh-restricted" /usr/lib/devaipod/upcalls/gh-restricted
@@ -252,11 +270,11 @@ main() {
     fi
     
     # Verify installation
-    if command -v devaipod >/dev/null 2>&1; then
+    if [ -x /usr/local/bin/devaipod ]; then
         echo "devaipod installation verified"
-        devaipod --version 2>/dev/null || devaipod --help | head -1
+        /usr/local/bin/devaipod --version 2>/dev/null || /usr/local/bin/devaipod --help | head -1
     else
-        echo "ERROR: devaipod installation failed"
+        echo "ERROR: devaipod installation failed - /usr/local/bin/devaipod not found"
         exit 1
     fi
 }

@@ -6,13 +6,7 @@
 
 ## Installation
 
-OpenCode is installed in the devcontainer image via the Containerfile:
-
-```dockerfile
-ARG OPENCODE_VERSION=1.1.12
-RUN curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OPENCODE_ARCH}.tar.gz" \
-    | tar -xzf - -C /usr/local/bin opencode
-```
+OpenCode is pre-installed in the `ghcr.io/bootc-dev/devenv-debian` base image used by the devcontainer. The devaipod devcontainer feature expects opencode to be available in the base image.
 
 ## Configuration
 

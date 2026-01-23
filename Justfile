@@ -50,25 +50,19 @@ smoke-test:
     ./target/debug/devaipod list
     ./target/debug/devaipod delete devc --force
 
-# Build container image for development
-build-container:
-    podman build -t localhost/devaipod:latest .
-
 # Run devaipod against our own local git tree for self-hosting development.
-# This tears down any existing devcontainer completely, rebuilds the image,
-# and starts a fresh workspace. Run this from outside the devcontainer (e.g. toolbox)
+# This tears down any existing devcontainer completely and starts a fresh workspace
+# using the devcontainer feature. Run this from outside the devcontainer (e.g. toolbox)
 # to iterate on changes.
 self-devenv:
     #!/usr/bin/env bash
     set -euo pipefail
     # Build the binary first
     cargo build --release
-    # Build the container image
-    podman build -t localhost/devaipod:latest .
-    # Stop and remove existing devpod workspace to force fresh container from new image
+    # Stop and remove existing devpod workspace to force fresh container
     devpod stop devaipod 2>/dev/null || true
     devpod delete devaipod --force 2>/dev/null || true
-    # Start fresh workspace with our local tree
+    # Start fresh workspace with our local tree (uses devcontainer.json with feature)
     ./target/release/devaipod up .
 
 # Alias for self-devenv (used by devenv-self convention)
