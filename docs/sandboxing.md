@@ -121,10 +121,34 @@ these flags manually.
 ## External Service Access
 
 For operations requiring access to external services (GitHub, Jira, etc.), agents
-should use MCP servers like [service-gator](https://github.com/cgwalters/service-gator)
-which provides scope-based access control for CLI tools. This approach is preferred
-over building service access directly into devaipod because:
+use the integrated [service-gator](https://github.com/cgwalters/service-gator)
+MCP server which provides scope-based access control for CLI tools.
+
+### First-class Integration
+
+devaipod provides first-class integration with service-gator:
+
+1. **Configure scopes** in `~/.config/devaipod.toml`:
+   ```toml
+   [service-gator.gh.repos]
+   "myorg/*" = { read = true }
+   "myorg/main-project" = { read = true, create-draft = true }
+   ```
+
+2. **devaipod automatically**:
+   - Starts service-gator MCP server when the agent starts
+   - Configures opencode to connect via MCP
+   - Service-gator monitors the config for dynamic updates
+
+3. **The agent** can now use GitHub/JIRA tools with the permissions you've granted
+
+See [Service-gator Integration](service-gator.md) for full documentation.
+
+### Why MCP?
+
+This approach is preferred over building service access directly into devaipod because:
 
 - MCP servers can be independently developed and configured
 - Different projects can use different scoping policies
 - The security boundary is clearer (the MCP server runs outside the sandbox)
+- Credentials (GH_TOKEN, etc.) never enter the sandbox

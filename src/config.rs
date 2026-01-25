@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Target container(s) for a secret or configuration
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -46,6 +46,9 @@ pub struct Config {
     /// Secret mappings
     #[serde(default)]
     pub secrets: HashMap<String, SecretMapping>,
+    /// Service-gator MCP server configuration
+    #[serde(default, rename = "service-gator")]
+    pub service_gator: ServiceGatorConfig,
 }
 
 /// Agent configuration
@@ -199,6 +202,257 @@ pub struct SecretMapping {
     /// Target container(s) for this secret
     #[serde(default)]
     pub container: ContainerTarget,
+}
+
+// =============================================================================
+// Service-gator configuration
+// =============================================================================
+
+/// Default port for the service-gator MCP server
+pub const SERVICE_GATOR_DEFAULT_PORT: u16 = 8765;
+
+/// Service-gator MCP server configuration
+///
+/// Service-gator provides scope-restricted access to external services
+/// (GitHub, JIRA, GitLab) for AI agents. It runs outside the bwrap sandbox
+/// and enforces fine-grained permissions on API operations.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ServiceGatorConfig {
+    /// Whether to enable service-gator (default: false, auto-enabled if scopes configured)
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Port to listen on (default: 8765)
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// GitHub scope configuration
+    #[serde(default)]
+    pub gh: GithubScope,
+    /// JIRA scope configuration
+    #[serde(default)]
+    pub jira: JiraScope,
+}
+
+impl ServiceGatorConfig {
+    /// Check if service-gator should be enabled.
+    /// Returns true if explicitly enabled OR if any scopes are configured.
+    pub fn is_enabled(&self) -> bool {
+        if let Some(enabled) = self.enabled {
+            return enabled;
+        }
+        // Auto-enable if any scopes are configured
+        !self.gh.repos.is_empty()
+            || !self.gh.prs.is_empty()
+            || !self.jira.projects.is_empty()
+            || !self.jira.issues.is_empty()
+    }
+
+    /// Get the port to use
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(SERVICE_GATOR_DEFAULT_PORT)
+    }
+}
+
+/// GitHub scope configuration for service-gator
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct GithubScope {
+    /// Repository permissions: "owner/repo" or "owner/*" → permission
+    #[serde(default)]
+    pub repos: HashMap<String, GhRepoPermission>,
+    /// PR-specific permissions: "owner/repo#123" → permission
+    #[serde(default)]
+    pub prs: HashMap<String, GhResourcePermission>,
+    /// Issue-specific permissions: "owner/repo#123" → permission
+    #[serde(default)]
+    pub issues: HashMap<String, GhResourcePermission>,
+    /// GraphQL API permission level
+    #[serde(default)]
+    pub graphql: GraphQlPermission,
+}
+
+/// Fine-grained permissions for a GitHub repository
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct GhRepoPermission {
+    /// Can read the repository (view PRs, issues, code, etc.)
+    #[serde(default)]
+    pub read: bool,
+    /// Can create draft PRs in this repo
+    #[serde(default)]
+    pub create_draft: bool,
+    /// Can create/update/delete pending PR reviews
+    #[serde(default)]
+    pub pending_review: bool,
+    /// Full write access (merge, close, create non-draft, etc.)
+    #[serde(default)]
+    pub write: bool,
+}
+
+/// Permissions for a specific PR or issue
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct GhResourcePermission {
+    /// Can read this resource
+    #[serde(default)]
+    pub read: bool,
+    /// Can write to this resource (comment, edit, etc.)
+    #[serde(default)]
+    pub write: bool,
+}
+
+/// GraphQL permission level
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphQlPermission {
+    /// No GraphQL access (default)
+    #[default]
+    None,
+    /// Read-only GraphQL access
+    Read,
+    /// Full GraphQL access
+    Write,
+}
+
+/// JIRA scope configuration for service-gator
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct JiraScope {
+    /// Project permissions: "PROJ" → permission
+    #[serde(default)]
+    pub projects: HashMap<String, JiraProjectPermission>,
+    /// Issue-specific permissions: "PROJ-123" → permission
+    #[serde(default)]
+    pub issues: HashMap<String, JiraIssuePermission>,
+}
+
+/// JIRA project permissions
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct JiraProjectPermission {
+    /// Can read the project (list issues, view, etc.)
+    #[serde(default)]
+    pub read: bool,
+    /// Can create issues in this project
+    #[serde(default)]
+    pub create: bool,
+    /// Full write access
+    #[serde(default)]
+    pub write: bool,
+}
+
+/// JIRA issue permissions
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct JiraIssuePermission {
+    /// Can read this issue
+    #[serde(default)]
+    pub read: bool,
+    /// Can write to this issue
+    #[serde(default)]
+    pub write: bool,
+}
+
+/// Generate a service-gator scope config as TOML string
+///
+/// This is written to ~/.config/service-gator.toml inside the container
+/// for service-gator to read.
+pub fn generate_service_gator_toml(config: &ServiceGatorConfig) -> String {
+    let mut output = String::new();
+    output.push_str("# Generated by devaipod - do not edit manually\n");
+    output.push_str("# This file is monitored and reloaded by service-gator\n\n");
+
+    // GitHub repos
+    if !config.gh.repos.is_empty() {
+        output.push_str("[gh.repos]\n");
+        for (pattern, perm) in &config.gh.repos {
+            let mut perms = Vec::new();
+            if perm.read {
+                perms.push("read = true");
+            }
+            if perm.create_draft {
+                perms.push("create-draft = true");
+            }
+            if perm.pending_review {
+                perms.push("pending-review = true");
+            }
+            if perm.write {
+                perms.push("write = true");
+            }
+            if !perms.is_empty() {
+                output.push_str(&format!("\"{}\" = {{ {} }}\n", pattern, perms.join(", ")));
+            }
+        }
+        output.push('\n');
+    }
+
+    // GitHub PRs
+    if !config.gh.prs.is_empty() {
+        output.push_str("[gh.prs]\n");
+        for (ref_str, perm) in &config.gh.prs {
+            let mut perms = Vec::new();
+            if perm.read {
+                perms.push("read = true");
+            }
+            if perm.write {
+                perms.push("write = true");
+            }
+            if !perms.is_empty() {
+                output.push_str(&format!("\"{}\" = {{ {} }}\n", ref_str, perms.join(", ")));
+            }
+        }
+        output.push('\n');
+    }
+
+    // GitHub GraphQL
+    if config.gh.graphql != GraphQlPermission::None {
+        output.push_str("[gh]\n");
+        let graphql_str = match config.gh.graphql {
+            GraphQlPermission::None => "none",
+            GraphQlPermission::Read => "read",
+            GraphQlPermission::Write => "write",
+        };
+        output.push_str(&format!("graphql = \"{}\"\n\n", graphql_str));
+    }
+
+    // JIRA projects
+    if !config.jira.projects.is_empty() {
+        output.push_str("[jira.projects]\n");
+        for (project, perm) in &config.jira.projects {
+            let mut perms = Vec::new();
+            if perm.read {
+                perms.push("read = true");
+            }
+            if perm.create {
+                perms.push("create = true");
+            }
+            if perm.write {
+                perms.push("write = true");
+            }
+            if !perms.is_empty() {
+                output.push_str(&format!("\"{}\" = {{ {} }}\n", project, perms.join(", ")));
+            }
+        }
+        output.push('\n');
+    }
+
+    // JIRA issues
+    if !config.jira.issues.is_empty() {
+        output.push_str("[jira.issues]\n");
+        for (issue, perm) in &config.jira.issues {
+            let mut perms = Vec::new();
+            if perm.read {
+                perms.push("read = true");
+            }
+            if perm.write {
+                perms.push("write = true");
+            }
+            if !perms.is_empty() {
+                output.push_str(&format!("\"{}\" = {{ {} }}\n", issue, perms.join(", ")));
+            }
+        }
+    }
+
+    output
 }
 
 /// Get the XDG config directory
@@ -490,6 +744,82 @@ container = "all"
         assert_eq!(config.secrets["test1"].container, ContainerTarget::Main);
         assert_eq!(config.secrets["test2"].container, ContainerTarget::Sidecar);
         assert_eq!(config.secrets["test3"].container, ContainerTarget::All);
+    }
+
+    #[test]
+    fn test_parse_service_gator_config() {
+        let toml = r#"
+[service-gator]
+enabled = true
+port = 9000
+
+[service-gator.gh.repos]
+"cgwalters/*" = { read = true }
+"cgwalters/bootc" = { read = true, create-draft = true }
+
+[service-gator.gh.prs]
+"cgwalters/bootc#123" = { read = true, write = true }
+
+[service-gator.jira.projects]
+"BOOTC" = { read = true, create = true }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.service_gator.enabled.unwrap());
+        assert_eq!(config.service_gator.port(), 9000);
+        assert_eq!(config.service_gator.gh.repos.len(), 2);
+        assert!(config.service_gator.gh.repos["cgwalters/*"].read);
+        assert!(!config.service_gator.gh.repos["cgwalters/*"].create_draft);
+        assert!(config.service_gator.gh.repos["cgwalters/bootc"].create_draft);
+        assert!(config.service_gator.gh.prs["cgwalters/bootc#123"].write);
+        assert!(config.service_gator.jira.projects["BOOTC"].create);
+    }
+
+    #[test]
+    fn test_service_gator_auto_enable() {
+        // Empty config - not enabled
+        let config = ServiceGatorConfig::default();
+        assert!(!config.is_enabled());
+
+        // Explicit enable
+        let mut config = ServiceGatorConfig::default();
+        config.enabled = Some(true);
+        assert!(config.is_enabled());
+
+        // Auto-enable when repos configured
+        let mut config = ServiceGatorConfig::default();
+        config
+            .gh
+            .repos
+            .insert("owner/repo".to_string(), GhRepoPermission::default());
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_generate_service_gator_toml() {
+        let mut config = ServiceGatorConfig::default();
+        config.gh.repos.insert(
+            "owner/repo".to_string(),
+            GhRepoPermission {
+                read: true,
+                create_draft: true,
+                ..Default::default()
+            },
+        );
+        config.jira.projects.insert(
+            "PROJ".to_string(),
+            JiraProjectPermission {
+                read: true,
+                ..Default::default()
+            },
+        );
+
+        let toml = generate_service_gator_toml(&config);
+        assert!(toml.contains("[gh.repos]"));
+        assert!(toml.contains("\"owner/repo\""));
+        assert!(toml.contains("read = true"));
+        assert!(toml.contains("create-draft = true"));
+        assert!(toml.contains("[jira.projects]"));
+        assert!(toml.contains("\"PROJ\""));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use color_eyre::eyre::{bail, Context, Result};
 mod config;
 mod devpod;
 mod secrets;
+mod service_gator;
 
 // =============================================================================
 // Host CLI - commands that run on the host machine (outside devcontainer)
@@ -238,7 +239,9 @@ fn run_container(cli: ContainerCli) -> Result<()> {
         ContainerCommand::Tmux { agent } => cmd_tmux(&config, agent.as_deref()),
         ContainerCommand::Enter => cmd_enter(),
         ContainerCommand::ConfigureEnv => cmd_configure_env(),
-        ContainerCommand::InternalRunAgent { agent, task } => cmd_internal_run_agent(&agent, &task),
+        ContainerCommand::InternalRunAgent { agent, task } => {
+            cmd_internal_run_agent(&config, &agent, &task)
+        }
     }
 }
 
@@ -1148,6 +1151,20 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
 
         // Build the bwrap command for the agent
         let (real_home, agent_home) = get_agent_home_dir()?;
+
+        // Start service-gator if configured
+        if config.service_gator.is_enabled() {
+            if let Err(e) = service_gator::start_server(&config.service_gator) {
+                tracing::warn!("Failed to start service-gator: {}", e);
+            } else {
+                // Configure opencode to use service-gator MCP
+                if let Err(e) =
+                    service_gator::configure_opencode(&agent_home, &config.service_gator)
+                {
+                    tracing::warn!("Failed to configure opencode for service-gator: {}", e);
+                }
+            }
+        }
         let agent_env_vars = config::collect_agent_env_vars();
 
         // Check for podman socket (started by devaipod-init.sh)
@@ -1268,7 +1285,7 @@ fn cmd_enter() -> Result<()> {
 
 /// Internal command: Run an agent with task inside devcontainer
 /// This is called via `devpod ssh` from the host's `run` command.
-fn cmd_internal_run_agent(agent: &str, task: &str) -> Result<()> {
+fn cmd_internal_run_agent(config: &config::Config, agent: &str, task: &str) -> Result<()> {
     let workspace_path = get_workspace_path()?;
 
     tracing::info!(
@@ -1294,6 +1311,18 @@ fn cmd_internal_run_agent(agent: &str, task: &str) -> Result<()> {
 
     // Build and run the bwrap command
     let (real_home, agent_home) = get_agent_home_dir()?;
+
+    // Start service-gator if configured
+    if config.service_gator.is_enabled() {
+        if let Err(e) = service_gator::start_server(&config.service_gator) {
+            tracing::warn!("Failed to start service-gator: {}", e);
+        } else {
+            // Configure opencode to use service-gator MCP
+            if let Err(e) = service_gator::configure_opencode(&agent_home, &config.service_gator) {
+                tracing::warn!("Failed to configure opencode for service-gator: {}", e);
+            }
+        }
+    }
 
     // Check for podman socket (started by devaipod-init.sh)
     let podman_socket = get_podman_socket();

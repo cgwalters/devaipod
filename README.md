@@ -85,6 +85,7 @@ For controlled access to external services (like creating PRs), agents should us
 - [Sandboxing Model](docs/sandboxing.md) - How the bwrap sandbox works
 - [Secret Management](docs/secrets.md) - Handling API keys and credentials
 - [OpenCode Agent](docs/opencode.md) - Configuring the default AI agent
+- [Service-gator Integration](docs/service-gator.md) - Scope-restricted access to GitHub/JIRA
 
 ## License
 
