@@ -18,7 +18,27 @@
 //! Run with: `just test-e2e-gh` or `DEVAIPOD_TEST_REPO=owner/repo cargo test test_e2e_gh -- --ignored`
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+/// RAII guard that cleans up a directory when dropped.
+/// Ensures cleanup happens even if test panics.
+struct CleanupGuard(PathBuf);
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// RAII guard that cleans up a devpod workspace when dropped.
+struct WorkspaceCleanupGuard(String);
+
+impl Drop for WorkspaceCleanupGuard {
+    fn drop(&mut self) {
+        cleanup_workspace(&self.0);
+    }
+}
 
 /// Helper to run devaipod CLI commands
 fn devaipod(args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -619,6 +639,185 @@ fn test_compose_generation_creates_valid_files() {
 
     // TODO: Add a --dry-run or --generate-only flag to test compose generation
     // without actually starting devpod
+}
+
+/// Test dry-run on this project (just verifies command runs without starting containers)
+#[test]
+fn test_dry_run_on_self() {
+    // Run dry-run on this project - should succeed without starting anything
+    let output = devaipod(&["up", ".", "--dry-run"]).expect("Failed to run devaipod up --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "devaipod up --dry-run failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify dry-run output mentions the source (output goes to stdout via tracing)
+    assert!(
+        stdout.contains("Dry run") || stdout.contains("dry run"),
+        "Expected dry-run message. stdout:\n{}",
+        stdout
+    );
+}
+
+/// Test that compose validates with podman-compose (if available)
+///
+/// NOTE: This test is ignored because compose generation has been temporarily
+/// removed while devaipod is simplified to be a thin wrapper around devpod.
+/// Re-enable this test when compose generation is re-implemented.
+#[test]
+#[ignore]
+fn test_compose_validates() {
+    use std::path::Path;
+
+    // Check if podman compose is available
+    let compose_available = Command::new("podman")
+        .args(["compose", "version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !compose_available {
+        eprintln!("Skipping: podman compose not available");
+        return;
+    }
+
+    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let devaipod_dir = project_root.join(".devaipod");
+
+    // Use RAII guard to ensure cleanup even on panic
+    let _cleanup = CleanupGuard(devaipod_dir.clone());
+
+    // Generate compose files
+    let output = devaipod(&["up", ".", "--dry-run"]).expect("Failed to run devaipod up --dry-run");
+    assert!(output.status.success(), "dry-run failed");
+
+    // Validate with podman compose config
+    let validate_output = Command::new("podman")
+        .args(["compose", "config"])
+        .current_dir(&devaipod_dir)
+        .output()
+        .expect("Failed to run podman compose config");
+
+    let stdout = String::from_utf8_lossy(&validate_output.stdout);
+    let stderr = String::from_utf8_lossy(&validate_output.stderr);
+
+    assert!(
+        validate_output.status.success(),
+        "podman compose config failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify output contains expected services
+    assert!(
+        stdout.contains("agent:"),
+        "Missing agent service in output. Full output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("workspace:"),
+        "Missing workspace service in output. Full output:\n{}",
+        stdout
+    );
+}
+
+/// Full end-to-end test: actually start devaipod for this project
+///
+/// This test is ignored by default because it:
+/// - Takes significant time (container build + start)
+/// - Requires podman/docker
+/// - Modifies system state (creates devpod workspace)
+///
+/// Run with: cargo test test_e2e_recursive_self -- --ignored
+#[test]
+#[ignore]
+fn test_e2e_recursive_self() {
+    if !devpod_available() || !podman_available() {
+        eprintln!("Skipping: devpod or podman not available");
+        return;
+    }
+
+    use std::path::Path;
+
+    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_name = "devaipod"; // derived from directory name
+
+    // Clean up any existing workspace first
+    cleanup_workspace(workspace_name);
+
+    // Set up RAII guards for cleanup even on panic
+    let devaipod_dir = project_root.join(".devaipod");
+    let _dir_cleanup = CleanupGuard(devaipod_dir);
+    let _workspace_cleanup = WorkspaceCleanupGuard(workspace_name.to_string());
+
+    eprintln!("Starting devaipod for this project (recursive self-test)...");
+
+    // Start the workspace with --no-agent (we just want to verify containers start)
+    let output = devaipod(&["up", ".", "--no-agent"]).expect("Failed to run devaipod up");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "devaipod up failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    eprintln!("Workspace started. Verifying we can SSH in...");
+
+    // Verify we can SSH in and run a command
+    let ssh_output = Command::new("devpod")
+        .args([
+            "ssh",
+            workspace_name,
+            "--command",
+            "echo hello-from-devaipod",
+        ])
+        .output()
+        .expect("Failed to SSH");
+
+    let ssh_stdout = String::from_utf8_lossy(&ssh_output.stdout);
+    let ssh_stderr = String::from_utf8_lossy(&ssh_output.stderr);
+
+    assert!(
+        ssh_output.status.success(),
+        "SSH failed.\nstdout: {}\nstderr: {}",
+        ssh_stdout,
+        ssh_stderr
+    );
+    assert!(
+        ssh_stdout.contains("hello-from-devaipod"),
+        "Expected 'hello-from-devaipod' in SSH output: {}",
+        ssh_stdout
+    );
+    eprintln!("SSH verified. Output: {}", ssh_stdout.trim());
+
+    // Verify cargo is available inside the container
+    eprintln!("Verifying cargo is available in container...");
+    let cargo_output = Command::new("devpod")
+        .args(["ssh", workspace_name, "--command", "cargo --version"])
+        .output()
+        .expect("Failed to check cargo");
+
+    let cargo_stdout = String::from_utf8_lossy(&cargo_output.stdout);
+    if cargo_output.status.success() {
+        eprintln!("Cargo available: {}", cargo_stdout.trim());
+    } else {
+        eprintln!("Warning: cargo not immediately available (may need shell init)");
+    }
+
+    eprintln!("Recursive self-test passed! (cleanup will happen automatically)");
 }
 
 /// Test with a mock agent script that simulates opencode behavior

@@ -1,15 +1,22 @@
 //! Docker Compose generation for multi-container devcontainer setup
+//! Compose generation module (future enhancement)
 //!
 //! This module transforms a simple devcontainer.json into a multi-container
 //! Docker Compose configuration with:
 //! - workspace: User's devcontainer (for human interaction)
 //! - agent: Same image, running opencode serve (sandboxed AI execution)
 //! - gator: service-gator MCP server (scoped external service access)
+//!
+//! Currently not used - devaipod is a thin wrapper around devpod.
+//! This module will be enabled when agent sidecar support is added.
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{bail, Context, Result};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ServiceGatorConfig;
@@ -138,9 +145,9 @@ pub enum Command {
 #[derive(Debug, Serialize)]
 pub struct ComposeConfig {
     pub version: String,
-    pub services: HashMap<String, ComposeService>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub volumes: HashMap<String, serde_json::Value>,
+    pub services: IndexMap<String, ComposeService>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub volumes: IndexMap<String, serde_json::Value>,
 }
 
 /// A service in the Docker Compose file
@@ -158,8 +165,8 @@ pub struct ComposeService {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<StringOrArray>,
 
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub environment: HashMap<String, String>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub environment: IndexMap<String, String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<ComposeDependsOn>,
@@ -188,8 +195,8 @@ pub struct ComposeService {
 pub struct ComposeBuild {
     pub context: String,
     pub dockerfile: String,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub args: HashMap<String, String>,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub args: IndexMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
@@ -200,7 +207,7 @@ pub struct ComposeBuild {
 #[allow(dead_code)]
 pub enum ComposeDependsOn {
     Simple(Vec<String>),
-    WithCondition(HashMap<String, DependsOnCondition>),
+    WithCondition(IndexMap<String, DependsOnCondition>),
 }
 
 #[derive(Debug, Serialize)]
@@ -329,7 +336,7 @@ pub fn generate_compose(
         let build = ComposeBuild {
             context: "..".to_string(),
             dockerfile: ".devaipod/Dockerfile".to_string(),
-            args: HashMap::new(),
+            args: IndexMap::new(),
             target: None,
         };
         (Some(dockerfile), build)
@@ -355,7 +362,11 @@ pub fn generate_compose(
         let build_cfg = ComposeBuild {
             context: adjusted_context,
             dockerfile: adjusted_dockerfile,
-            args: build.args.clone(),
+            args: build
+                .args
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             target: build.target.clone(),
         };
         (None, build_cfg)
@@ -364,8 +375,9 @@ pub fn generate_compose(
     };
 
     // Build the compose configuration
-    let mut services = HashMap::new();
-    let mut volumes = HashMap::new();
+    // Using IndexMap to preserve insertion order in the generated YAML
+    let mut services = IndexMap::new();
+    let mut volumes = IndexMap::new();
 
     // Workspace service (user's environment)
     let mut workspace_service = ComposeService {
@@ -375,9 +387,9 @@ pub fn generate_compose(
             "workspace-home:/home/vscode".to_string(),
         ],
         command: Some(StringOrArray::String("sleep infinity".to_string())),
-        environment: HashMap::new(),
+        environment: IndexMap::new(),
         depends_on: Some(ComposeDependsOn::WithCondition({
-            let mut deps = HashMap::new();
+            let mut deps = IndexMap::new();
             deps.insert(
                 "agent".to_string(),
                 DependsOnCondition {
@@ -425,7 +437,7 @@ pub fn generate_compose(
             "0.0.0.0".to_string(),
         ])),
         environment: {
-            let mut env = HashMap::new();
+            let mut env = IndexMap::new();
             env.insert("HOME".to_string(), "/home/ai".to_string());
             env.insert(
                 "OPENCODE_CONFIG".to_string(),
@@ -468,7 +480,7 @@ pub fn generate_compose(
                 format!("0.0.0.0:{GATOR_PORT}"),
             ])),
             environment: {
-                let mut env = HashMap::new();
+                let mut env = IndexMap::new();
                 // Tokens passed via environment
                 env.insert("GH_TOKEN".to_string(), "${GH_TOKEN}".to_string());
                 env.insert(
@@ -681,82 +693,13 @@ fn generate_opencode_config(gator_config: &ServiceGatorConfig) -> Result<String>
 }
 
 /// Convert compose config to YAML string
-/// Note: We use serde_json + manual conversion since serde_yaml has issues with some types
+#[allow(dead_code)]
 fn serde_yaml_to_string(compose: &ComposeConfig) -> Result<String> {
-    // For now, use a simple YAML generation approach
-    // In production, we'd want to use a proper YAML library
-
-    let json = serde_json::to_value(compose)?;
-    let yaml = json_to_yaml(&json, 0);
-    Ok(yaml)
-}
-
-/// Simple JSON to YAML converter (handles our subset of types)
-fn json_to_yaml(value: &serde_json::Value, indent: usize) -> String {
-    let prefix = "  ".repeat(indent);
-
-    match value {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => {
-            // Quote strings that might be ambiguous
-            if s.contains(':')
-                || s.contains('#')
-                || s.contains('\n')
-                || s.starts_with('$')
-                || s.is_empty()
-            {
-                format!("\"{}\"", s.replace('\"', "\\\""))
-            } else {
-                s.clone()
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            if arr.is_empty() {
-                "[]".to_string()
-            } else {
-                let items: Vec<String> = arr
-                    .iter()
-                    .map(|v| {
-                        let yaml = json_to_yaml(v, indent + 1);
-                        if matches!(v, serde_json::Value::Object(_)) {
-                            format!("{prefix}  -\n{yaml}")
-                        } else {
-                            format!("{prefix}  - {yaml}")
-                        }
-                    })
-                    .collect();
-                format!("\n{}", items.join("\n"))
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            if obj.is_empty() {
-                "{}".to_string()
-            } else {
-                let items: Vec<String> = obj
-                    .iter()
-                    .map(|(k, v)| {
-                        let yaml_value = json_to_yaml(v, indent + 1);
-                        if matches!(
-                            v,
-                            serde_json::Value::Object(_) | serde_json::Value::Array(_)
-                        ) && !yaml_value.starts_with('[')
-                            && !yaml_value.starts_with('{')
-                        {
-                            format!("{prefix}  {k}:{yaml_value}")
-                        } else {
-                            format!("{prefix}  {k}: {yaml_value}")
-                        }
-                    })
-                    .collect();
-                format!("\n{}", items.join("\n"))
-            }
-        }
-    }
+    serde_yaml::to_string(compose).context("Failed to serialize compose config to YAML")
 }
 
 /// Find the devcontainer.json file for a project
+#[allow(dead_code)]
 pub fn find_devcontainer_json(project_path: &Path) -> Result<PathBuf> {
     // Standard location
     let standard = project_path.join(".devcontainer/devcontainer.json");
@@ -793,6 +736,7 @@ pub fn find_devcontainer_json(project_path: &Path) -> Result<PathBuf> {
 }
 
 /// Write generated files to .devaipod directory
+#[allow(dead_code)]
 pub fn write_generated_files(project_path: &Path, generated: &GeneratedCompose) -> Result<PathBuf> {
     let devaipod_dir = project_path.join(".devaipod");
     std::fs::create_dir_all(&devaipod_dir)
