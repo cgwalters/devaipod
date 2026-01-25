@@ -39,6 +39,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+  # Security audit of dependencies
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+
   # Test the devcontainer feature install script syntax
   shellcheck:
     runs-on: ubuntu-latest

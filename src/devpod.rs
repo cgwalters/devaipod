@@ -71,12 +71,18 @@ pub fn up(
         tracing::info!("Injecting {} secret(s) via --workspace-env", secrets.len());
     }
 
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .context("Failed to run devpod up. Is devpod installed?")?;
 
-    if !status.success() {
-        bail!("devpod up failed");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("devpod up failed with exit code {:?}", output.status.code());
+        } else {
+            bail!("devpod up failed: {}", stderr);
+        }
     }
 
     // Derive workspace name from source
@@ -98,10 +104,19 @@ pub fn ssh(workspace: &str, command: &[String]) -> Result<()> {
         cmd.args(command);
     }
 
-    let status = cmd.status().context("Failed to run devpod ssh")?;
+    let output = cmd.output().context("Failed to run devpod ssh")?;
 
-    if !status.success() {
-        bail!("devpod ssh failed");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "devpod ssh failed with exit code {:?}",
+                output.status.code()
+            );
+        } else {
+            bail!("devpod ssh failed: {}", stderr);
+        }
     }
 
     Ok(())
@@ -110,17 +125,31 @@ pub fn ssh(workspace: &str, command: &[String]) -> Result<()> {
 /// Run `devpod list` to show workspaces
 pub fn list(json: bool) -> Result<()> {
     let mut cmd = Command::new("devpod");
+    configure_devpod_env(&mut cmd);
     cmd.arg("list");
 
     if json {
         cmd.arg("--output=json");
     }
 
-    let status = cmd.status().context("Failed to run devpod list")?;
+    let output = cmd.output().context("Failed to run devpod list")?;
 
-    if !status.success() {
-        bail!("devpod list failed");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "devpod list failed with exit code {:?}",
+                output.status.code()
+            );
+        } else {
+            bail!("devpod list failed: {}", stderr);
+        }
     }
+
+    // Print stdout for the user
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    print!("{}", stdout);
 
     Ok(())
 }
@@ -129,13 +158,23 @@ pub fn list(json: bool) -> Result<()> {
 pub fn stop(workspace: &str) -> Result<()> {
     tracing::info!("Stopping workspace '{}'", workspace);
 
-    let status = Command::new("devpod")
-        .args(["stop", workspace])
-        .status()
-        .context("Failed to run devpod stop")?;
+    let mut cmd = Command::new("devpod");
+    configure_devpod_env(&mut cmd);
+    cmd.args(["stop", workspace]);
 
-    if !status.success() {
-        bail!("devpod stop failed");
+    let output = cmd.output().context("Failed to run devpod stop")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "devpod stop failed with exit code {:?}",
+                output.status.code()
+            );
+        } else {
+            bail!("devpod stop failed: {}", stderr);
+        }
     }
 
     Ok(())
@@ -146,16 +185,26 @@ pub fn delete(workspace: &str, force: bool) -> Result<()> {
     tracing::info!("Deleting workspace '{}'", workspace);
 
     let mut cmd = Command::new("devpod");
+    configure_devpod_env(&mut cmd);
     cmd.args(["delete", workspace]);
 
     if force {
         cmd.arg("--force");
     }
 
-    let status = cmd.status().context("Failed to run devpod delete")?;
+    let output = cmd.output().context("Failed to run devpod delete")?;
 
-    if !status.success() {
-        bail!("devpod delete failed");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "devpod delete failed with exit code {:?}",
+                output.status.code()
+            );
+        } else {
+            bail!("devpod delete failed: {}", stderr);
+        }
     }
 
     Ok(())

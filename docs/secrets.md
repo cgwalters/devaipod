@@ -88,7 +88,7 @@ export DEVAIPOD_AGENT_GOOGLE_CLOUD_PROJECT="my-project"
 This makes it explicit which secrets the agent can access. There is no hardcoded allowlist.
 
 **NOT forwarded** (kept outside sandbox):
-- `GH_TOKEN` - GitHub access is via upcalls only
+- `GH_TOKEN` - GitHub access should use MCP servers (like service-gator) running outside the sandbox
 - `ANTHROPIC_API_KEY` (without prefix) - only the prefixed version is forwarded
 - Any env var without the `DEVAIPOD_AGENT_` prefix
 
@@ -103,7 +103,7 @@ export DEVAIPOD_AGENT_ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
 # Vertex AI config - agent needs this
 export DEVAIPOD_AGENT_GOOGLE_CLOUD_PROJECT="$GOOGLE_CLOUD_PROJECT"
 
-# GH_TOKEN stays unprefixed - only upcall listener can use it
+# GH_TOKEN stays unprefixed - for MCP servers running outside sandbox
 export GH_TOKEN="ghp_full_access"
 ```
 
@@ -112,7 +112,7 @@ export GH_TOKEN="ghp_full_access"
 You can give the agent different credentials than human tools in the outer container:
 
 ```bash
-# Full-access token for human tools and upcalls
+# Full-access token for human tools and MCP servers
 export GH_TOKEN="ghp_full_access"
 
 # Restricted token for the agent (or omit to give agent no GH_TOKEN)
@@ -129,4 +129,4 @@ The `DEVAIPOD_AGENT_*` vars are available in the outer container too (for script
 
 ## GitHub Token
 
-`GH_TOKEN` is intentionally NOT forwarded to the sandbox. The agent uses the upcall mechanism (`gh-restricted`) which runs outside the sandbox where `GH_TOKEN` is available.
+`GH_TOKEN` is intentionally NOT forwarded to the sandbox. For GitHub operations, agents should use MCP servers like [service-gator](https://github.com/cgwalters/service-gator) which run outside the sandbox with appropriate access controls.

@@ -31,19 +31,14 @@ The agent runs inside **two layers of isolation**:
 │  │  │  • No /var, /opt, real $HOME                    │  │  │
 │  │  │  • PID namespace isolated                       │  │  │
 │  │  │  ┌─────────────┐                                │  │  │
-│  │  │  │  AI Agent   │ ←── /run/devaipod.sock ──→     │  │  │
-│  │  │  │  (opencode) │      (JSON-RPC upcalls)        │  │  │
-│  │  │  │             │ ←── /run/podman/podman.sock    │  │  │
-│  │  │  └─────────────┘      (container operations)    │  │  │
+│  │  │  │  AI Agent   │ ←── /run/podman/podman.sock    │  │  │
+│  │  │  │  (opencode) │      (container operations)    │  │  │
+│  │  │  └─────────────┘                                │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  │                                                         │  │
 │  │  Podman Service (sudo podman system service)          │  │
 │  │  • Runs as root - safe because container is rootless  │  │
 │  │  • Socket at /run/podman/podman.sock (world-readable) │  │
-│  │                                                         │  │
-│  │  Upcall Listener (runs outside sandbox)               │  │
-│  │  • Executes allowlisted binaries from                 │  │
-│  │    /usr/lib/devaipod/upcalls/                         │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -123,14 +118,13 @@ these flags manually.
 
 2. **Secrets in workspace**: If `.env` or other secrets exist in the workspace, the agent can read them.
 
-## Upcalls
+## External Service Access
 
-For operations requiring access outside the sandbox (like creating PRs), the agent uses an upcall mechanism. See `src/upcall.rs` for details.
+For operations requiring access to external services (GitHub, Jira, etc.), agents
+should use MCP servers like [service-gator](https://github.com/cgwalters/service-gator)
+which provides scope-based access control for CLI tools. This approach is preferred
+over building service access directly into devaipod because:
 
-The agent connects to `/run/devaipod.sock` and can execute binaries from `/usr/lib/devaipod/upcalls/`:
-- `gh-restricted`: Configurable GitHub CLI wrapper. Set `allow-read-all = true` in 
-  `~/.config/gh-restricted.toml` for read-only mode, or leave default for restricted
-  write operations (draft PRs only for allowed repos).
-
-For future work on interactive permission prompts (similar to XDG Desktop Portal),
-see [todo/upcalls-portals.md](todo/upcalls-portals.md).
+- MCP servers can be independently developed and configured
+- Different projects can use different scoping policies
+- The security boundary is clearer (the MCP server runs outside the sandbox)

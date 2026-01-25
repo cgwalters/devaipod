@@ -68,7 +68,7 @@ The agent can only write to:
 - The workspace (`/workspaces/<name>`)
 - Its isolated home (`$HOME/ai` mounted over `$HOME`)
 
-For controlled operations (like creating PRs), the agent uses an upcall mechanism with allowlisted binaries (`gh-restricted`). See [Sandboxing Model](docs/sandboxing.md) for details.
+For controlled access to external services (like creating PRs), agents should use MCP servers like [service-gator](https://github.com/cgwalters/service-gator) which provides scope-based access control. See [Sandboxing Model](docs/sandboxing.md) for details.
 
 ## Status
 
@@ -77,7 +77,7 @@ For controlled operations (like creating PRs), the agent uses an upcall mechanis
 | Feature | Status |
 |---------|--------|
 | Sandbox isolation | ✅ Working |
-| GitHub PR creation (draft) | ✅ Working |
+| MCP server integration | ✅ Supported (via service-gator) |
 | Network isolation | 🟡 Not yet (full network access) |
 
 ## Documentation

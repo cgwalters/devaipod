@@ -2,7 +2,7 @@
     "name": "devaipod",
     "id": "devaipod",
     "version": "0.1.0",
-    "description": "Installs devaipod and its upcall binaries for sandboxed AI agent execution",
+    "description": "Installs devaipod for sandboxed AI agent execution in devcontainers",
     "options": {
         "version": {
             "type": "string",

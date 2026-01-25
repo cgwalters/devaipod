@@ -73,7 +73,6 @@ devaipod-aarch64-unknown-linux-gnu.tar.gz
 
 Each tarball should contain:
 - `devaipod` - Main binary
-- `gh-restricted` - GitHub CLI wrapper for sandboxed PR creation
 
 ## GitHub Actions for Releases
 

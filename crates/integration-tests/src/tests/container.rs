@@ -134,7 +134,7 @@ podman_integration_test!(test_container_exec);
 
 /// Create a test config file with sidecar settings
 fn create_test_config(dir: &Path, sidecar_image: &str) -> std::path::PathBuf {
-    let config_path = dir.join("devc.toml");
+    let config_path = dir.join("devaipod.toml");
     let config_content = format!(
         r#"
 [sidecar]

@@ -1,6 +1,9 @@
-//! Global configuration management for devc
+//! Global configuration management for devaipod
 //!
-//! Handles loading and parsing of the unified configuration file at `~/.config/devc.toml`.
+//! Handles loading and parsing of the configuration file. Looks for config in this order:
+//! 1. `~/.config/devaipod.toml` (preferred)
+//! 2. `~/.config/devc.toml` (legacy, for backward compatibility)
+//!
 //! Also provides backward compatibility with the legacy `~/.config/devc/secrets.toml`.
 
 use std::collections::HashMap;
@@ -56,6 +59,9 @@ pub struct AgentConfig {
 /// Prefix for environment variables that should be forwarded into the sandbox.
 /// Variables like `DEVAIPOD_AGENT_FOO=bar` become `FOO=bar` inside the sandbox.
 pub const AGENT_ENV_PREFIX: &str = "DEVAIPOD_AGENT_";
+
+/// Default agent to use when none is specified in config or CLI.
+pub const DEFAULT_AGENT: &str = "opencode";
 
 // TODO: Support a static allowlist in devcontainer.json, e.g.:
 // "customizations": { "devaipod": { "env_allowlist": ["ANTHROPIC_API_KEY"] } }
@@ -195,28 +201,49 @@ pub struct SecretMapping {
     pub container: ContainerTarget,
 }
 
-/// Get the main config file path (~/.config/devc.toml)
-pub fn config_path() -> PathBuf {
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
+/// Get the XDG config directory
+fn get_config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".config")
-        });
+        })
+}
 
-    config_dir.join("devc.toml")
+/// Get the main config file path.
+///
+/// Returns the first existing config file in order of preference:
+/// 1. `~/.config/devaipod.toml` (preferred)
+/// 2. `~/.config/devc.toml` (legacy)
+///
+/// If neither exists, returns the preferred path for creation.
+pub fn config_path() -> PathBuf {
+    let config_dir = get_config_dir();
+
+    // Check for new name first
+    let new_path = config_dir.join("devaipod.toml");
+    if new_path.exists() {
+        return new_path;
+    }
+
+    // Fall back to legacy name
+    let legacy_path = config_dir.join("devc.toml");
+    if legacy_path.exists() {
+        tracing::debug!(
+            "Using legacy config path {}. Consider renaming to devaipod.toml",
+            legacy_path.display()
+        );
+        return legacy_path;
+    }
+
+    // Neither exists, return preferred path for creation
+    new_path
 }
 
 /// Get the legacy secrets config path (~/.config/devc/secrets.toml)
 fn legacy_secrets_path() -> PathBuf {
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".config")
-        });
-
-    config_dir.join("devc").join("secrets.toml")
+    get_config_dir().join("devc").join("secrets.toml")
 }
 
 /// Load configuration from the default path or a specific path
@@ -467,8 +494,13 @@ container = "all"
 
     #[test]
     fn test_config_path() {
-        // Just verify it returns a path ending with devc.toml
+        // Verify it returns a path ending with devaipod.toml (preferred) or devc.toml (legacy)
         let path = config_path();
-        assert!(path.ends_with("devc.toml"));
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.ends_with("devaipod.toml") || path_str.ends_with("devc.toml"),
+            "Expected path to end with devaipod.toml or devc.toml, got: {}",
+            path_str
+        );
     }
 }

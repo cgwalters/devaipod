@@ -17,16 +17,6 @@ fi
 devaipod --help > /dev/null
 echo "PASS: devaipod --help works"
 
-# Verify gh-restricted is installed
-echo "Testing gh-restricted binary..."
-if [ ! -x /usr/lib/devaipod/upcalls/gh-restricted ]; then
-    echo "ERROR: gh-restricted not found at /usr/lib/devaipod/upcalls/gh-restricted"
-    exit 1
-fi
-
-/usr/lib/devaipod/upcalls/gh-restricted --help > /dev/null
-echo "PASS: gh-restricted --help works"
-
 # Verify bubblewrap is installed
 echo "Testing bubblewrap..."
 if ! command -v bwrap &> /dev/null; then

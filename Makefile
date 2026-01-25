@@ -24,8 +24,6 @@ bin:
 
 install:
 	install -D -m 0755 -t $(DESTDIR)$(prefix)/bin target/release/devaipod
-	install -d -m 0755 $(DESTDIR)$(prefix)/lib/devaipod/upcalls
-	install -D -m 0755 -t $(DESTDIR)$(prefix)/lib/devaipod/upcalls target/release/gh-restricted
 
 .PHONY: validate
 validate:

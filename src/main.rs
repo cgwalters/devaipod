@@ -6,9 +6,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 
 use clap::Parser;
 use color_eyre::eyre::{bail, Context, Result};
@@ -16,8 +13,6 @@ use color_eyre::eyre::{bail, Context, Result};
 mod config;
 mod devpod;
 mod secrets;
-mod state;
-mod upcall;
 
 // =============================================================================
 // Host CLI - commands that run on the host machine (outside devcontainer)
@@ -160,7 +155,7 @@ enum ContainerCommand {
     ConfigureEnv,
     /// Internal: Run an agent with task (called by 'run' command via devpod ssh)
     ///
-    /// Starts the upcall listener, runs the agent in a bwrap sandbox, and cleans up.
+    /// Runs the agent in a bwrap sandbox.
     #[command(hide = true)]
     InternalRunAgent {
         /// AI agent to run
@@ -169,54 +164,6 @@ enum ContainerCommand {
         /// Task for the agent
         #[arg(long)]
         task: String,
-        /// Repositories the agent is allowed to write to (format: owner/repo)
-        #[arg(long = "repo")]
-        repos: Vec<String>,
-    },
-    /// Perform an upcall from inside the sandbox
-    ///
-    /// Upcalls allow the sandboxed agent to request controlled operations
-    /// that require access outside the sandbox (like creating a GitHub PR).
-    #[command(subcommand)]
-    Upcall(UpcallCommand),
-}
-
-#[derive(Debug, Parser)]
-enum UpcallCommand {
-    /// Execute an allowlisted binary via upcall RPC
-    ///
-    /// Runs a binary from /usr/lib/devaipod/upcalls/ with the given arguments.
-    /// This allows sandboxed agents to perform controlled operations.
-    ///
-    /// Examples:
-    ///   devaipod upcall exec gh-restricted pr create --draft --title "Fix"
-    Exec {
-        /// Binary name (must be in /usr/lib/devaipod/upcalls/)
-        binary: String,
-        /// Arguments to pass to the binary
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
-    },
-    /// Show the current state (allowed repos and PRs)
-    ///
-    /// Displays the list of repositories the agent can write to and
-    /// the PRs that have been created by the agent.
-    State,
-    /// Add a repository to the allowed list
-    ///
-    /// Allows the agent to create draft PRs in this repository.
-    ///
-    /// Examples:
-    ///   devaipod upcall add-repo containers/composefs
-    ///   devaipod upcall add-repo containers/bootc
-    AddRepo {
-        /// Repository in "owner/repo" format
-        repo: String,
-    },
-    /// Remove a repository from the allowed list
-    RemoveRepo {
-        /// Repository in "owner/repo" format
-        repo: String,
     },
 }
 
@@ -291,10 +238,7 @@ fn run_container(cli: ContainerCli) -> Result<()> {
         ContainerCommand::Tmux { agent } => cmd_tmux(&config, agent.as_deref()),
         ContainerCommand::Enter => cmd_enter(),
         ContainerCommand::ConfigureEnv => cmd_configure_env(),
-        ContainerCommand::InternalRunAgent { agent, task, repos } => {
-            cmd_internal_run_agent(&agent, &task, &repos)
-        }
-        ContainerCommand::Upcall(upcall_cmd) => cmd_upcall(upcall_cmd),
+        ContainerCommand::InternalRunAgent { agent, task } => cmd_internal_run_agent(&agent, &task),
     }
 }
 
@@ -337,7 +281,7 @@ fn cmd_up(
         let agent_name = agent
             .map(|s| s.to_string())
             .or_else(|| config.agent.default_agent.clone())
-            .unwrap_or_else(|| "goose".to_string());
+            .unwrap_or_else(|| config::DEFAULT_AGENT.to_string());
 
         tracing::info!("Starting {} agent in tmux session...", agent_name);
         start_agent_in_tmux(&workspace_name, &agent_name)?;
@@ -441,7 +385,7 @@ fn cmd_run(
     let agent_name = agent
         .map(|s| s.to_string())
         .or_else(|| config.agent.default_agent.clone())
-        .unwrap_or_else(|| "opencode".to_string());
+        .unwrap_or_else(|| config::DEFAULT_AGENT.to_string());
 
     tracing::info!("Running {} agent...", agent_name);
 
@@ -502,120 +446,6 @@ fn get_agent_home_dir() -> Result<(String, String)> {
     Ok((real_home, agent_home))
 }
 
-/// Handle for a running upcall listener thread
-struct UpcallListenerHandle {
-    #[allow(dead_code)]
-    thread: thread::JoinHandle<()>,
-    shutdown: Arc<AtomicBool>,
-    socket_path: std::path::PathBuf,
-    workspace: String,
-}
-
-impl Drop for UpcallListenerHandle {
-    fn drop(&mut self) {
-        // Signal the listener to shut down
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Connect to the socket to unblock the listener's accept() call
-        let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
-        // Clean up the socket file and PID file
-        let _ = std::fs::remove_file(&self.socket_path);
-        let _ = state::remove_pid_file(&self.workspace);
-        tracing::debug!("Upcall listener shutdown signaled");
-    }
-}
-
-/// Result of ensuring a listener is available for a workspace.
-enum ListenerResult {
-    /// Started a new listener (caller owns it)
-    Started(UpcallListenerHandle, PathBuf),
-    /// An existing listener is running (caller should just use the socket)
-    Existing(PathBuf),
-}
-
-/// Ensure an upcall listener is available for the workspace.
-///
-/// If a listener is already running (based on PID file check), returns
-/// the existing socket path. Otherwise, starts a new listener.
-fn ensure_upcall_listener(workspace: &str) -> Result<ListenerResult> {
-    // Check if a listener is already running
-    match state::check_listener_status(workspace)? {
-        state::ListenerStatus::Running { socket_path, pid } => {
-            tracing::info!(
-                "Upcall listener already running (pid {}) at {:?}",
-                pid,
-                socket_path
-            );
-            return Ok(ListenerResult::Existing(socket_path));
-        }
-        state::ListenerStatus::NotRunning => {
-            tracing::debug!("No existing listener, starting new one");
-        }
-    }
-
-    // Start a new listener
-    let socket_path = upcall::get_host_socket_path(workspace)?;
-
-    // Create the socket directory
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create upcall socket directory: {:?}", parent))?;
-    }
-
-    // Remove existing socket if present (stale from previous run)
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Create the listener before spawning the thread so we can catch bind errors
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
-        .with_context(|| format!("Failed to bind upcall socket at {:?}", socket_path))?;
-
-    // Set non-blocking so we can check for shutdown
-    listener.set_nonblocking(true)?;
-
-    // Write PID file so other processes know we're running
-    state::write_pid_file(workspace)?;
-
-    tracing::info!("Starting upcall listener at {:?}", socket_path);
-
-    let workspace_owned = workspace.to_string();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    let thread = thread::spawn(move || {
-        while !shutdown_clone.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    // Set blocking mode for the stream
-                    let _ = stream.set_nonblocking(false);
-                    if let Err(e) = upcall::handle_connection(stream, &workspace_owned) {
-                        tracing::error!("Error handling upcall: {}", e);
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No connection pending, sleep briefly and check shutdown
-                    thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(e) => {
-                    if !shutdown_clone.load(Ordering::SeqCst) {
-                        tracing::error!("Error accepting upcall connection: {}", e);
-                    }
-                    break;
-                }
-            }
-        }
-        tracing::debug!("Upcall listener thread exiting");
-    });
-
-    Ok(ListenerResult::Started(
-        UpcallListenerHandle {
-            thread,
-            shutdown,
-            socket_path: socket_path.clone(),
-            workspace: workspace.to_string(),
-        },
-        socket_path,
-    ))
-}
-
 /// Build a bwrap command to sandbox the agent
 fn build_bwrap_command(
     workspace_path: &str,
@@ -624,7 +454,6 @@ fn build_bwrap_command(
     agent: &str,
     task: &str,
     agent_env_vars: &[(String, String)],
-    socket_path: &Path,
     podman_socket: Option<&Path>,
 ) -> String {
     // Escape task for shell - replace single quotes with escaped version
@@ -678,10 +507,6 @@ fn build_bwrap_command(
         "/tmp".to_string(),
         "--tmpfs".to_string(),
         "/run".to_string(),
-        // Upcall socket (bind-mounted from host for agent-to-host RPC)
-        "--ro-bind".to_string(),
-        socket_path.display().to_string(),
-        upcall::UPCALL_SOCKET_PATH.to_string(),
         // Writable workspace
         "--bind".to_string(),
         workspace_path.to_string(),
@@ -1181,7 +1006,6 @@ fn build_bwrap_shell_args(
     real_home: &str,
     agent_home: &str,
     agent_env_vars: &[(String, String)],
-    socket_path: &Path,
     podman_socket: Option<&Path>,
 ) -> Vec<String> {
     // Build a minimal root filesystem - only bind what's explicitly needed
@@ -1219,10 +1043,6 @@ fn build_bwrap_shell_args(
         "/tmp".to_string(),
         "--tmpfs".to_string(),
         "/run".to_string(),
-        // Upcall socket (bind-mounted from host for agent-to-host RPC)
-        "--ro-bind".to_string(),
-        socket_path.display().to_string(),
-        upcall::UPCALL_SOCKET_PATH.to_string(),
         // Writable workspace
         "--bind".to_string(),
         workspace_path.to_string(),
@@ -1294,33 +1114,13 @@ fn build_bwrap_shell_args(
 /// Create/attach to tmux session with AI agent (inside devcontainer)
 fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
     let workspace_path = get_workspace_path()?;
-    // Extract workspace name from path (e.g., "/workspaces/myrepo" -> "myrepo")
-    let workspace_name = Path::new(&workspace_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
 
     let agent_name = agent
         .map(|s| s.to_string())
         .or_else(|| config.agent.default_agent.clone())
-        .unwrap_or_else(|| "opencode".to_string());
+        .unwrap_or_else(|| config::DEFAULT_AGENT.to_string());
 
     let session_name = "devaipod";
-
-    // Ensure an upcall listener is running for this workspace.
-    // If one already exists (from a previous devaipod tmux invocation that's still running),
-    // we reuse it. Otherwise, we start a new one.
-    // The listener allows the sandboxed agent to perform controlled operations
-    // like creating PRs or pushing branches via RPC to this process.
-    let (maybe_listener, socket_path) = match ensure_upcall_listener(workspace_name)? {
-        ListenerResult::Started(handle, path) => (Some(handle), path),
-        ListenerResult::Existing(path) => (None, path),
-    };
-    tracing::debug!(
-        "Upcall listener ready for workspace: {} (socket: {:?})",
-        workspace_name,
-        socket_path
-    );
 
     // Check if session already exists
     let session_exists = ProcessCommand::new("tmux")
@@ -1335,9 +1135,6 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
             .args(["attach-session", "-t", session_name])
             .status()
             .context("Failed to attach to tmux session")?;
-
-        // Keep the listener alive until we're done (if we started one)
-        drop(maybe_listener);
 
         if !status.success() {
             bail!("Failed to attach to tmux session");
@@ -1361,7 +1158,6 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
             &real_home,
             &agent_home,
             &agent_env_vars,
-            &socket_path,
             podman_socket.as_deref(),
         );
         bwrap_args.push("--".to_string());
@@ -1438,27 +1234,8 @@ fn cmd_tmux(config: &config::Config, agent: Option<&str>) -> Result<()> {
 /// Get a shell inside the bwrap sandbox (inside devcontainer)
 fn cmd_enter() -> Result<()> {
     let workspace_path = get_workspace_path()?;
-    // Extract workspace name from path (e.g., "/workspaces/myrepo" -> "myrepo")
-    let workspace_name = Path::new(&workspace_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
 
     tracing::info!("Entering bwrap sandbox (workspace: {})...", workspace_path);
-
-    // Ensure an upcall listener is running. If one already exists (e.g., from
-    // a running `devaipod tmux` session), we reuse it.
-    let (maybe_listener, socket_path) = match ensure_upcall_listener(workspace_name)? {
-        ListenerResult::Started(handle, path) => (Some(handle), path),
-        ListenerResult::Existing(path) => (None, path),
-    };
-    tracing::debug!(
-        "Upcall listener ready for workspace: {} (socket: {:?})",
-        workspace_name,
-        socket_path
-    );
-    // Suppress unused warning - we need to keep the listener alive
-    let _ = &maybe_listener;
 
     // Build bwrap args for a shell
     let (real_home, agent_home) = get_agent_home_dir()?;
@@ -1472,7 +1249,6 @@ fn cmd_enter() -> Result<()> {
         &real_home,
         &agent_home,
         &agent_env_vars,
-        &socket_path,
         podman_socket.as_deref(),
     );
     bwrap_args.push("--".to_string());
@@ -1492,40 +1268,14 @@ fn cmd_enter() -> Result<()> {
 
 /// Internal command: Run an agent with task inside devcontainer
 /// This is called via `devpod ssh` from the host's `run` command.
-fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<()> {
+fn cmd_internal_run_agent(agent: &str, task: &str) -> Result<()> {
     let workspace_path = get_workspace_path()?;
-    // Extract workspace name from path (e.g., "/workspaces/myrepo" -> "myrepo")
-    let workspace_name = Path::new(&workspace_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
 
     tracing::info!(
         "Running {} agent in bwrap sandbox (workspace: {})",
         agent,
         workspace_path
     );
-
-    // Initialize state with allowed repos before starting the upcall listener
-    if !repos.is_empty() {
-        tracing::info!("Initializing state with {} allowed repos", repos.len());
-        for repo in repos {
-            state::add_repo(repo)?;
-        }
-    }
-
-    // Ensure an upcall listener is running. If one already exists, we reuse it.
-    let (maybe_listener, socket_path) = match ensure_upcall_listener(workspace_name)? {
-        ListenerResult::Started(handle, path) => (Some(handle), path),
-        ListenerResult::Existing(path) => (None, path),
-    };
-    tracing::debug!(
-        "Upcall listener ready for workspace: {} (socket: {:?})",
-        workspace_name,
-        socket_path
-    );
-    // Suppress unused warning - we need to keep the listener alive
-    let _ = &maybe_listener;
 
     // Collect DEVAIPOD_AGENT_* prefixed env vars to forward into sandbox
     let agent_env_vars = config::collect_agent_env_vars();
@@ -1555,7 +1305,6 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
         agent,
         task,
         &agent_env_vars,
-        &socket_path,
         podman_socket.as_deref(),
     );
 
@@ -1572,59 +1321,6 @@ fn cmd_internal_run_agent(agent: &str, task: &str, repos: &[String]) -> Result<(
     }
 
     Ok(())
-}
-
-/// Execute an upcall command from inside the sandbox
-fn cmd_upcall(cmd: UpcallCommand) -> Result<()> {
-    match cmd {
-        UpcallCommand::Exec { binary, args } => {
-            // Convert Vec<String> to Vec<&str> for the API
-            let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            let (exit_code, output) = upcall::exec_command(&binary, &args_refs)?;
-
-            // Print the combined output
-            if !output.is_empty() {
-                print!("{}", output);
-            }
-
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-
-            Ok(())
-        }
-        UpcallCommand::State => {
-            let current_state = state::load_state()?;
-            println!("Allowed repositories:");
-            if current_state.allowed_repos.is_empty() {
-                println!("  (none)");
-            } else {
-                for repo in &current_state.allowed_repos {
-                    println!("  {}", repo);
-                }
-            }
-            println!();
-            println!("Allowed PRs (created by agent):");
-            if current_state.allowed_prs.is_empty() {
-                println!("  (none)");
-            } else {
-                for pr in &current_state.allowed_prs {
-                    println!("  {}", pr);
-                }
-            }
-            Ok(())
-        }
-        UpcallCommand::AddRepo { repo } => {
-            state::add_repo(&repo)?;
-            println!("Added repository: {}", repo);
-            Ok(())
-        }
-        UpcallCommand::RemoveRepo { repo } => {
-            state::remove_repo(&repo)?;
-            println!("Removed repository: {}", repo);
-            Ok(())
-        }
-    }
 }
 
 /// Start AI agent in a tmux session inside the workspace
@@ -1700,7 +1396,7 @@ fn fetch_github_issue(owner: &str, repo: &str, issue_number: u64) -> Result<GitH
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
-            "User-Agent: devaipod/0.1.0",
+            &format!("User-Agent: devaipod/{}", env!("CARGO_PKG_VERSION")),
             &url,
         ])
         .output()
@@ -1774,7 +1470,7 @@ fn fetch_github_comments(comments_url: &str) -> Result<Vec<String>> {
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
-            "User-Agent: devaipod/0.1.0",
+            &format!("User-Agent: devaipod/{}", env!("CARGO_PKG_VERSION")),
             comments_url,
         ])
         .output()
@@ -1881,7 +1577,6 @@ mod tests {
 
         assert!(subcommands.contains(&"tmux"), "Missing 'tmux' command");
         assert!(subcommands.contains(&"enter"), "Missing 'enter' command");
-        assert!(subcommands.contains(&"upcall"), "Missing 'upcall' command");
 
         // Should NOT have host-only commands
         assert!(

@@ -110,7 +110,16 @@ pub fn load_secrets_from_devcontainer(source_path: &Path) -> Result<Vec<(String,
         .with_context(|| format!("Failed to read {}", devcontainer_path.display()))?;
 
     // Parse just the secrets field (ignore other fields)
-    let devcontainer: DevcontainerSecrets = serde_json::from_str(&content).unwrap_or_default();
+    let devcontainer: DevcontainerSecrets = match serde_json::from_str(&content) {
+        Ok(dc) => dc,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to parse devcontainer.json ({}), treating as no secrets declared",
+                e
+            );
+            DevcontainerSecrets::default()
+        }
+    };
 
     if devcontainer.secrets.is_empty() {
         tracing::debug!("No secrets declared in devcontainer.json");

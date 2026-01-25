@@ -2,11 +2,11 @@
 set -eu
 
 # devaipod devcontainer feature installer
-# Installs devaipod and gh-restricted binaries
+# Installs the devaipod binary
 
 VERSION="${VERSION:-latest}"
 DEVAIPOD_REPO="cgwalters/devaipod"
-# For local testing: set DEVAIPOD_LOCAL_BINARIES to a directory containing devaipod and gh-restricted
+# For local testing: set DEVAIPOD_LOCAL_BINARIES to a directory containing devaipod
 DEVAIPOD_LOCAL_BINARIES="${DEVAIPOD_LOCAL_BINARIES:-}"
 
 echo "Activating feature 'devaipod' (version: ${VERSION})"
@@ -110,6 +110,8 @@ install_from_github_release() {
     if [ "$version" = "latest" ]; then
         release_url="${base_url}/latest/download"
     else
+        # Strip 'v' prefix if present (user might specify v0.1.0 or 0.1.0)
+        version="${version#v}"
         release_url="${base_url}/download/v${version}"
     fi
     
@@ -140,14 +142,8 @@ install_from_github_release() {
         return 1
     fi
     
-    # Install binaries
+    # Install binary
     install -D -m 0755 "${tmp_dir}/devaipod" /usr/local/bin/devaipod
-    
-    # Install upcall binaries if present
-    if [ -f "${tmp_dir}/gh-restricted" ]; then
-        install -d -m 0755 /usr/lib/devaipod/upcalls
-        install -D -m 0755 "${tmp_dir}/gh-restricted" /usr/lib/devaipod/upcalls/gh-restricted
-    fi
     
     # Cleanup
     rm -rf "$tmp_dir"
@@ -166,21 +162,12 @@ install_from_source() {
     
     cargo install --git "https://github.com/${DEVAIPOD_REPO}" devaipod
     
-    # Also build and install gh-restricted from the upcalls crate
-    cargo install --git "https://github.com/${DEVAIPOD_REPO}" devaipod-upcalls --bin gh-restricted
-    
-    # Move binaries to standard locations
+    # Move binary to standard location
     local cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
     
     # Move devaipod to /usr/local/bin
     if [ -f "${cargo_bin}/devaipod" ]; then
         mv "${cargo_bin}/devaipod" /usr/local/bin/devaipod
-    fi
-    
-    # Move gh-restricted to upcalls directory
-    if [ -f "${cargo_bin}/gh-restricted" ]; then
-        install -d -m 0755 /usr/lib/devaipod/upcalls
-        mv "${cargo_bin}/gh-restricted" /usr/lib/devaipod/upcalls/gh-restricted
     fi
 }
 
@@ -224,11 +211,6 @@ install_from_local() {
     fi
     
     install -D -m 0755 "${bindir}/devaipod" /usr/local/bin/devaipod
-    
-    if [ -f "${bindir}/gh-restricted" ]; then
-        install -d -m 0755 /usr/lib/devaipod/upcalls
-        install -D -m 0755 "${bindir}/gh-restricted" /usr/lib/devaipod/upcalls/gh-restricted
-    fi
     
     echo "devaipod installed from local binaries"
 }
