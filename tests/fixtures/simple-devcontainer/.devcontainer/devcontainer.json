@@ -1,0 +1,15 @@
+{
+    "name": "Test Rust Project",
+    "image": "mcr.microsoft.com/devcontainers/rust:1",
+    "features": {
+        "ghcr.io/devcontainers/features/node:1": {}
+    },
+    "postCreateCommand": "cargo --version",
+    "customizations": {
+        "vscode": {
+            "extensions": ["rust-lang.rust-analyzer"]
+        }
+    },
+    "forwardPorts": [8080],
+    "remoteUser": "vscode"
+}

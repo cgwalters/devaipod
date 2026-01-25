@@ -118,6 +118,7 @@ pub fn start_server(config: &ServiceGatorConfig) -> Result<()> {
 }
 
 /// Stop the service-gator server if running
+#[allow(dead_code)]
 pub fn stop_server() -> Result<()> {
     let pid_file = Path::new(SERVICE_GATOR_PID_FILE);
     if !pid_file.exists() {
@@ -144,6 +145,7 @@ pub fn mcp_url(config: &ServiceGatorConfig) -> String {
 /// Generate opencode configuration JSON with service-gator as an MCP server
 ///
 /// This returns a JSON string that can be written to opencode's config file.
+#[allow(dead_code)]
 pub fn generate_opencode_mcp_config(config: &ServiceGatorConfig) -> String {
     let url = mcp_url(config);
 

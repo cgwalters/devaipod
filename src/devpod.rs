@@ -33,6 +33,19 @@ fn configure_devpod_env(cmd: &mut Command) {
     }
 }
 
+/// Options for running `devpod up`
+#[derive(Default)]
+pub struct UpOptions<'a> {
+    /// Optional provider override
+    pub provider: Option<&'a str>,
+    /// Optional IDE (defaults to "none")
+    pub ide: Option<&'a str>,
+    /// Environment variables to inject via `--workspace-env`
+    pub secrets: Vec<(String, String)>,
+    /// Custom devcontainer.json path (relative to source)
+    pub devcontainer_path: Option<&'a str>,
+}
+
 /// Run `devpod up` to create/start a workspace
 ///
 /// Returns the workspace name on success.
@@ -48,41 +61,59 @@ pub fn up(
     ide: Option<&str>,
     secrets: &[(String, String)],
 ) -> Result<String> {
+    up_with_options(
+        source,
+        UpOptions {
+            provider,
+            ide,
+            secrets: secrets.to_vec(),
+            devcontainer_path: None,
+        },
+    )
+}
+
+/// Run `devpod up` with extended options
+///
+/// Returns the workspace name on success.
+pub fn up_with_options(source: &str, options: UpOptions) -> Result<String> {
     let mut cmd = Command::new("devpod");
     configure_devpod_env(&mut cmd);
     cmd.arg("up");
     cmd.arg(source);
 
     // Default to no IDE (we manage our own agent)
-    let ide = ide.unwrap_or("none");
+    let ide = options.ide.unwrap_or("none");
     cmd.args(["--ide", ide]);
 
-    if let Some(provider) = provider {
+    if let Some(provider) = options.provider {
         cmd.args(["--provider", provider]);
     }
 
+    // Custom devcontainer path (for our generated compose setup)
+    if let Some(devcontainer_path) = options.devcontainer_path {
+        cmd.args(["--devcontainer-path", devcontainer_path]);
+        tracing::info!("Using custom devcontainer: {}", devcontainer_path);
+    }
+
     // Inject secrets as workspace environment variables
-    for (name, value) in secrets {
+    for (name, value) in &options.secrets {
         cmd.args(["--workspace-env", &format!("{}={}", name, value)]);
     }
 
     tracing::info!("Running: devpod up {} --ide {}", source, ide);
-    if !secrets.is_empty() {
-        tracing::info!("Injecting {} secret(s) via --workspace-env", secrets.len());
+    if !options.secrets.is_empty() {
+        tracing::info!(
+            "Injecting {} secret(s) via --workspace-env",
+            options.secrets.len()
+        );
     }
 
-    let output = cmd
-        .output()
+    let status = cmd
+        .status()
         .context("Failed to run devpod up. Is devpod installed?")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            bail!("devpod up failed with exit code {:?}", output.status.code());
-        } else {
-            bail!("devpod up failed: {}", stderr);
-        }
+    if !status.success() {
+        bail!("devpod up failed with exit code {:?}", status.code());
     }
 
     // Derive workspace name from source

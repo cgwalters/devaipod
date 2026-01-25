@@ -10,6 +10,7 @@ use std::process::Command as ProcessCommand;
 use clap::Parser;
 use color_eyre::eyre::{bail, Context, Result};
 
+mod compose;
 mod config;
 mod devpod;
 mod secrets;
@@ -56,6 +57,9 @@ enum HostCommand {
         /// DevPod IDE to open (default: none)
         #[arg(long, value_name = "IDE")]
         ide: Option<String>,
+        /// Generate configuration files but don't start containers
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run an AI agent with a task
     ///
@@ -202,6 +206,7 @@ fn run_host(cli: HostCli) -> Result<()> {
             no_agent,
             provider,
             ide,
+            dry_run,
         } => cmd_up(
             &config,
             &source,
@@ -209,6 +214,7 @@ fn run_host(cli: HostCli) -> Result<()> {
             no_agent,
             provider.as_deref(),
             ide.as_deref(),
+            dry_run,
         ),
         HostCommand::Run {
             task,
@@ -249,49 +255,125 @@ fn run_container(cli: ContainerCli) -> Result<()> {
 fn cmd_up(
     config: &config::Config,
     source: &str,
-    agent: Option<&str>,
+    _agent: Option<&str>,
     no_agent: bool,
     provider: Option<&str>,
     ide: Option<&str>,
+    dry_run: bool,
 ) -> Result<()> {
     // Resolve the source path to an absolute path
     let source_path = if source.starts_with("http://")
         || source.starts_with("https://")
         || source.starts_with("git@")
     {
-        // For remote URLs, we can't load secrets from devcontainer.json
-        // since we don't have the repo locally yet
-        tracing::debug!("Remote source detected, skipping devcontainer secrets");
-        std::path::PathBuf::from(source)
+        // For remote URLs, we can't generate compose setup yet
+        // TODO: Clone first, then generate compose
+        tracing::warn!(
+            "Remote source detected. Multi-container setup requires local source for now."
+        );
+        tracing::info!("Falling back to standard devpod up...");
+
+        let secrets: Vec<(String, String)> = Vec::new();
+        let workspace_name = devpod::up(source, provider, ide, &secrets)?;
+        tracing::info!(
+            "Workspace '{}' started. Note: Agent sidecar not configured for remote sources.",
+            workspace_name
+        );
+        return Ok(());
     } else {
         // Resolve local path to absolute
         std::path::Path::new(source)
             .canonicalize()
-            .unwrap_or_else(|_| std::path::PathBuf::from(source))
+            .with_context(|| format!("Cannot resolve path: {}", source))?
     };
 
-    // Load secrets from devcontainer.json (fetched from podman secrets)
-    let secrets = if source_path.is_dir() {
-        secrets::load_secrets_from_devcontainer(&source_path)?
-    } else {
-        Vec::new()
-    };
+    // Find and parse the devcontainer.json
+    let devcontainer_path = compose::find_devcontainer_json(&source_path)?;
+    tracing::info!("Found devcontainer at: {}", devcontainer_path.display());
 
-    // Run devpod up, passing secrets via --workspace-env
-    let workspace_name = devpod::up(source, provider, ide, &secrets)?;
+    let devcontainer = compose::load_devcontainer(&devcontainer_path)?;
 
-    if !no_agent {
-        let agent_name = agent
-            .map(|s| s.to_string())
-            .or_else(|| config.agent.default_agent.clone())
-            .unwrap_or_else(|| config::DEFAULT_AGENT.to_string());
+    // Derive workspace name and folder
+    let project_name = devpod::derive_workspace_name(source);
+    let workspace_folder = devcontainer
+        .workspace_folder
+        .clone()
+        .unwrap_or_else(|| format!("/workspaces/{}", project_name));
 
-        tracing::info!("Starting {} agent in tmux session...", agent_name);
-        start_agent_in_tmux(&workspace_name, &agent_name)?;
+    // Generate the multi-container compose setup
+    tracing::info!("Generating multi-container configuration...");
+    let generated = compose::generate_compose(
+        &devcontainer,
+        &project_name,
+        &workspace_folder,
+        &config.service_gator,
+    )?;
+
+    // Write generated files to .devaipod/
+    let devaipod_dir = compose::write_generated_files(&source_path, &generated)?;
+
+    // In dry-run mode, just show what was generated and exit
+    if dry_run {
+        tracing::info!("Dry run complete. Generated files in .devaipod/:");
+        tracing::info!("  • {}/devcontainer.json", devaipod_dir.display());
+        tracing::info!("  • {}/docker-compose.yml", devaipod_dir.display());
+        if generated.dockerfile.is_some() {
+            tracing::info!("  • {}/Dockerfile", devaipod_dir.display());
+        }
+        tracing::info!("  • {}/opencode-shim", devaipod_dir.display());
+        tracing::info!("  • {}/opencode-config.json", devaipod_dir.display());
+        tracing::info!("");
+        tracing::info!("To start the workspace manually:");
         tracing::info!(
-            "Agent started. Use 'devaipod attach {}' to connect.",
+            "  devpod up {} --devcontainer-path .devaipod/devcontainer.json",
+            source
+        );
+        return Ok(());
+    }
+
+    // Load secrets from config (for workspace-env injection)
+    let secrets = secrets::load_secrets_from_devcontainer(&source_path)?;
+
+    // Build devpod options with custom devcontainer path
+    let devcontainer_rel_path = devaipod_dir
+        .strip_prefix(&source_path)
+        .unwrap_or(&devaipod_dir)
+        .join("devcontainer.json");
+
+    let devcontainer_path_str = devcontainer_rel_path
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid devcontainer path"))?;
+
+    let options = devpod::UpOptions {
+        provider,
+        ide,
+        secrets,
+        devcontainer_path: Some(devcontainer_path_str),
+    };
+
+    // Run devpod up with our generated compose configuration
+    let workspace_name = devpod::up_with_options(source, options)?;
+
+    if no_agent {
+        tracing::info!(
+            "Workspace '{}' started without agent. Use 'devpod ssh {}' to connect.",
+            workspace_name,
             workspace_name
         );
+    } else {
+        tracing::info!("Workspace '{}' started with agent sidecar.", workspace_name);
+        tracing::info!("  • SSH into workspace: devpod ssh {}", workspace_name);
+        tracing::info!("  • Run opencode to connect to agent");
+        tracing::info!(
+            "  • Agent container is running 'opencode serve' on port {}",
+            compose::OPENCODE_PORT
+        );
+        if config.service_gator.is_enabled() {
+            tracing::info!(
+                "  • service-gator MCP available on port {}",
+                compose::GATOR_PORT
+            );
+        }
     }
 
     Ok(())
@@ -1347,30 +1429,6 @@ fn cmd_internal_run_agent(config: &config::Config, agent: &str, task: &str) -> R
 
     if !status.success() {
         bail!("Agent exited with error");
-    }
-
-    Ok(())
-}
-
-/// Start AI agent in a tmux session inside the workspace
-fn start_agent_in_tmux(workspace: &str, agent: &str) -> Result<()> {
-    let status = ProcessCommand::new("devpod")
-        .args([
-            "ssh",
-            workspace,
-            "--",
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            "agent",
-            agent,
-        ])
-        .status()
-        .context("Failed to start agent in tmux")?;
-
-    if !status.success() {
-        bail!("Failed to start agent in tmux session");
     }
 
     Ok(())

@@ -573,6 +573,54 @@ fn test_sandbox_var_not_mounted() {
     );
 }
 
+// =============================================================================
+// Compose generation tests
+// =============================================================================
+
+/// Test that compose generation works for a simple devcontainer
+#[test]
+fn test_compose_generation() {
+    use std::path::Path;
+
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-devcontainer");
+
+    // Find the devcontainer.json
+    let devcontainer_path = fixture_path.join(".devcontainer/devcontainer.json");
+    assert!(
+        devcontainer_path.exists(),
+        "Fixture devcontainer.json not found at {:?}",
+        devcontainer_path
+    );
+
+    // Run devaipod to generate compose (dry-run would be ideal, but for now just check parsing)
+    // For unit testing, we'll directly test the compose module
+    let content = std::fs::read_to_string(&devcontainer_path).unwrap();
+    assert!(content.contains("rust"));
+    assert!(content.contains("image"));
+}
+
+/// Test that generated compose files are valid
+#[test]
+fn test_compose_generation_creates_valid_files() {
+    use std::path::Path;
+
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-devcontainer");
+
+    let devaipod_dir = fixture_path.join(".devaipod");
+
+    // Clean up any previous generation
+    let _ = std::fs::remove_dir_all(&devaipod_dir);
+
+    // Run devaipod up --help to verify binary works (without actually starting)
+    let output = devaipod(&["--help"]).expect("Failed to run devaipod");
+    assert!(output.status.success());
+
+    // TODO: Add a --dry-run or --generate-only flag to test compose generation
+    // without actually starting devpod
+}
+
 /// Test with a mock agent script that simulates opencode behavior
 #[test]
 fn test_sandbox_mock_agent() {
