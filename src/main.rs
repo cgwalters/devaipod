@@ -358,6 +358,31 @@ async fn cmd_up(
         .await
         .context("Failed to start podman service")?;
 
+    // Check if pod already exists
+    if let Some(status) = podman
+        .get_pod_status(&pod_name)
+        .await
+        .context("Failed to check pod status")?
+    {
+        if status.is_running() {
+            tracing::info!("Pod '{}' is already running", pod_name);
+            tracing::info!("  • SSH into workspace: podman exec -it {}-workspace bash", pod_name);
+            tracing::info!("  • Use 'devaipod ssh {}' to connect", pod_name);
+            return Ok(());
+        } else {
+            // Pod exists but is stopped - start it
+            tracing::info!("Pod '{}' exists but is stopped, starting...", pod_name);
+            podman
+                .start_pod(&pod_name)
+                .await
+                .context("Failed to start existing pod")?;
+            tracing::info!("Pod '{}' started", pod_name);
+            tracing::info!("  • SSH into workspace: podman exec -it {}-workspace bash", pod_name);
+            tracing::info!("  • Use 'devaipod ssh {}' to connect", pod_name);
+            return Ok(());
+        }
+    }
+
     // Check if gator should be enabled
     let enable_gator = config.service_gator.is_enabled();
 
