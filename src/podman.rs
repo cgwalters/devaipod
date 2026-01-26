@@ -576,6 +576,102 @@ impl PodmanService {
         }
         Ok(())
     }
+
+    /// Copy a file or directory into a running container
+    ///
+    /// Uses `podman cp` to copy files into the container. This avoids permission
+    /// issues with bind mounts in rootless podman.
+    ///
+    /// The `owner` parameter sets ownership of the copied files (e.g., "1000:1000" or "vscode").
+    pub async fn copy_to_container(
+        &self,
+        container: &str,
+        source: &Path,
+        target: &str,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        // First, ensure the parent directory exists in the container
+        let target_parent = std::path::Path::new(target)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+
+        // Create parent directory with mkdir -p
+        let mkdir_output = self
+            .podman_command()
+            .args([
+                "exec",
+                container,
+                "mkdir",
+                "-p",
+                &target_parent,
+            ])
+            .output()
+            .await
+            .context("Failed to create parent directory")?;
+
+        if !mkdir_output.status.success() {
+            let stderr = String::from_utf8_lossy(&mkdir_output.stderr);
+            tracing::warn!("Failed to create parent directory {}: {}", target_parent, stderr);
+            // Continue anyway, cp might still work
+        }
+
+        // Copy the file/directory
+        let container_target = format!("{}:{}", container, target);
+        let output = self
+            .podman_command()
+            .args(["cp", &source.to_string_lossy(), &container_target])
+            .output()
+            .await
+            .context("Failed to execute podman cp")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            color_eyre::eyre::bail!(
+                "Failed to copy {} to {}:{}: {}",
+                source.display(),
+                container,
+                target,
+                stderr
+            );
+        }
+
+        // Set ownership if specified
+        if let Some(owner) = owner {
+            let chown_output = self
+                .podman_command()
+                .args([
+                    "exec",
+                    container,
+                    "chown",
+                    "-R",
+                    owner,
+                    target,
+                ])
+                .output()
+                .await
+                .context("Failed to change ownership")?;
+
+            if !chown_output.status.success() {
+                let stderr = String::from_utf8_lossy(&chown_output.stderr);
+                tracing::warn!(
+                    "Failed to chown {} to {}: {}",
+                    target,
+                    owner,
+                    stderr
+                );
+                // Don't fail - chown might fail if running as non-root
+            }
+        }
+
+        tracing::debug!(
+            "Copied {} to {}:{}",
+            source.display(),
+            container,
+            target
+        );
+        Ok(())
+    }
 }
 
 impl Drop for PodmanService {

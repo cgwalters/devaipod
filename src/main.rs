@@ -369,6 +369,7 @@ async fn cmd_up(
         &devcontainer_config,
         &pod_name,
         enable_gator,
+        config,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -379,6 +380,28 @@ async fn cmd_up(
         .start(&podman)
         .await
         .context("Failed to start pod")?;
+
+    // Copy bind_home files into containers (using podman cp instead of bind mounts
+    // to avoid permission issues with rootless podman)
+    tracing::info!("Copying bind_home files...");
+    devaipod_pod
+        .copy_bind_home_files(
+            &podman,
+            &devaipod_pod.workspace_bind_home,
+            &devaipod_pod.agent_bind_home,
+            &devaipod_pod.container_home,
+            devcontainer_config.effective_user(),
+        )
+        .await
+        .context("Failed to copy bind_home files")?;
+
+    // Install dotfiles BEFORE lifecycle commands so bashrc, gitconfig, etc. are available
+    if let Some(ref dotfiles) = config.dotfiles {
+        devaipod_pod
+            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
+            .await
+            .context("Failed to install dotfiles")?;
+    }
 
     // Run lifecycle commands (onCreateCommand, postCreateCommand, postStartCommand)
     tracing::info!("Running lifecycle commands...");

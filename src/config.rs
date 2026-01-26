@@ -39,6 +39,9 @@ pub struct Config {
     /// Agent configuration
     #[serde(default)]
     pub agent: AgentConfig,
+    /// Dotfiles configuration
+    #[serde(default)]
+    pub dotfiles: Option<DotfilesConfig>,
     /// Sidecar container configuration (planned feature, not yet implemented)
     #[serde(default)]
     #[allow(dead_code)]
@@ -49,6 +52,41 @@ pub struct Config {
     /// Service-gator MCP server configuration
     #[serde(default, rename = "service-gator")]
     pub service_gator: ServiceGatorConfig,
+    /// Bind paths from host $HOME to container $HOME (applies to all containers)
+    /// Paths are relative to $HOME on both sides
+    #[serde(default)]
+    pub bind_home: Vec<String>,
+    /// Bind paths specifically for the workspace container
+    #[serde(default)]
+    pub bind_home_workspace: Option<BindHomePaths>,
+    /// Bind paths specifically for the agent container
+    #[serde(default)]
+    pub bind_home_agent: Option<BindHomePaths>,
+}
+
+/// Configuration for binding paths from host home to container home
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct BindHomePaths {
+    /// Paths relative to $HOME to bind mount
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// Dotfiles configuration for provisioning user dotfiles in workspaces
+///
+/// Similar to devpod's dotfiles feature, this clones a git repository
+/// containing dotfiles and runs an install script.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DotfilesConfig {
+    /// Git URL of the dotfiles repository (e.g., "https://github.com/user/dotfiles")
+    pub url: String,
+    /// Optional install script to run after cloning (e.g., "install.sh")
+    /// If not specified, the default behavior is:
+    /// 1. Run `install.sh` if it exists
+    /// 2. Else run `install-dotfiles.sh` if it exists
+    /// 3. Else rsync `dotfiles/` directory to home if it exists
+    #[serde(default)]
+    pub script: Option<String>,
 }
 
 /// Agent configuration
@@ -589,6 +627,32 @@ mod tests {
         assert!(!config.sidecar.network);
         assert_eq!(config.sidecar.profiles.len(), 0);
         assert_eq!(config.secrets.len(), 0);
+        assert!(config.dotfiles.is_none());
+    }
+
+    #[test]
+    fn test_parse_dotfiles_config() {
+        let toml = r#"
+[dotfiles]
+url = "https://github.com/user/dotfiles"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let dotfiles = config.dotfiles.expect("dotfiles should be present");
+        assert_eq!(dotfiles.url, "https://github.com/user/dotfiles");
+        assert!(dotfiles.script.is_none());
+    }
+
+    #[test]
+    fn test_parse_dotfiles_config_with_script() {
+        let toml = r#"
+[dotfiles]
+url = "https://github.com/cgwalters/homegit"
+script = "install-dotfiles.sh"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let dotfiles = config.dotfiles.expect("dotfiles should be present");
+        assert_eq!(dotfiles.url, "https://github.com/cgwalters/homegit");
+        assert_eq!(dotfiles.script, Some("install-dotfiles.sh".to_string()));
     }
 
     #[test]
@@ -833,5 +897,96 @@ port = 9000
             "Expected path to end with devaipod.toml or devc.toml, got: {}",
             path_str
         );
+    }
+
+    #[test]
+    fn test_parse_bind_home() {
+        let toml = r#"
+bind_home = [
+    ".config/gcloud/application_default_credentials.json",
+    ".gitconfig",
+]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.bind_home.len(), 2);
+        assert_eq!(
+            config.bind_home[0],
+            ".config/gcloud/application_default_credentials.json"
+        );
+        assert_eq!(config.bind_home[1], ".gitconfig");
+    }
+
+    #[test]
+    fn test_parse_bind_home_workspace() {
+        let toml = r#"
+[bind_home_workspace]
+paths = [".config/gcloud", ".ssh"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ws = config
+            .bind_home_workspace
+            .expect("bind_home_workspace should be present");
+        assert_eq!(ws.paths.len(), 2);
+        assert_eq!(ws.paths[0], ".config/gcloud");
+        assert_eq!(ws.paths[1], ".ssh");
+    }
+
+    #[test]
+    fn test_parse_bind_home_agent() {
+        let toml = r#"
+[bind_home_agent]
+paths = [".config/gcloud/application_default_credentials.json"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let agent = config
+            .bind_home_agent
+            .expect("bind_home_agent should be present");
+        assert_eq!(agent.paths.len(), 1);
+        assert_eq!(
+            agent.paths[0],
+            ".config/gcloud/application_default_credentials.json"
+        );
+    }
+
+    #[test]
+    fn test_parse_bind_home_combined() {
+        let toml = r#"
+# Global bind_home applies to all containers
+bind_home = [".gitconfig"]
+
+# Workspace-specific
+[bind_home_workspace]
+paths = [".config/gcloud", ".ssh"]
+
+# Agent-specific (read-only)
+[bind_home_agent]
+paths = [".config/gcloud/application_default_credentials.json"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        // Global
+        assert_eq!(config.bind_home.len(), 1);
+        assert_eq!(config.bind_home[0], ".gitconfig");
+
+        // Workspace
+        let ws = config
+            .bind_home_workspace
+            .expect("bind_home_workspace should be present");
+        assert_eq!(ws.paths.len(), 2);
+
+        // Agent
+        let agent = config
+            .bind_home_agent
+            .expect("bind_home_agent should be present");
+        assert_eq!(agent.paths.len(), 1);
+    }
+
+    #[test]
+    fn test_bind_home_default_empty() {
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.bind_home.is_empty());
+        assert!(config.bind_home_workspace.is_none());
+        assert!(config.bind_home_agent.is_none());
     }
 }

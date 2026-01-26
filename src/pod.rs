@@ -8,10 +8,11 @@
 //! All containers share the same network namespace via the pod, allowing
 //! localhost communication between the agent and workspace.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Context, Result};
 
+use crate::config::{Config, DotfilesConfig};
 use crate::devcontainer::DevcontainerConfig;
 use crate::podman::{ContainerConfig, MountConfig, PodmanService};
 
@@ -23,6 +24,22 @@ pub const GATOR_PORT: u16 = 8765;
 
 /// Image for the service-gator container
 const GATOR_IMAGE: &str = "ghcr.io/cgwalters/service-gator:latest";
+
+/// Configuration for bind_home mounts passed to container config functions
+#[derive(Debug, Clone, Default)]
+pub struct BindHomeConfig {
+    /// Paths to bind (relative to $HOME)
+    pub paths: Vec<String>,
+    /// Whether mounts should be read-only
+    pub readonly: bool,
+}
+
+/// Get the host home directory
+fn get_host_home() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+
 
 /// A devaipod pod managing multiple containers
 #[derive(Debug, Clone)]
@@ -39,6 +56,12 @@ pub struct DevaipodPod {
     pub image: String,
     /// Workspace folder inside the container
     pub workspace_folder: String,
+    /// Bind home config for workspace container
+    pub workspace_bind_home: BindHomeConfig,
+    /// Bind home config for agent container
+    pub agent_bind_home: BindHomeConfig,
+    /// Container home directory path
+    pub container_home: String,
 }
 
 impl DevaipodPod {
@@ -48,13 +71,40 @@ impl DevaipodPod {
     /// 1. Build or pull the image from devcontainer config
     /// 2. Create the pod
     /// 3. Create workspace, agent, and optionally gator containers
+    ///
+    /// Note: Dotfiles installation happens after the pod starts via `install_dotfiles()`.
     pub async fn create(
         podman: &PodmanService,
         project_path: &Path,
-        config: &DevcontainerConfig,
+        devcontainer_config: &DevcontainerConfig,
         pod_name: &str,
         enable_gator: bool,
+        global_config: &Config,
     ) -> Result<Self> {
+        // Resolve bind_home configurations
+        let container_home = Self::resolve_container_home(devcontainer_config);
+
+        // Build workspace bind_home: global bind_home + workspace-specific
+        let mut workspace_paths = global_config.bind_home.clone();
+        if let Some(ref ws_config) = global_config.bind_home_workspace {
+            workspace_paths.extend(ws_config.paths.clone());
+        }
+        let workspace_bind_home = BindHomeConfig {
+            paths: workspace_paths,
+            readonly: false, // Workspace gets read-write access
+        };
+
+        // Build agent bind_home: global bind_home + agent-specific
+        let mut agent_paths = global_config.bind_home.clone();
+        if let Some(ref agent_config) = global_config.bind_home_agent {
+            agent_paths.extend(agent_config.paths.clone());
+        }
+        let agent_bind_home = BindHomeConfig {
+            paths: agent_paths,
+            readonly: true, // Agent gets read-only access for security
+        };
+
+        let config = devcontainer_config;
         // Derive project name from path
         let project_name = project_path
             .file_name()
@@ -95,6 +145,8 @@ impl DevaipodPod {
             &workspace_folder,
             config.effective_user(),
             config,
+            &workspace_bind_home,
+            &container_home,
         );
         podman
             .create_container(&workspace_container, &image, pod_name, workspace_config)
@@ -105,6 +157,8 @@ impl DevaipodPod {
         let agent_config = Self::agent_container_config(
             project_path,
             &workspace_folder,
+            &agent_bind_home,
+            &container_home,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -143,6 +197,9 @@ impl DevaipodPod {
             gator_container,
             image,
             workspace_folder,
+            workspace_bind_home,
+            agent_bind_home,
+            container_home,
         })
     }
 
@@ -154,6 +211,110 @@ impl DevaipodPod {
             .with_context(|| format!("Failed to start pod: {}", self.pod_name))?;
 
         tracing::info!("Started pod '{}'", self.pod_name);
+        Ok(())
+    }
+
+    /// Install dotfiles in the workspace container
+    ///
+    /// This should be called after the pod starts but BEFORE lifecycle commands,
+    /// so that bashrc, gitconfig, and other dotfiles are available for lifecycle scripts.
+    ///
+    /// The install process:
+    /// 1. Clone the dotfiles repo to a temp directory
+    /// 2. Run the install script (or default behavior)
+    /// 3. Clean up the cloned repo
+    ///
+    /// Default install behavior (if no script specified):
+    /// 1. If `install.sh` exists, run it
+    /// 2. Else if `install-dotfiles.sh` exists, run it
+    /// 3. Else if `dotfiles/` directory exists, rsync to home
+    pub async fn install_dotfiles(
+        &self,
+        podman: &PodmanService,
+        dotfiles: &DotfilesConfig,
+        user: Option<&str>,
+    ) -> Result<()> {
+        tracing::info!("Installing dotfiles from {}...", dotfiles.url);
+
+        // Build the installation script
+        // We clone to a temp dir, run the install, then clean up
+        let install_script = if let Some(script) = &dotfiles.script {
+            // User specified a custom script
+            format!(
+                r#"
+set -e
+DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
+rm -rf "$DOTFILES_TMP"
+git clone --depth 1 "{url}" "$DOTFILES_TMP"
+cd "$DOTFILES_TMP"
+if [ -x "./{script}" ]; then
+    ./{script}
+elif [ -f "./{script}" ]; then
+    sh "./{script}"
+else
+    echo "Error: Install script '{script}' not found in dotfiles repo"
+    exit 1
+fi
+rm -rf "$DOTFILES_TMP"
+echo "Dotfiles installed successfully"
+"#,
+                url = dotfiles.url,
+                script = script
+            )
+        } else {
+            // Default behavior: try install.sh, install-dotfiles.sh, or rsync dotfiles/
+            format!(
+                r#"
+set -e
+DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
+rm -rf "$DOTFILES_TMP"
+git clone --depth 1 "{url}" "$DOTFILES_TMP"
+cd "$DOTFILES_TMP"
+if [ -x "./install.sh" ]; then
+    ./install.sh
+elif [ -f "./install.sh" ]; then
+    sh ./install.sh
+elif [ -x "./install-dotfiles.sh" ]; then
+    ./install-dotfiles.sh
+elif [ -f "./install-dotfiles.sh" ]; then
+    sh ./install-dotfiles.sh
+elif [ -d "./dotfiles" ]; then
+    # rsync dotfiles/ to home, preserving any existing files
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -av --ignore-existing ./dotfiles/ "$HOME/"
+    else
+        cp -rn ./dotfiles/. "$HOME/" 2>/dev/null || cp -r ./dotfiles/. "$HOME/"
+    fi
+else
+    echo "Warning: No install script or dotfiles/ directory found, skipping"
+fi
+rm -rf "$DOTFILES_TMP"
+echo "Dotfiles installed successfully"
+"#,
+                url = dotfiles.url
+            )
+        };
+
+        let exit_code = podman
+            .exec(
+                &self.workspace_container,
+                &["/bin/sh", "-c", &install_script],
+                user,
+                Some(&self.workspace_folder),
+            )
+            .await
+            .context("Failed to install dotfiles")?;
+
+        if exit_code != 0 {
+            // Log warning but don't fail - dotfiles are nice to have, not critical
+            tracing::warn!(
+                "Dotfiles installation exited with code {}. Continuing anyway.",
+                exit_code
+            );
+        } else {
+            tracing::info!("Dotfiles installed successfully");
+        }
+
         Ok(())
     }
 
@@ -190,6 +351,100 @@ impl DevaipodPod {
             self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
                 .await
                 .context("postStartCommand failed")?;
+        }
+
+        Ok(())
+    }
+
+    /// Copy bind_home files into containers using podman cp
+    ///
+    /// This is called after the pod starts to copy credential files and other
+    /// bind_home paths into the containers. Using `podman cp` instead of bind
+    /// mounts avoids permission issues with rootless podman and user namespaces.
+    ///
+    /// For the workspace container, files are copied to the user's home directory.
+    /// For the agent container, files are copied to the agent's HOME (/tmp/agent-home).
+    pub async fn copy_bind_home_files(
+        &self,
+        podman: &PodmanService,
+        workspace_bind_home: &BindHomeConfig,
+        agent_bind_home: &BindHomeConfig,
+        container_home: &str,
+        container_user: Option<&str>,
+    ) -> Result<()> {
+        let Some(host_home) = get_host_home() else {
+            tracing::warn!("HOME environment variable not set, skipping bind_home file copy");
+            return Ok(());
+        };
+
+        // Copy files to workspace container
+        for relative_path in &workspace_bind_home.paths {
+            let source = host_home.join(relative_path);
+            let target = format!("{}/{}", container_home, relative_path);
+
+            if !source.exists() {
+                tracing::warn!(
+                    "bind_home: skipping '{}' for workspace (not found at {})",
+                    relative_path,
+                    source.display()
+                );
+                continue;
+            }
+
+            tracing::debug!(
+                "bind_home: copying {} -> {}:{} for workspace",
+                source.display(),
+                self.workspace_container,
+                target
+            );
+
+            if let Err(e) = podman
+                .copy_to_container(&self.workspace_container, &source, &target, container_user)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to copy {} to workspace container: {}",
+                    relative_path,
+                    e
+                );
+            }
+        }
+
+        // Copy files to agent container (to agent's HOME which is /tmp/agent-home)
+        // This directory is created by the agent startup script and is writable
+        const AGENT_HOME: &str = "/tmp/agent-home";
+        for relative_path in &agent_bind_home.paths {
+            let source = host_home.join(relative_path);
+            let target = format!("{}/{}", AGENT_HOME, relative_path);
+
+            if !source.exists() {
+                tracing::warn!(
+                    "bind_home: skipping '{}' for agent (not found at {})",
+                    relative_path,
+                    source.display()
+                );
+                continue;
+            }
+
+            tracing::debug!(
+                "bind_home: copying {} -> {}:{} for agent",
+                source.display(),
+                self.agent_container,
+                target
+            );
+
+            // Agent container runs as non-root, but the agent home is created by the
+            // startup script with correct ownership
+            if let Err(e) = podman
+                .copy_to_container(&self.agent_container, &source, &target, None)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to copy {} to agent container: {}",
+                    relative_path,
+                    e
+                );
+            }
         }
 
         Ok(())
@@ -248,6 +503,8 @@ impl DevaipodPod {
         workspace_folder: &str,
         user: Option<&str>,
         config: &DevcontainerConfig,
+        _bind_home: &BindHomeConfig,
+        _container_home: &str,
     ) -> ContainerConfig {
         let mut env = config.container_env.clone();
         // Merge remote_env (these typically take precedence)
@@ -263,12 +520,15 @@ impl DevaipodPod {
             format!("http://localhost:{}", OPENCODE_PORT),
         );
 
+        // Build mounts: project mount only (bind_home files are copied after container starts)
+        let mounts = vec![MountConfig {
+            source: project_path.to_string_lossy().to_string(),
+            target: workspace_folder.to_string(),
+            readonly: false,
+        }];
+
         ContainerConfig {
-            mounts: vec![MountConfig {
-                source: project_path.to_string_lossy().to_string(),
-                target: workspace_folder.to_string(),
-                readonly: false,
-            }],
+            mounts,
             env,
             workdir: Some(workspace_folder.to_string()),
             user: user.map(|u| u.to_string()),
@@ -317,6 +577,8 @@ exec sleep infinity
     fn agent_container_config(
         project_path: &Path,
         workspace_folder: &str,
+        bind_home: &BindHomeConfig,
+        _container_home: &str,
     ) -> ContainerConfig {
         // Use /tmp as agent home - it's always writable and isolated per container.
         // In the future we could mount a named volume for persistent agent state.
@@ -359,25 +621,45 @@ exec sleep infinity
             }
         }
 
+        // Build mounts: project mount only (bind_home files are copied after container starts)
+        let mounts = vec![
+            // Project mount - agent can read/write code
+            MountConfig {
+                source: project_path.to_string_lossy().to_string(),
+                target: workspace_folder.to_string(),
+                readonly: false,
+            },
+        ];
+
+        // If gcloud ADC is in bind_home, set GOOGLE_APPLICATION_CREDENTIALS to point to it
+        // Files are copied to the agent's home directory after container starts
+        const GCLOUD_ADC_PATH: &str = ".config/gcloud/application_default_credentials.json";
+        if bind_home.paths.iter().any(|p| p == GCLOUD_ADC_PATH) {
+            // Check if the file actually exists on the host
+            if let Some(host_home) = get_host_home() {
+                if host_home.join(GCLOUD_ADC_PATH).exists() {
+                    env.insert(
+                        "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+                        format!("{}/{}", agent_home, GCLOUD_ADC_PATH),
+                    );
+                }
+            }
+        }
+
         ContainerConfig {
-            mounts: vec![
-                // Project mount - agent can read/write code
-                MountConfig {
-                    source: project_path.to_string_lossy().to_string(),
-                    target: workspace_folder.to_string(),
-                    readonly: false,
-                },
-            ],
+            mounts,
             env,
             workdir: Some(workspace_folder.to_string()),
             // Run as a non-root user if possible (agent user)
             user: None, // Let the image decide, or we could set "1000" for a generic user
             command: Some(vec![
-                // Create home dir first, then run opencode
+                // Create home dir structure first (including dirs that might be needed for bind mounts),
+                // then run opencode. We use mkdir -p to ensure all XDG dirs exist.
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 format!(
-                    "mkdir -p {agent_home} && exec opencode serve --port {} --hostname 0.0.0.0",
+                    r#"mkdir -p {agent_home}/.config {agent_home}/.local/share {agent_home}/.local/bin {agent_home}/.cache && \
+                       exec opencode serve --port {} --hostname 0.0.0.0"#,
                     OPENCODE_PORT
                 ),
             ]),
@@ -411,6 +693,24 @@ exec sleep infinity
             no_new_privileges: true,
         }
     }
+
+    /// Resolve the container home directory based on devcontainer config
+    ///
+    /// Most devcontainer images use a non-root user like "vscode" or "devenv"
+    /// with a home directory at /home/<user>. This function attempts to determine
+    /// the correct home directory for bind mounts.
+    fn resolve_container_home(config: &DevcontainerConfig) -> String {
+        if let Some(user) = config.effective_user() {
+            if user == "root" {
+                "/root".to_string()
+            } else {
+                format!("/home/{}", user)
+            }
+        } else {
+            // Default to vscode user which is common in devcontainer images
+            "/home/vscode".to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -422,12 +722,16 @@ mod tests {
         let project_path = Path::new("/home/user/myproject");
         let workspace_folder = "/workspaces/myproject";
         let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
 
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
             Some("vscode"),
             &config,
+            &bind_home,
+            container_home,
         );
 
         assert_eq!(container_config.mounts.len(), 1);
@@ -452,10 +756,14 @@ mod tests {
     fn test_agent_container_config() {
         let project_path = Path::new("/home/user/myproject");
         let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
 
         let container_config = DevaipodPod::agent_container_config(
             project_path,
             workspace_folder,
+            &bind_home,
+            container_home,
         );
 
         // Verify mounts
@@ -478,6 +786,39 @@ mod tests {
         assert_eq!(
             container_config.env.get("HOME"),
             Some(&"/tmp/agent-home".to_string())
+        );
+    }
+
+    #[test]
+    fn test_agent_bind_home_uses_podman_cp() {
+        // Test that agent container config doesn't include bind_home mounts
+        // (we use podman cp after container starts instead)
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig {
+            paths: vec![".config/some-app".to_string()],
+            readonly: true,
+        };
+        let container_home = "/home/vscode";
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+        );
+
+        // Agent should only have the project mount, not bind_home mounts
+        // bind_home files are copied using podman cp after container starts
+        assert_eq!(
+            container_config.mounts.len(),
+            1,
+            "Agent should only have project mount, got {} mounts",
+            container_config.mounts.len()
+        );
+        assert_eq!(
+            container_config.mounts[0].target, workspace_folder,
+            "First mount should be the project mount"
         );
     }
 
@@ -524,6 +865,8 @@ mod tests {
     fn test_workspace_config_with_env() {
         let project_path = Path::new("/project");
         let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
         
         let mut config = DevcontainerConfig::default();
         config.container_env.insert("FOO".to_string(), "bar".to_string());
@@ -534,6 +877,8 @@ mod tests {
             workspace_folder,
             None,
             &config,
+            &bind_home,
+            container_home,
         );
 
         assert_eq!(container_config.env.get("FOO"), Some(&"bar".to_string()));
@@ -549,6 +894,8 @@ mod tests {
     fn test_workspace_config_with_caps() {
         let project_path = Path::new("/project");
         let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
         
         let mut config = DevcontainerConfig::default();
         config.cap_add = vec!["SYS_PTRACE".to_string()];
@@ -558,8 +905,28 @@ mod tests {
             workspace_folder,
             None,
             &config,
+            &bind_home,
+            container_home,
         );
 
         assert_eq!(container_config.cap_add, vec!["SYS_PTRACE".to_string()]);
+    }
+
+    #[test]
+    fn test_dotfiles_config_struct() {
+        // Test that DotfilesConfig can be created and accessed
+        let dotfiles = DotfilesConfig {
+            url: "https://github.com/user/dotfiles".to_string(),
+            script: Some("install.sh".to_string()),
+        };
+        assert_eq!(dotfiles.url, "https://github.com/user/dotfiles");
+        assert_eq!(dotfiles.script, Some("install.sh".to_string()));
+
+        // Test without script
+        let dotfiles_no_script = DotfilesConfig {
+            url: "https://github.com/user/dotfiles".to_string(),
+            script: None,
+        };
+        assert!(dotfiles_no_script.script.is_none());
     }
 }
