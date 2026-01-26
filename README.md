@@ -53,10 +53,22 @@ oc
 devaipod up .              # Create pod with workspace + agent containers
 devaipod list              # List devaipod pods
 devaipod ssh <pod>         # SSH into workspace container
+devaipod ssh-config <pod>  # Generate SSH config (for editor integration)
 devaipod stop <pod>        # Stop a pod
 devaipod delete <pod>      # Delete a pod
 devaipod up . --dry-run    # Show what would be created
 ```
+
+### Editor Integration (WIP)
+
+The `ssh-config` command generates an SSH config entry:
+```bash
+devaipod ssh-config my-pod  # Writes to ~/.ssh/config.d/devaipod-my-pod
+```
+
+**Note**: Full SSH support for VSCode/Zed Remote SSH requires an SSH server in
+the container (currently not implemented). For now, use VSCode's Dev Containers
+extension or the CLI workflow.
 
 ## Key Features
 

@@ -102,9 +102,26 @@ enum HostCommand {
     Ssh {
         /// Workspace name
         workspace: String,
+        /// Stdio mode: pipe stdin/stdout for ProxyCommand use (VSCode/Zed remote dev)
+        #[arg(long)]
+        stdio: bool,
         /// Command to run (optional)
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+    },
+    /// Generate SSH config entry for a workspace
+    ///
+    /// Outputs an SSH config block that can be added to ~/.ssh/config.
+    /// This enables VSCode/Zed Remote SSH to connect via ProxyCommand.
+    ///
+    /// Example:
+    ///   devaipod ssh-config my-pod >> ~/.ssh/config
+    SshConfig {
+        /// Workspace name (pod name without devaipod- prefix)
+        workspace: String,
+        /// User to connect as (default: current user)
+        #[arg(long)]
+        user: Option<String>,
     },
     /// List workspaces
     List {
@@ -243,7 +260,12 @@ async fn run_host(cli: HostCli) -> Result<()> {
             &repos,
         ),
         HostCommand::Attach { workspace } => cmd_attach(&workspace),
-        HostCommand::Ssh { workspace, command } => cmd_ssh(&workspace, &command),
+        HostCommand::Ssh {
+            workspace,
+            stdio,
+            command,
+        } => cmd_ssh(&workspace, stdio, &command),
+        HostCommand::SshConfig { workspace, user } => cmd_ssh_config(&workspace, user.as_deref()),
         HostCommand::List { json } => cmd_list(json),
         HostCommand::Stop { workspace } => cmd_stop(&workspace),
         HostCommand::Delete { workspace, force } => cmd_delete(&workspace, force),
@@ -784,27 +806,155 @@ fn podman_command() -> ProcessCommand {
 }
 
 /// SSH into workspace using podman exec
-fn cmd_ssh(pod_name: &str, command: &[String]) -> Result<()> {
+fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
     let container = format!("{}-workspace", pod_name);
 
-    tracing::info!("Connecting to container '{}'...", container);
+    if stdio {
+        // Stdio mode: pipe stdin/stdout directly for ProxyCommand use
+        // VSCode/Zed Remote SSH uses this to tunnel SSH protocol
+        let mut cmd = podman_command();
+        cmd.args(["exec", "-i", &container]);
 
-    let mut cmd = podman_command();
-    cmd.args(["exec", "-it", &container]);
+        if command.is_empty() {
+            // Default to bash for shell access
+            cmd.arg("bash");
+        } else {
+            cmd.args(command);
+        }
 
-    if command.is_empty() {
-        cmd.arg("bash");
+        let status = cmd.status().context("Failed to run podman exec")?;
+
+        if !status.success() {
+            bail!(
+                "podman exec failed with exit code {:?}",
+                status.code()
+            );
+        }
     } else {
-        cmd.args(command);
+        // Interactive mode with TTY
+        tracing::info!("Connecting to container '{}'...", container);
+
+        let mut cmd = podman_command();
+        cmd.args(["exec", "-it", &container]);
+
+        if command.is_empty() {
+            cmd.arg("bash");
+        } else {
+            cmd.args(command);
+        }
+
+        let status = cmd.status().context("Failed to run podman exec")?;
+
+        if !status.success() {
+            bail!(
+                "podman exec failed with exit code {:?}",
+                status.code()
+            );
+        }
     }
 
-    let status = cmd.status().context("Failed to run podman exec")?;
+    Ok(())
+}
 
-    if !status.success() {
-        bail!(
-            "podman exec failed with exit code {:?}",
-            status.code()
-        );
+/// Get the SSH config directory path (~/.ssh/config.d)
+fn get_ssh_config_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    Ok(PathBuf::from(home).join(".ssh").join("config.d"))
+}
+
+/// Get the SSH config file path for a workspace
+fn get_ssh_config_path(workspace: &str) -> Result<PathBuf> {
+    Ok(get_ssh_config_dir()?.join(format!("devaipod-{}", workspace)))
+}
+
+/// Check if ~/.ssh/config has Include directive for config.d
+fn ssh_config_has_include() -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let ssh_config = PathBuf::from(home).join(".ssh").join("config");
+
+    if !ssh_config.exists() {
+        return false;
+    }
+
+    let content = match std::fs::read_to_string(&ssh_config) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Check for Include directive that covers config.d/*
+    // Common patterns: "Include config.d/*", "Include ~/.ssh/config.d/*"
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("Include") {
+            let rest = line.strip_prefix("Include").unwrap_or("").trim();
+            if rest.contains("config.d/*") || rest.contains("config.d/") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Remove SSH config file for a workspace
+fn remove_ssh_config(workspace: &str) -> Result<()> {
+    let config_path = get_ssh_config_path(workspace)?;
+    if config_path.exists() {
+        std::fs::remove_file(&config_path)
+            .with_context(|| format!("Failed to remove {}", config_path.display()))?;
+        tracing::info!("Removed SSH config: {}", config_path.display());
+    }
+    Ok(())
+}
+
+/// Generate SSH config entry for a workspace
+fn cmd_ssh_config(pod_name: &str, user: Option<&str>) -> Result<()> {
+    // Determine username: --user flag, or current user
+    let username = user
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "user".to_string());
+
+    // Find the devaipod binary path for the ProxyCommand
+    let devaipod_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "devaipod".to_string());
+
+    // Create SSH config content
+    let config_content = format!(
+        r#"# Generated by devaipod ssh-config
+Host {pod}.devaipod
+    ProxyCommand {devaipod} ssh --stdio {pod}
+    User {user}
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+"#,
+        pod = pod_name,
+        devaipod = devaipod_path,
+        user = username,
+    );
+
+    // Ensure ~/.ssh/config.d directory exists
+    let config_dir = get_ssh_config_dir()?;
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("Failed to create {}", config_dir.display()))?;
+
+    // Write the config file
+    let config_path = get_ssh_config_path(pod_name)?;
+    std::fs::write(&config_path, &config_content)
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+
+    println!("Added SSH config to {}", config_path.display());
+
+    // Check if Include directive exists in ~/.ssh/config
+    if !ssh_config_has_include() {
+        println!();
+        println!("Add this line to the TOP of ~/.ssh/config:");
+        println!("Include ~/.ssh/config.d/*");
     }
 
     Ok(())
@@ -899,6 +1049,12 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
     }
 
     tracing::info!("Pod '{}' deleted", pod_name);
+
+    // Clean up SSH config file if it exists
+    if let Err(e) = remove_ssh_config(pod_name) {
+        tracing::warn!("Failed to remove SSH config: {}", e);
+    }
+
     Ok(())
 }
 
@@ -1774,6 +1930,10 @@ mod tests {
         assert!(subcommands.contains(&"run"), "Missing 'run' command");
         assert!(subcommands.contains(&"attach"), "Missing 'attach' command");
         assert!(subcommands.contains(&"ssh"), "Missing 'ssh' command");
+        assert!(
+            subcommands.contains(&"ssh-config"),
+            "Missing 'ssh-config' command"
+        );
         assert!(subcommands.contains(&"list"), "Missing 'list' command");
         assert!(subcommands.contains(&"stop"), "Missing 'stop' command");
         assert!(subcommands.contains(&"delete"), "Missing 'delete' command");

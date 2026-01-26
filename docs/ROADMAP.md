@@ -30,6 +30,12 @@ Complete native podman implementation:
 
 Making devaipod reliable for daily use:
 
+- **SSH server for editor connections**: VSCode/Zed Remote SSH needs an actual
+  SSH server in the container. Current `ssh-config` generates ProxyCommand but
+  containers lack sshd. Options:
+  - Install dropbear (lightweight SSH) at container startup
+  - Use VSCode Dev Containers extension instead (works with podman exec)
+  - Embed SSH server in a devaipod agent binary
 - **Agent readiness probes / health checks**: Detect when agent container is
   actually ready to accept connections, not just started. Currently we start
   the pod and hope opencode is listening.
