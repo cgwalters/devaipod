@@ -3,12 +3,18 @@
 This document outlines the development roadmap for devaipod. Status is approximate
 and priorities may shift based on user feedback and practical experience.
 
-## Phase 1: Core Functionality (Current)
+## Phase 1: Core Functionality ✅
 
-The foundation is in place:
+Complete native podman implementation:
 
+- **Native CLI commands**: `devaipod up`, `ssh`, `list`, `stop`, `delete` - no
+  devpod dependency for core workflow
 - **Podman-native multi-container pods**: Workspace, agent, and gator containers
   share a pod with localhost networking between them
+- **Workspace shims**: `oc` and `opencode-agent` commands in workspace run
+  `opencode attach http://localhost:4096` to connect to sandboxed agent
+- **API key passthrough**: Agent container receives LLM API keys from host
+  environment (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
 - **Devcontainer.json parsing**: Image/build config, lifecycle commands
   (onCreateCommand, postCreateCommand, postStartCommand), environment variables,
   capabilities
@@ -27,12 +33,6 @@ Making devaipod reliable for daily use:
 - **Agent readiness probes / health checks**: Detect when agent container is
   actually ready to accept connections, not just started. Currently we start
   the pod and hope opencode is listening.
-- **Proper stop/delete commands**: Native podman pod lifecycle management.
-  Currently relies on `podman pod stop/rm` directly or devpod commands.
-- **API key / secrets management for agent**: The agent container needs LLM API
-  keys. Current approach requires keys in the image or environment. Need a
-  cleaner pattern - possibly podman secrets mounted as files, or fetched from
-  a secrets manager at startup.
 - **Agent container image strategy**: Currently agent uses the same image as
   workspace, requiring opencode to be installed in every devcontainer image.
   Options:

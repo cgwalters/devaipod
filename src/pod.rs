@@ -253,6 +253,16 @@ impl DevaipodPod {
         // Merge remote_env (these typically take precedence)
         env.extend(config.remote_env.clone());
 
+        // Filter out env vars containing devcontainer variable syntax like ${containerEnv:PATH}
+        // These cannot be resolved outside of VS Code and would be passed literally.
+        env.retain(|_key, value| !value.contains("${"));
+
+        // Tell opencode in workspace to connect to agent's server
+        env.insert(
+            "OPENCODE_AGENT_URL".to_string(),
+            format!("http://localhost:{}", OPENCODE_PORT),
+        );
+
         ContainerConfig {
             mounts: vec![MountConfig {
                 source: project_path.to_string_lossy().to_string(),
@@ -262,10 +272,35 @@ impl DevaipodPod {
             env,
             workdir: Some(workspace_folder.to_string()),
             user: user.map(|u| u.to_string()),
-            // Keep the container running (use absolute path for reliability)
+            // Keep the container running, create opencode shim in user's bin, print agent connection info
             command: Some(vec![
-                "/usr/bin/sleep".to_string(),
-                "infinity".to_string(),
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    r#"
+# Create opencode-agent shim that attaches to the agent container's server
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/opencode-agent" << 'EOF'
+#!/bin/sh
+# Shim to connect to devaipod agent container
+exec opencode attach http://localhost:{port} "$@"
+EOF
+chmod +x "$HOME/.local/bin/opencode-agent"
+
+# Also create a short 'oc' alias
+ln -sf "$HOME/.local/bin/opencode-agent" "$HOME/.local/bin/oc"
+
+# Add to PATH if not already there
+if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+echo "devaipod: opencode agent at http://localhost:{port}"
+echo "devaipod: use 'opencode-agent' or 'oc' to connect (in ~/.local/bin)"
+exec sleep infinity
+"#,
+                    port = OPENCODE_PORT
+                ),
             ]),
             drop_all_caps: false,
             cap_add: config.cap_add.clone(),
@@ -294,6 +329,35 @@ impl DevaipodPod {
         // Tell opencode to create its config in the agent home
         env.insert("XDG_CONFIG_HOME".to_string(), format!("{agent_home}/.config"));
         env.insert("XDG_DATA_HOME".to_string(), format!("{agent_home}/.local/share"));
+
+        // Forward API keys to the agent container for LLM access
+        // 1. DEVAIPOD_AGENT_* vars: strip prefix and forward (e.g., DEVAIPOD_AGENT_FOO=bar -> FOO=bar)
+        // 2. Common API key env vars: forward as-is
+        const API_KEY_VARS: &[&str] = &[
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GEMINI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_ENDPOINT",
+            "OPENROUTER_API_KEY",
+            "GROQ_API_KEY",
+            "MISTRAL_API_KEY",
+            "COHERE_API_KEY",
+            "XAI_API_KEY",
+        ];
+
+        for (key, value) in std::env::vars() {
+            // Handle DEVAIPOD_AGENT_* prefix: strip and forward
+            if let Some(stripped) = key.strip_prefix("DEVAIPOD_AGENT_") {
+                if !stripped.is_empty() {
+                    env.insert(stripped.to_string(), value);
+                }
+            } else if API_KEY_VARS.contains(&key.as_str()) {
+                // Forward common API key vars directly
+                env.insert(key, value);
+            }
+        }
 
         ContainerConfig {
             mounts: vec![
@@ -372,10 +436,14 @@ mod tests {
         assert!(!container_config.mounts[0].readonly);
         assert_eq!(container_config.user, Some("vscode".to_string()));
         assert_eq!(container_config.workdir, Some("/workspaces/myproject".to_string()));
-        assert_eq!(
-            container_config.command,
-            Some(vec!["/usr/bin/sleep".to_string(), "infinity".to_string()])
-        );
+        // Verify command is a shell script that creates shim, prints agent info, and sleeps
+        let cmd = container_config.command.as_ref().unwrap();
+        assert_eq!(cmd[0], "/bin/sh");
+        assert_eq!(cmd[1], "-c");
+        assert!(cmd[2].contains("opencode-agent"));  // Creates shim
+        assert!(cmd[2].contains("opencode attach"));  // Shim uses attach
+        assert!(cmd[2].contains(&format!("http://localhost:{}", OPENCODE_PORT)));
+        assert!(cmd[2].contains("sleep infinity"));
         assert!(!container_config.drop_all_caps);
         assert!(!container_config.no_new_privileges);
     }
@@ -470,6 +538,11 @@ mod tests {
 
         assert_eq!(container_config.env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(container_config.env.get("BAZ"), Some(&"qux".to_string()));
+        // Verify agent URL is always set
+        assert_eq!(
+            container_config.env.get("OPENCODE_AGENT_URL"),
+            Some(&format!("http://localhost:{}", OPENCODE_PORT))
+        );
     }
 
     #[test]

@@ -764,24 +764,142 @@ fn cmd_attach(workspace: &str) -> Result<()> {
     Ok(())
 }
 
-/// SSH into workspace
-fn cmd_ssh(workspace: &str, command: &[String]) -> Result<()> {
-    devpod::ssh(workspace, command)
+/// Check if we're running inside a toolbox container
+fn is_toolbox() -> bool {
+    std::env::var_os("TOOLBOX_PATH").is_some()
 }
 
-/// List workspaces
+/// Build a std::process::Command for running podman CLI.
+///
+/// In toolbox mode, uses flatpak-spawn to run podman on the host.
+/// Otherwise, runs podman directly.
+fn podman_command() -> ProcessCommand {
+    if is_toolbox() {
+        let mut cmd = ProcessCommand::new("flatpak-spawn");
+        cmd.args(["--host", "podman"]);
+        cmd
+    } else {
+        ProcessCommand::new("podman")
+    }
+}
+
+/// SSH into workspace using podman exec
+fn cmd_ssh(pod_name: &str, command: &[String]) -> Result<()> {
+    let container = format!("{}-workspace", pod_name);
+
+    tracing::info!("Connecting to container '{}'...", container);
+
+    let mut cmd = podman_command();
+    cmd.args(["exec", "-it", &container]);
+
+    if command.is_empty() {
+        cmd.arg("bash");
+    } else {
+        cmd.args(command);
+    }
+
+    let status = cmd.status().context("Failed to run podman exec")?;
+
+    if !status.success() {
+        bail!(
+            "podman exec failed with exit code {:?}",
+            status.code()
+        );
+    }
+
+    Ok(())
+}
+
+/// List devaipod pods using podman pod ps
 fn cmd_list(json: bool) -> Result<()> {
-    devpod::list(json)
+    let mut cmd = podman_command();
+    cmd.args(["pod", "ps", "--filter", "name=devaipod-*"]);
+
+    if json {
+        cmd.arg("--format=json");
+    }
+
+    let output = cmd.output().context("Failed to run podman pod ps")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "podman pod ps failed with exit code {:?}",
+                output.status.code()
+            );
+        } else {
+            bail!("podman pod ps failed: {}", stderr);
+        }
+    }
+
+    // Print stdout for the user
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    print!("{}", stdout);
+
+    Ok(())
 }
 
-/// Stop workspace
-fn cmd_stop(workspace: &str) -> Result<()> {
-    devpod::stop(workspace)
+/// Stop a pod using podman pod stop
+fn cmd_stop(pod_name: &str) -> Result<()> {
+    tracing::info!("Stopping pod '{}'...", pod_name);
+
+    let output = podman_command()
+        .args(["pod", "stop", pod_name])
+        .output()
+        .context("Failed to run podman pod stop")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        // Ignore "not running" errors
+        if !stderr.contains("not running") && !stderr.contains("no such pod") {
+            if stderr.is_empty() {
+                bail!(
+                    "podman pod stop failed with exit code {:?}",
+                    output.status.code()
+                );
+            } else {
+                bail!("podman pod stop failed: {}", stderr);
+            }
+        }
+    }
+
+    tracing::info!("Pod '{}' stopped", pod_name);
+    Ok(())
 }
 
-/// Delete workspace
-fn cmd_delete(workspace: &str, force: bool) -> Result<()> {
-    devpod::delete(workspace, force)
+/// Delete a pod using podman pod rm
+fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
+    tracing::info!("Deleting pod '{}'...", pod_name);
+
+    let mut cmd = podman_command();
+    cmd.args(["pod", "rm"]);
+
+    if force {
+        cmd.arg("--force");
+    }
+
+    cmd.arg(pod_name);
+
+    let output = cmd.output().context("Failed to run podman pod rm")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "podman pod rm failed with exit code {:?}",
+                output.status.code()
+            );
+        } else {
+            bail!("podman pod rm failed: {}", stderr);
+        }
+    }
+
+    tracing::info!("Pod '{}' deleted", pod_name);
+    Ok(())
 }
 
 /// Check if we're running inside a devpod devcontainer

@@ -18,7 +18,7 @@ devaipod uses podman pods to create a multi-container environment:
 1. Parses your project's `devcontainer.json` to determine the image
 2. Creates a podman pod with shared network namespace
 3. Starts containers:
-   - **workspace**: Your development environment (runs `sleep infinity`)
+   - **workspace**: Your development environment with `oc` and `opencode-agent` shims
    - **agent**: Runs `opencode serve` with security restrictions (dropped capabilities, no-new-privileges)
    - **gator** (optional): [service-gator](https://github.com/cgwalters/service-gator) MCP server for controlled access to GitHub/JIRA
 
@@ -37,30 +37,34 @@ All containers share the same network namespace, allowing localhost communicatio
 git clone https://github.com/cgwalters/devaipod && cd devaipod
 cargo build --release
 
-# Start a pod for a local project
-./target/release/devaipod up /path/to/your/project
+# Start a pod for your project
+devaipod up /path/to/your/project
 
-# Access the workspace container
-podman exec -it devaipod-yourproject-workspace bash
+# SSH into the workspace container
+devaipod ssh devaipod-myproject
 
-# Agent is running at http://localhost:4096
+# Run opencode (connects to sandboxed agent)
+oc
 ```
 
-## Usage
+## Commands
 
 ```bash
-# Start a pod (requires local path with devcontainer.json)
-devaipod up .
-
-# Dry run - show what would be created
-devaipod up . --dry-run
-
-# Stop the pod
-podman pod stop devaipod-yourproject
-
-# Remove the pod
-podman pod rm devaipod-yourproject
+devaipod up .              # Create pod with workspace + agent containers
+devaipod list              # List devaipod pods
+devaipod ssh <pod>         # SSH into workspace container
+devaipod stop <pod>        # Stop a pod
+devaipod delete <pod>      # Delete a pod
+devaipod up . --dry-run    # Show what would be created
 ```
+
+## Key Features
+
+- **Native podman** - no devpod dependency for core workflow
+- **Sandboxed agent** - agent container runs with dropped capabilities, no-new-privileges
+- **Workspace shims** - `oc` and `opencode-agent` commands run `opencode attach http://localhost:4096`
+- **API keys from environment** - agent receives `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.
+- **Toolbox compatible** - works inside toolbox containers
 
 ## Security
 
@@ -76,11 +80,9 @@ For controlled access to external services (like creating PRs), configure servic
 
 ## Status
 
-**Early MVP** - Core pod orchestration works.
-
 | Feature | Status |
 |---------|--------|
-| Podman pod orchestration | ✅ Working |
+| Native podman commands | ✅ Working |
 | Agent container isolation | ✅ Working |
 | devcontainer.json parsing | ✅ Working |
 | Dockerfile builds | ✅ Working |
