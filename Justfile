@@ -35,9 +35,9 @@ fmt:
 clean:
     cargo clean
 
-# Run devaipod with arguments
-run *ARGS:
-    cargo run -- {{ARGS}}
+# Run devaipod with arguments (builds release first)
+run *ARGS: build-release
+    ./target/release/devaipod {{ARGS}}
 
 # Build and install to ~/.cargo/bin
 install:
