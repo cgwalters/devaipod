@@ -12,7 +12,10 @@ use color_eyre::eyre::{bail, Context, Result};
 
 mod compose;
 mod config;
+mod devcontainer;
 mod devpod;
+mod pod;
+mod podman;
 mod secrets;
 mod service_gator;
 
@@ -60,6 +63,9 @@ enum HostCommand {
         /// Generate configuration files but don't start containers
         #[arg(long)]
         dry_run: bool,
+        /// Enable agent sidecar container (experimental)
+        #[arg(long)]
+        agent_sidecar: bool,
     },
     /// Run an AI agent with a task
     ///
@@ -172,7 +178,8 @@ enum ContainerCommand {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     color_eyre::install()?;
     let format = tracing_subscriber::fmt::format()
         .without_time()
@@ -192,11 +199,11 @@ fn main() -> Result<()> {
         run_container(cli)
     } else {
         let cli = HostCli::parse();
-        run_host(cli)
+        run_host(cli).await
     }
 }
 
-fn run_host(cli: HostCli) -> Result<()> {
+async fn run_host(cli: HostCli) -> Result<()> {
     let config = config::load_config(cli.config.as_deref())?;
 
     match cli.command {
@@ -207,15 +214,20 @@ fn run_host(cli: HostCli) -> Result<()> {
             provider,
             ide,
             dry_run,
-        } => cmd_up(
-            &config,
-            &source,
-            agent.as_deref(),
-            no_agent,
-            provider.as_deref(),
-            ide.as_deref(),
-            dry_run,
-        ),
+            agent_sidecar,
+        } => {
+            cmd_up(
+                &config,
+                &source,
+                agent.as_deref(),
+                no_agent,
+                provider.as_deref(),
+                ide.as_deref(),
+                dry_run,
+                agent_sidecar,
+            )
+            .await
+        }
         HostCommand::Run {
             task,
             git,
@@ -252,27 +264,22 @@ fn run_container(cli: ContainerCli) -> Result<()> {
 }
 
 /// Create/start a workspace with AI agent
-fn cmd_up(
-    _config: &config::Config,
+///
+/// Uses podman-native multi-container setup with a pod containing:
+/// - workspace: The user's development environment
+/// - agent: Container running opencode serve with restricted security
+/// - gator (optional): Service-gator MCP server container
+async fn cmd_up(
+    config: &config::Config,
     source: &str,
     _agent: Option<&str>,
-    no_agent: bool,
-    provider: Option<&str>,
-    ide: Option<&str>,
+    _no_agent: bool,
+    _provider: Option<&str>,
+    _ide: Option<&str>,
     dry_run: bool,
+    _agent_sidecar: bool,
 ) -> Result<()> {
-    // For now, devaipod is a thin wrapper around devpod.
-    // Future: add agent sidecar via compose generation (opt-in with --agent-sidecar flag)
-
-    if dry_run {
-        tracing::info!("Dry run: would start devpod workspace for '{}'", source);
-        tracing::info!("  provider: {:?}", provider);
-        tracing::info!("  ide: {:?}", ide);
-        tracing::info!("  no_agent: {}", no_agent);
-        return Ok(());
-    }
-
-    // Resolve local paths to load secrets from devcontainer.json
+    // Resolve local paths
     let source_path = if source.starts_with("http://")
         || source.starts_with("https://")
         || source.starts_with("git@")
@@ -282,24 +289,107 @@ fn cmd_up(
         std::path::Path::new(source).canonicalize().ok()
     };
 
-    // Load secrets from devcontainer.json if available
-    let secrets = if let Some(ref path) = source_path {
-        secrets::load_secrets_from_devcontainer(path)?
-    } else {
-        Vec::new()
+    // Podman-native path requires a local path (can't modify remote repos)
+    let project_path = match source_path {
+        Some(ref p) => p,
+        None => {
+            bail!(
+                "Podman-native mode requires a local path, not a remote URL. \
+                 Clone the repository first and use the local path."
+            );
+        }
     };
 
-    // Run devpod up
-    let workspace_name = devpod::up(source, provider, ide, &secrets)?;
+    // Find and load devcontainer.json
+    let devcontainer_json_path = devcontainer::find_devcontainer_json(project_path)?;
+    let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
 
-    tracing::info!("Workspace '{}' started.", workspace_name);
-    tracing::info!("  • SSH: devpod ssh {}", workspace_name);
-    tracing::info!("  • SSH: devaipod ssh {}", workspace_name);
+    // Derive project/pod name from path
+    let project_name = project_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
 
-    if !no_agent {
-        // TODO: Future enhancement - start agent sidecar
-        tracing::debug!("Agent sidecar not yet implemented in this version");
+    // Use a sanitized pod name (replace problematic characters)
+    let pod_name = format!(
+        "devaipod-{}",
+        project_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .collect::<String>()
+    );
+
+    if dry_run {
+        tracing::info!("Dry run: would create pod '{}'", pod_name);
+        tracing::info!("  project: {}", project_path.display());
+        tracing::info!("  devcontainer: {}", devcontainer_json_path.display());
+        tracing::info!(
+            "  gator enabled: {}",
+            config.service_gator.is_enabled()
+        );
+        return Ok(());
     }
+
+    // Start podman service
+    tracing::info!("Starting podman service...");
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    // Check if gator should be enabled
+    let enable_gator = config.service_gator.is_enabled();
+
+    // Create the pod with all containers
+    tracing::info!("Creating pod '{}'...", pod_name);
+    let devaipod_pod = pod::DevaipodPod::create(
+        &podman,
+        project_path,
+        &devcontainer_config,
+        &pod_name,
+        enable_gator,
+    )
+    .await
+    .context("Failed to create devaipod pod")?;
+
+    // Start the pod
+    tracing::info!("Starting pod...");
+    devaipod_pod
+        .start(&podman)
+        .await
+        .context("Failed to start pod")?;
+
+    // Run lifecycle commands (onCreateCommand, postCreateCommand, postStartCommand)
+    tracing::info!("Running lifecycle commands...");
+    devaipod_pod
+        .run_lifecycle_commands(&podman, &devcontainer_config)
+        .await
+        .context("Failed to run lifecycle commands")?;
+
+    // Success! Print connection info
+    tracing::info!("Pod '{}' started successfully.", pod_name);
+    tracing::info!("  • Workspace container: {}", devaipod_pod.workspace_container);
+    tracing::info!("  • Agent container: {}", devaipod_pod.agent_container);
+    if let Some(ref gator) = devaipod_pod.gator_container {
+        tracing::info!("  • Gator container: {}", gator);
+    }
+    tracing::info!(
+        "  • Agent server: http://localhost:{}",
+        pod::OPENCODE_PORT
+    );
+    tracing::info!(
+        "  • SSH into workspace: podman exec -it {} bash",
+        devaipod_pod.workspace_container
+    );
+
+    // Keep podman service running - when we drop it, the service will stop
+    // For now, we just exit after starting. The pod will keep running.
+    // In the future, we could wait for a signal or provide a shell.
+    tracing::info!("Pod is running. Use 'podman pod stop {}' to stop.", pod_name);
+
+    // Drop podman service - this will kill the service process
+    // but the pod/containers will continue running since podman doesn't
+    // require the service to be running for containers to run.
+    drop(podman);
 
     Ok(())
 }

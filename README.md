@@ -1,8 +1,8 @@
 # devaipod
 
-**Sandboxed AI coding agents in reproducible dev environments**
+**Sandboxed AI coding agents in reproducible dev environments using podman pods**
 
-Run AI agents with confidence: your code in a devcontainer, the agent in an additional sandbox with only the access it needs.
+Run AI agents with confidence: your code in a devcontainer, the agent in a separate container with security restrictions.
 
 ## On the topic of AI
 
@@ -11,6 +11,25 @@ he believes the long term negatives are likely to outweigh the gains. But since 
 is about maximizing the positive aspects of LLMs with a focus on software production (but not exclusively).
 We need use LLMs safely and responsibly, with efficient human-in-the-loop controls and auditability.
 
+## How It Works
+
+devaipod uses podman pods to create a multi-container environment:
+
+1. Parses your project's `devcontainer.json` to determine the image
+2. Creates a podman pod with shared network namespace
+3. Starts containers:
+   - **workspace**: Your development environment (runs `sleep infinity`)
+   - **agent**: Runs `opencode serve` with security restrictions (dropped capabilities, no-new-privileges)
+   - **gator** (optional): [service-gator](https://github.com/cgwalters/service-gator) MCP server for controlled access to GitHub/JIRA
+
+All containers share the same network namespace, allowing localhost communication between the agent and workspace.
+
+## Requirements
+
+- **podman** (rootless works, including inside toolbox containers)
+- An image with `opencode` installed (e.g., [devenv-debian](https://github.com/cgwalters/devenv-debian))
+- A `devcontainer.json` in your project (`.devcontainer/devcontainer.json` or `.devcontainer.json`)
+
 ## Quick Start
 
 ```bash
@@ -18,73 +37,62 @@ We need use LLMs safely and responsibly, with efficient human-in-the-loop contro
 git clone https://github.com/cgwalters/devaipod && cd devaipod
 cargo build --release
 
-# Configure (Vertex AI example)
-gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT="your-project-id"
-devpod context set-options -o DOTFILES_URL=https://github.com/your/dotfiles
+# Start a pod for a local project
+./target/release/devaipod up /path/to/your/project
 
-# Run
-./target/release/devaipod run --git . "find typos in the docs"
+# Access the workspace container
+podman exec -it devaipod-yourproject-workspace bash
+
+# Agent is running at http://localhost:4096
 ```
-
-See [Secret Management](docs/secrets.md) for detailed setup instructions.
-
-## How It Works
-
-devaipod combines [DevPod](https://devpod.sh/) with [bubblewrap](https://github.com/containers/bubblewrap) sandboxing:
-
-1. **DevPod** creates a reproducible devcontainer with your code
-2. **bubblewrap** runs the AI agent in a minimal sandbox inside that container
-
-The agent can read your code and propose changes, but can't access your credentials or modify system files. Network access is currently unrestricted (needed for LLM API calls).
 
 ## Usage
 
 ```bash
-# Run on local repo
-devaipod run --git . "explain the main function"
+# Start a pod (requires local path with devcontainer.json)
+devaipod up .
 
-# Run on GitHub issue (auto-clones repo)
-devaipod run --issue https://github.com/org/repo/issues/123
+# Dry run - show what would be created
+devaipod up . --dry-run
 
-# Allow agent to create PRs in specific repos
-devaipod run --git . --repo owner/repo "fix the bug and create a PR"
-```
+# Stop the pod
+podman pod stop devaipod-yourproject
 
-Inside a devcontainer:
-```bash
-devaipod tmux    # Split view: agent + shell
-devaipod enter   # Shell into sandbox
+# Remove the pod
+podman pod rm devaipod-yourproject
 ```
 
 ## Security
 
-The sandbox isolates the agent from:
-- Your home directory credentials (SSH keys, tokens, etc.)
-- System files (read-only `/usr`, `/etc`, `/lib`)
-- Other processes (PID namespace isolation)
+The agent container runs with restricted privileges:
+- Drops all capabilities except `NET_BIND_SERVICE`
+- Sets `no-new-privileges`
+- Uses an isolated home directory (`/tmp/agent-home`)
+- Has read/write access only to the workspace
 
-The agent can only write to:
-- The workspace (`/workspaces/<name>`)
-- Its isolated home (`$HOME/ai` mounted over `$HOME`)
+The workspace container retains normal privileges for development tasks.
 
-For controlled access to external services (like creating PRs), agents should use MCP servers like [service-gator](https://github.com/cgwalters/service-gator) which provides scope-based access control. See [Sandboxing Model](docs/sandboxing.md) for details.
+For controlled access to external services (like creating PRs), configure service-gator in your `~/.config/devaipod.toml`.
 
 ## Status
 
-**Early MVP** - Core sandboxing works.
+**Early MVP** - Core pod orchestration works.
 
 | Feature | Status |
 |---------|--------|
-| Sandbox isolation | ✅ Working |
-| MCP server integration | ✅ Supported (via service-gator) |
+| Podman pod orchestration | ✅ Working |
+| Agent container isolation | ✅ Working |
+| devcontainer.json parsing | ✅ Working |
+| Dockerfile builds | ✅ Working |
+| Lifecycle commands | ✅ Working |
+| service-gator integration | ✅ Optional |
 | Network isolation | 🟡 Not yet (full network access) |
 
 ## Documentation
 
-- [Sandboxing Model](docs/sandboxing.md) - How the bwrap sandbox works
+- [Sandboxing Model](docs/sandboxing.md) - Security model details
 - [Secret Management](docs/secrets.md) - Handling API keys and credentials
-- [OpenCode Agent](docs/opencode.md) - Configuring the default AI agent
+- [OpenCode Agent](docs/opencode.md) - Configuring the AI agent
 - [Service-gator Integration](docs/service-gator.md) - Scope-restricted access to GitHub/JIRA
 
 ## License
