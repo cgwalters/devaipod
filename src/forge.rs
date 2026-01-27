@@ -16,6 +16,27 @@ pub enum ForgeType {
     Gitea,
 }
 
+/// A parsed repository reference (not a PR, just a repo)
+#[derive(Debug, Clone)]
+pub struct RepoRef {
+    /// The forge type (github, gitlab, etc.)
+    pub forge_type: ForgeType,
+    /// The forge host (e.g., "github.com", "gitlab.com", "codeberg.org")
+    #[allow(dead_code)] // Will be useful when adding GitLab/Forgejo support
+    pub host: String,
+    /// Repository owner/organization
+    pub owner: String,
+    /// Repository name
+    pub repo: String,
+}
+
+impl RepoRef {
+    /// Get owner/repo string (e.g., "owner/repo")
+    pub fn owner_repo(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
 impl std::fmt::Display for ForgeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -166,6 +187,74 @@ pub fn parse_pr_url(url: &str) -> Option<PullRequestRef> {
     }
 
     None
+}
+
+/// Parse a git repository URL to extract forge type and owner/repo
+///
+/// Supports:
+/// - GitHub: https://github.com/owner/repo or git@github.com:owner/repo.git
+/// - GitLab: https://gitlab.com/owner/repo or git@gitlab.com:owner/repo.git
+/// - Forgejo/Gitea: https://codeberg.org/owner/repo, etc.
+///
+/// Returns None if the URL doesn't match a known pattern.
+pub fn parse_repo_url(url: &str) -> Option<RepoRef> {
+    let url = url.trim().trim_end_matches('/');
+
+    // Handle SSH format: git@host:owner/repo.git
+    if url.starts_with("git@") {
+        let rest = url.strip_prefix("git@")?;
+        let (host, path) = rest.split_once(':')?;
+        let path = path.trim_end_matches(".git");
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 2 {
+            let forge_type = detect_forge_type(host);
+            return Some(RepoRef {
+                forge_type,
+                host: host.to_string(),
+                owner: parts[0].to_string(),
+                repo: parts[1].to_string(),
+            });
+        }
+        return None;
+    }
+
+    // Handle HTTPS format: https://host/owner/repo
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let path_segments: Vec<&str> = parsed
+        .path()
+        .trim_start_matches('/')
+        .trim_end_matches(".git")
+        .split('/')
+        .collect();
+
+    if path_segments.len() >= 2 {
+        let forge_type = detect_forge_type(&host);
+        return Some(RepoRef {
+            forge_type,
+            host,
+            owner: path_segments[0].to_string(),
+            repo: path_segments[1].to_string(),
+        });
+    }
+
+    None
+}
+
+/// Detect forge type from hostname
+fn detect_forge_type(host: &str) -> ForgeType {
+    if host.contains("github") {
+        ForgeType::GitHub
+    } else if host.contains("gitlab") {
+        ForgeType::GitLab
+    } else if host.contains("codeberg") || host.contains("forgejo") {
+        ForgeType::Forgejo
+    } else if host.contains("gitea") {
+        ForgeType::Gitea
+    } else {
+        // Default to GitHub for unknown hosts (most common)
+        ForgeType::GitHub
+    }
 }
 
 /// Fetch PR metadata from the forge API
@@ -478,5 +567,48 @@ mod tests {
             number: 200,
         };
         assert_eq!(pr.short_display(), "containers/composefs-rs#200");
+    }
+
+    #[test]
+    fn test_parse_repo_url_github_https() {
+        let repo = parse_repo_url("https://github.com/owner/repo").unwrap();
+        assert_eq!(repo.forge_type, ForgeType::GitHub);
+        assert_eq!(repo.owner, "owner");
+        assert_eq!(repo.repo, "repo");
+        assert_eq!(repo.owner_repo(), "owner/repo");
+    }
+
+    #[test]
+    fn test_parse_repo_url_github_https_with_git_suffix() {
+        let repo = parse_repo_url("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(repo.forge_type, ForgeType::GitHub);
+        assert_eq!(repo.owner_repo(), "owner/repo");
+    }
+
+    #[test]
+    fn test_parse_repo_url_github_ssh() {
+        let repo = parse_repo_url("git@github.com:owner/repo.git").unwrap();
+        assert_eq!(repo.forge_type, ForgeType::GitHub);
+        assert_eq!(repo.owner_repo(), "owner/repo");
+    }
+
+    #[test]
+    fn test_parse_repo_url_gitlab() {
+        let repo = parse_repo_url("https://gitlab.com/group/project").unwrap();
+        assert_eq!(repo.forge_type, ForgeType::GitLab);
+        assert_eq!(repo.owner_repo(), "group/project");
+    }
+
+    #[test]
+    fn test_parse_repo_url_codeberg() {
+        let repo = parse_repo_url("https://codeberg.org/owner/repo").unwrap();
+        assert_eq!(repo.forge_type, ForgeType::Forgejo);
+        assert_eq!(repo.owner_repo(), "owner/repo");
+    }
+
+    #[test]
+    fn test_parse_repo_url_trailing_slash() {
+        let repo = parse_repo_url("https://github.com/owner/repo/").unwrap();
+        assert_eq!(repo.owner_repo(), "owner/repo");
     }
 }

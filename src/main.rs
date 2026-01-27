@@ -960,14 +960,63 @@ async fn cmd_up_remote(
             .collect::<String>()
     );
 
+    // For remote URLs, auto-enable service-gator with readonly + draft PR access
+    // to the target repository (unless user provided explicit scopes)
+    let (service_gator_config, auto_gator_info) = if !service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(service_gator_scopes)
+            .context("Failed to parse --service-gator scopes")?;
+        (service_gator::merge_configs(&config.service_gator, &cli_scopes), None)
+    } else if let Some(repo_ref) = forge::parse_repo_url(remote_url) {
+        // Auto-configure: read + create-draft for the target repo
+        let mut sg_config = config.service_gator.clone();
+        let owner_repo = repo_ref.owner_repo();
+
+        match repo_ref.forge_type {
+            forge::ForgeType::GitHub => {
+                sg_config.gh.repos.insert(
+                    owner_repo.clone(),
+                    config::GhRepoPermission {
+                        read: true,
+                        create_draft: true,
+                        pending_review: false,
+                        write: false,
+                    },
+                );
+            }
+            forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
+                // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
+                // For now, just log that we can't auto-configure
+                tracing::debug!(
+                    "Auto service-gator not yet supported for {} ({})",
+                    repo_ref.forge_type,
+                    owner_repo
+                );
+            }
+        }
+        (sg_config, Some((repo_ref.forge_type, owner_repo)))
+    } else {
+        (config.service_gator.clone(), None)
+    };
+
     if dry_run {
         tracing::info!("Dry run mode - would create pod '{}'", pod_name);
         tracing::info!("  Remote URL: {}", remote_url);
         tracing::info!("  Default branch: {}", default_branch);
+        if let Some((forge_type, ref owner_repo)) = auto_gator_info {
+            if matches!(forge_type, forge::ForgeType::GitHub) {
+                tracing::info!("  Service-gator: {} (read + draft PRs)", owner_repo);
+            }
+        }
         if let Some(task_desc) = task {
             tracing::info!("  Task: {}", task_desc);
         }
         return Ok(());
+    }
+
+    if let Some((forge_type, ref owner_repo)) = auto_gator_info {
+        if matches!(forge_type, forge::ForgeType::GitHub) {
+            tracing::info!("Auto-enabled service-gator for {} (read + draft PRs)", owner_repo);
+        }
     }
 
     // Start podman service
@@ -991,15 +1040,6 @@ async fn cmd_up_remote(
             return Ok(());
         }
     }
-
-    // Parse CLI service-gator scopes and merge with file config
-    let service_gator_config = if !service_gator_scopes.is_empty() {
-        let cli_scopes = service_gator::parse_scopes(service_gator_scopes)
-            .context("Failed to parse --service-gator scopes")?;
-        service_gator::merge_configs(&config.service_gator, &cli_scopes)
-    } else {
-        config.service_gator.clone()
-    };
 
     let enable_gator = service_gator_config.is_enabled();
     let enable_network_isolation = config.network_isolation.enabled;
