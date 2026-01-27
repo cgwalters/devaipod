@@ -410,6 +410,12 @@ async fn cmd_up(
         .await
         .context("Failed to start pod")?;
 
+    // Wait for the agent to be ready before proceeding
+    devaipod_pod
+        .wait_for_agent_ready(&podman, 60, 500)
+        .await
+        .context("Agent container failed to start")?;
+
     // Copy bind_home files into containers (using podman cp instead of bind mounts
     // to avoid permission issues with rootless podman)
     tracing::info!("Copying bind_home files...");
