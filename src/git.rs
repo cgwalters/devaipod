@@ -16,6 +16,7 @@ pub struct GitRepoInfo {
     /// Current commit SHA (full 40-character hash)
     pub commit_sha: String,
     /// Current branch name (None if detached HEAD)
+    #[allow(dead_code)] // Useful for future features like branch-based workspace naming
     pub branch: Option<String>,
     /// Whether the working tree has uncommitted changes
     pub is_dirty: bool,

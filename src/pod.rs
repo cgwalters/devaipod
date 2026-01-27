@@ -811,7 +811,7 @@ echo "Nested podman configured successfully"
     /// Create container config for the workspace container
     fn workspace_container_config(
         _project_path: &Path,
-        workspace_folder: &str,
+        _workspace_folder: &str,
         user: Option<&str>,
         config: &DevcontainerConfig,
         _bind_home: &BindHomeConfig,
@@ -956,7 +956,7 @@ exec sleep infinity
     /// traffic through the network isolation proxy.
     fn agent_container_config(
         _project_path: &Path,
-        workspace_folder: &str,
+        _workspace_folder: &str,
         bind_home: &BindHomeConfig,
         _container_home: &str,
         devcontainer_config: Option<&DevcontainerConfig>,
