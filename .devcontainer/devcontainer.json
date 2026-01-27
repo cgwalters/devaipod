@@ -1,9 +1,6 @@
 {
   "name": "devaipod-dev",
   "image": "ghcr.io/bootc-dev/devenv-debian:latest",
-  "features": {
-    "../features/src/devaipod": {}
-  },
   "runArgs": [
     "--privileged"
   ],
