@@ -1064,7 +1064,7 @@ while true; do sleep 86400 & wait $!; done
     /// traffic through the network isolation proxy.
     fn agent_container_config(
         _project_path: &Path,
-        _workspace_folder: &str,
+        workspace_folder: &str,
         bind_home: &BindHomeConfig,
         _container_home: &str,
         devcontainer_config: Option<&DevcontainerConfig>,
@@ -1158,9 +1158,8 @@ while true; do sleep 86400 & wait $!; done
         ContainerConfig {
             mounts,
             env,
-            // Don't set workdir initially - workspace folder doesn't exist until we clone
-            // opencode serve will use the workspace folder after clone
-            workdir: None,
+            // Set workdir to the workspace folder - where the cloned repo lives
+            workdir: Some(workspace_folder.to_string()),
             // Run as a non-root user if possible (agent user)
             user: None, // Let the image decide, or we could set "1000" for a generic user
             command: Some(vec![
