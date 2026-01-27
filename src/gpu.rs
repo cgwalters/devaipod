@@ -4,6 +4,12 @@
 //! through to containers. Supports:
 //! - NVIDIA GPUs (via CDI or direct device passthrough)
 //! - AMD GPUs (via direct device passthrough)
+//!
+//! Note: This module is currently preparatory infrastructure. GPU passthrough
+//! will be integrated once the configuration parsing is complete.
+
+// Allow dead code since this is preparatory infrastructure for GPU passthrough
+#![allow(dead_code)]
 
 use std::fs;
 use std::path::Path;

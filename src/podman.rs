@@ -15,8 +15,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use bollard::container::{
-    LogsOptions, RemoveContainerOptions, StartContainerOptions,
-    StopContainerOptions,
+    LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::BuildImageOptions;
@@ -265,7 +264,9 @@ impl PodmanService {
             ..Default::default()
         };
 
-        let mut stream = self.client.build_image(options, None, Some(tar_data.into()));
+        let mut stream = self
+            .client
+            .build_image(options, None, Some(tar_data.into()));
 
         while let Some(result) = stream.next().await {
             let info = result.context("Error building image")?;
@@ -403,7 +404,11 @@ impl PodmanService {
         }
 
         let pod_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        tracing::info!("Created pod: {} ({})", name, &pod_id[..pod_id.len().min(12)]);
+        tracing::info!(
+            "Created pod: {} ({})",
+            name,
+            &pod_id[..pod_id.len().min(12)]
+        );
         Ok(pod_id)
     }
 
@@ -425,7 +430,9 @@ impl PodmanService {
             bail!("Failed to inspect pod: {}", stderr);
         }
 
-        let state = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+        let state = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_lowercase();
         let status = match state.as_str() {
             "running" => PodStatus::Running,
             "exited" | "stopped" | "dead" => PodStatus::Stopped,
@@ -606,7 +613,11 @@ impl PodmanService {
         }
 
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        tracing::debug!("Created container: {} ({})", name, &container_id[..container_id.len().min(12)]);
+        tracing::debug!(
+            "Created container: {} ({})",
+            name,
+            &container_id[..container_id.len().min(12)]
+        );
         Ok(container_id)
     }
 
@@ -759,20 +770,18 @@ impl PodmanService {
         // Create parent directory with mkdir -p
         let mkdir_output = self
             .podman_command()
-            .args([
-                "exec",
-                container,
-                "mkdir",
-                "-p",
-                &target_parent,
-            ])
+            .args(["exec", container, "mkdir", "-p", &target_parent])
             .output()
             .await
             .context("Failed to create parent directory")?;
 
         if !mkdir_output.status.success() {
             let stderr = String::from_utf8_lossy(&mkdir_output.stderr);
-            tracing::warn!("Failed to create parent directory {}: {}", target_parent, stderr);
+            tracing::warn!(
+                "Failed to create parent directory {}: {}",
+                target_parent,
+                stderr
+            );
             // Continue anyway, cp might still work
         }
 
@@ -800,36 +809,19 @@ impl PodmanService {
         if let Some(owner) = owner {
             let chown_output = self
                 .podman_command()
-                .args([
-                    "exec",
-                    container,
-                    "chown",
-                    "-R",
-                    owner,
-                    target,
-                ])
+                .args(["exec", container, "chown", "-R", owner, target])
                 .output()
                 .await
                 .context("Failed to change ownership")?;
 
             if !chown_output.status.success() {
                 let stderr = String::from_utf8_lossy(&chown_output.stderr);
-                tracing::warn!(
-                    "Failed to chown {} to {}: {}",
-                    target,
-                    owner,
-                    stderr
-                );
+                tracing::warn!("Failed to chown {} to {}: {}", target, owner, stderr);
                 // Don't fail - chown might fail if running as non-root
             }
         }
 
-        tracing::debug!(
-            "Copied {} to {}:{}",
-            source.display(),
-            container,
-            target
-        );
+        tracing::debug!("Copied {} to {}:{}", source.display(), container, target);
         Ok(())
     }
 }
@@ -888,10 +880,8 @@ pub struct MountConfig {
 
 /// Create a tar archive of a directory
 async fn create_tar_archive(path: &Path) -> Result<Vec<u8>> {
-    
-
     let path = path.to_path_buf();
-    
+
     // Run in blocking task since tar is sync
     tokio::task::spawn_blocking(move || {
         let mut builder = tar::Builder::new(Vec::new());

@@ -76,8 +76,6 @@ fn get_host_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
-
-
 /// A devaipod pod managing multiple containers
 #[derive(Debug, Clone)]
 pub struct DevaipodPod {
@@ -158,9 +156,7 @@ impl DevaipodPod {
 
         // Find devcontainer.json directory for resolving relative paths
         let devcontainer_json = crate::devcontainer::find_devcontainer_json(project_path)?;
-        let devcontainer_dir = devcontainer_json
-            .parent()
-            .unwrap_or(project_path);
+        let devcontainer_dir = devcontainer_json.parent().unwrap_or(project_path);
 
         // Determine image source and ensure image is available
         let image_source = config.image_source(devcontainer_dir)?;
@@ -198,13 +194,18 @@ impl DevaipodPod {
         podman
             .create_container(&workspace_container, &image, pod_name, workspace_config)
             .await
-            .with_context(|| format!("Failed to create workspace container: {}", workspace_container))?;
+            .with_context(|| {
+                format!(
+                    "Failed to create workspace container: {}",
+                    workspace_container
+                )
+            })?;
 
         // Create proxy container if network isolation is enabled
         let proxy_container_name = format!("{}-proxy", pod_name);
         let proxy_container = if enable_network_isolation {
             tracing::info!("Network isolation enabled, creating proxy container...");
-            
+
             // Pull proxy image
             let proxy_image = global_config.network_isolation.proxy_image();
             podman
@@ -214,13 +215,17 @@ impl DevaipodPod {
 
             // Combine allowed domains from global config and devcontainer customizations
             let mut network_config = global_config.network_isolation.clone();
-            network_config.allowed_domains.extend(devcontainer_config.allowed_domains());
+            network_config
+                .allowed_domains
+                .extend(devcontainer_config.allowed_domains());
 
             let proxy_config = crate::proxy::proxy_container_config(&network_config);
             podman
                 .create_container(&proxy_container_name, proxy_image, pod_name, proxy_config)
                 .await
-                .with_context(|| format!("Failed to create proxy container: {}", proxy_container_name))?;
+                .with_context(|| {
+                    format!("Failed to create proxy container: {}", proxy_container_name)
+                })?;
 
             Some(proxy_container_name)
         } else {
@@ -253,14 +258,16 @@ impl DevaipodPod {
             podman
                 .create_container(&gator_container_name, GATOR_IMAGE, pod_name, gator_config)
                 .await
-                .with_context(|| format!("Failed to create gator container: {}", gator_container_name))?;
+                .with_context(|| {
+                    format!("Failed to create gator container: {}", gator_container_name)
+                })?;
 
             Some(gator_container_name)
         } else {
             None
         };
 
-        let container_count = 2 
+        let container_count = 2
             + if gator_container.is_some() { 1 } else { 0 }
             + if proxy_container.is_some() { 1 } else { 0 };
         tracing::info!(
@@ -305,14 +312,14 @@ impl DevaipodPod {
         poll_interval_ms: u64,
     ) -> Result<()> {
         use std::time::{Duration, Instant};
-        
+
         let health_url = format!("http://localhost:{}/global/health", OPENCODE_PORT);
         let timeout = Duration::from_secs(timeout_secs);
         let poll_interval = Duration::from_millis(poll_interval_ms);
         let start = Instant::now();
-        
+
         tracing::info!("Waiting for agent to be ready...");
-        
+
         loop {
             // Check if we've exceeded timeout
             if start.elapsed() > timeout {
@@ -323,7 +330,7 @@ impl DevaipodPod {
                     self.agent_container
                 ));
             }
-            
+
             // Try to curl the health endpoint from inside the workspace container
             // (since containers share the pod's network namespace)
             let check_cmd = format!("curl -sf '{}' >/dev/null 2>&1", health_url);
@@ -335,13 +342,10 @@ impl DevaipodPod {
                     None,
                 )
                 .await;
-            
+
             match result {
                 Ok(0) => {
-                    tracing::info!(
-                        "Agent ready after {:.1}s",
-                        start.elapsed().as_secs_f64()
-                    );
+                    tracing::info!("Agent ready after {:.1}s", start.elapsed().as_secs_f64());
                     return Ok(());
                 }
                 Ok(_) | Err(_) => {
@@ -577,11 +581,7 @@ echo "Dotfiles installed successfully"
                 .copy_to_container(&self.agent_container, &source, &target, None)
                 .await
             {
-                tracing::warn!(
-                    "Failed to copy {} to agent container: {}",
-                    relative_path,
-                    e
-                );
+                tracing::warn!("Failed to copy {} to agent container: {}", relative_path, e);
             }
         }
 
@@ -796,10 +796,19 @@ exec sleep infinity
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), agent_home.clone());
         // Ensure agent can find opencode in PATH
-        env.insert("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".to_string());
+        env.insert(
+            "PATH".to_string(),
+            "/usr/local/bin:/usr/bin:/bin".to_string(),
+        );
         // Tell opencode to create its config in the agent home
-        env.insert("XDG_CONFIG_HOME".to_string(), format!("{agent_home}/.config"));
-        env.insert("XDG_DATA_HOME".to_string(), format!("{agent_home}/.local/share"));
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            format!("{agent_home}/.config"),
+        );
+        env.insert(
+            "XDG_DATA_HOME".to_string(),
+            format!("{agent_home}/.local/share"),
+        );
 
         // Forward API keys to the agent container for LLM access
         // 1. DEVAIPOD_AGENT_* vars: strip prefix and forward (e.g., DEVAIPOD_AGENT_FOO=bar -> FOO=bar)
@@ -965,13 +974,16 @@ mod tests {
         assert_eq!(container_config.mounts[0].target, "/workspaces/myproject");
         assert!(!container_config.mounts[0].readonly);
         assert_eq!(container_config.user, Some("vscode".to_string()));
-        assert_eq!(container_config.workdir, Some("/workspaces/myproject".to_string()));
+        assert_eq!(
+            container_config.workdir,
+            Some("/workspaces/myproject".to_string())
+        );
         // Verify command is a shell script that creates shim, prints agent info, and sleeps
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
         assert_eq!(cmd[1], "-c");
-        assert!(cmd[2].contains("opencode-agent"));  // Creates shim
-        assert!(cmd[2].contains("opencode attach"));  // Shim uses attach
+        assert!(cmd[2].contains("opencode-agent")); // Creates shim
+        assert!(cmd[2].contains("opencode attach")); // Shim uses attach
         assert!(cmd[2].contains(&format!("http://localhost:{}", OPENCODE_PORT)));
         assert!(cmd[2].contains("sleep infinity"));
         assert!(!container_config.drop_all_caps);
@@ -1008,7 +1020,10 @@ mod tests {
         // Verify security restrictions
         assert!(container_config.drop_all_caps);
         assert!(container_config.no_new_privileges);
-        assert_eq!(container_config.cap_add, vec!["NET_BIND_SERVICE".to_string()]);
+        assert_eq!(
+            container_config.cap_add,
+            vec!["NET_BIND_SERVICE".to_string()]
+        );
 
         // Verify agent has isolated home in /tmp
         assert_eq!(
@@ -1068,7 +1083,10 @@ mod tests {
         // Verify security restrictions
         assert!(container_config.drop_all_caps);
         assert!(container_config.no_new_privileges);
-        assert_eq!(container_config.cap_add, vec!["NET_BIND_SERVICE".to_string()]);
+        assert_eq!(
+            container_config.cap_add,
+            vec!["NET_BIND_SERVICE".to_string()]
+        );
     }
 
     #[test]
@@ -1146,11 +1164,15 @@ mod tests {
         let workspace_folder = "/workspaces/project";
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
-        
+
         let mut config = DevcontainerConfig::default();
-        config.container_env.insert("FOO".to_string(), "bar".to_string());
-        config.remote_env.insert("BAZ".to_string(), "qux".to_string());
-        
+        config
+            .container_env
+            .insert("FOO".to_string(), "bar".to_string());
+        config
+            .remote_env
+            .insert("BAZ".to_string(), "qux".to_string());
+
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1223,7 +1245,9 @@ mod tests {
             "${containerEnv:PATH}:/usr/local/cargo/bin".to_string(),
         );
         // A simple env var that should pass through
-        config.remote_env.insert("SIMPLE".to_string(), "value".to_string());
+        config
+            .remote_env
+            .insert("SIMPLE".to_string(), "value".to_string());
 
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
@@ -1260,7 +1284,9 @@ mod tests {
             "${containerEnv:SOME_VAR}".to_string(),
         );
         // A simple env var that should pass through
-        config.remote_env.insert("SIMPLE".to_string(), "value".to_string());
+        config
+            .remote_env
+            .insert("SIMPLE".to_string(), "value".to_string());
 
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
@@ -1289,10 +1315,10 @@ mod tests {
         let workspace_folder = "/workspaces/project";
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
-        
+
         let mut config = DevcontainerConfig::default();
         config.cap_add = vec!["SYS_PTRACE".to_string()];
-        
+
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1344,7 +1370,7 @@ mod tests {
         assert!(container_config.env.contains_key("HTTP_PROXY"));
         assert!(container_config.env.contains_key("HTTPS_PROXY"));
         assert!(container_config.env.contains_key("NO_PROXY"));
-        
+
         let proxy_url = format!("http://localhost:{}", crate::proxy::PROXY_PORT);
         assert_eq!(container_config.env.get("HTTP_PROXY"), Some(&proxy_url));
         assert_eq!(container_config.env.get("HTTPS_PROXY"), Some(&proxy_url));
@@ -1421,7 +1447,9 @@ mod tests {
 
         // Device should be in the devices list
         assert!(
-            container_config.devices.contains(&"/dev/custom".to_string()),
+            container_config
+                .devices
+                .contains(&"/dev/custom".to_string()),
             "devices should include /dev/custom from runArgs"
         );
     }
@@ -1445,7 +1473,10 @@ mod tests {
             &bind_home,
             container_home,
         );
-        assert!(container_config1.privileged, "direct privileged field should work");
+        assert!(
+            container_config1.privileged,
+            "direct privileged field should work"
+        );
 
         // Test both set
         let mut config2 = DevcontainerConfig::default();
@@ -1460,6 +1491,9 @@ mod tests {
             &bind_home,
             container_home,
         );
-        assert!(container_config2.privileged, "both set should still be privileged");
+        assert!(
+            container_config2.privileged,
+            "both set should still be privileged"
+        );
     }
 }

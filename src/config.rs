@@ -55,8 +55,9 @@ pub struct Config {
     /// Network isolation configuration for agent container
     #[serde(default, rename = "network-isolation")]
     pub network_isolation: NetworkIsolationConfig,
-    /// GPU passthrough configuration
+    /// GPU passthrough configuration (planned feature, not yet integrated)
     #[serde(default)]
+    #[allow(dead_code)]
     pub gpu: GpuPassthroughConfig,
     /// Bind paths from host $HOME to container $HOME (applies to all containers)
     /// Paths are relative to $HOME on both sides
@@ -225,6 +226,7 @@ impl Default for GpuPassthroughConfig {
 
 impl GpuPassthroughConfig {
     /// Check if GPU should be enabled for the workspace container
+    #[allow(dead_code)] // Preparatory for GPU passthrough integration
     pub fn workspace_enabled(&self, has_gpus: bool) -> bool {
         match self.enabled {
             GpuEnabled::Disabled => false,
@@ -234,7 +236,7 @@ impl GpuPassthroughConfig {
     }
 
     /// Check if GPU should be enabled for the agent container
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Preparatory for GPU passthrough integration
     pub fn agent_enabled(&self, has_gpus: bool) -> bool {
         match self.enabled {
             GpuEnabled::Disabled => false,

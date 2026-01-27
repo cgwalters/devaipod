@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use color_eyre::eyre::{bail, Context, Result};
 
 mod compose;
@@ -162,6 +162,29 @@ enum HostCommand {
         #[arg(short = 'n', long)]
         tail: Option<u32>,
     },
+    /// Show detailed status of a pod
+    ///
+    /// Displays pod status, container states, agent health, and exposed ports.
+    Status {
+        /// Workspace/pod name
+        workspace: String,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate shell completions
+    ///
+    /// Outputs shell completion scripts to stdout for various shells.
+    ///
+    /// Examples:
+    ///   devaipod completions bash > ~/.local/share/bash-completion/completions/devaipod
+    ///   devaipod completions zsh > ~/.zfunc/_devaipod
+    ///   devaipod completions fish > ~/.config/fish/completions/devaipod.fish
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 // =============================================================================
@@ -306,6 +329,8 @@ async fn run_host(cli: HostCli) -> Result<()> {
             follow,
             tail,
         } => cmd_logs(&workspace, &container, follow, tail),
+        HostCommand::Status { workspace, json } => cmd_status(&workspace, json),
+        HostCommand::Completions { shell } => cmd_completions(shell),
     }
 }
 
@@ -374,7 +399,11 @@ async fn cmd_up(
         "devaipod-{}",
         project_name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .map(|c| if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            })
             .collect::<String>()
     );
 
@@ -385,10 +414,7 @@ async fn cmd_up(
         tracing::info!("Dry run: would create pod '{}'", pod_name);
         tracing::info!("  project: {}", project_path.display());
         tracing::info!("  devcontainer: {}", devcontainer_json_path.display());
-        tracing::info!(
-            "  gator enabled: {}",
-            config.service_gator.is_enabled()
-        );
+        tracing::info!("  gator enabled: {}", config.service_gator.is_enabled());
         return Ok(());
     }
 
@@ -406,7 +432,10 @@ async fn cmd_up(
     {
         if status.is_running() {
             tracing::info!("Pod '{}' is already running", pod_name);
-            tracing::info!("  • SSH into workspace: podman exec -it {}-workspace bash", pod_name);
+            tracing::info!(
+                "  • SSH into workspace: podman exec -it {}-workspace bash",
+                pod_name
+            );
             tracing::info!("  • Use 'devaipod ssh {}' to connect", pod_name);
             return Ok(());
         } else {
@@ -417,7 +446,10 @@ async fn cmd_up(
                 .await
                 .context("Failed to start existing pod")?;
             tracing::info!("Pod '{}' started", pod_name);
-            tracing::info!("  • SSH into workspace: podman exec -it {}-workspace bash", pod_name);
+            tracing::info!(
+                "  • SSH into workspace: podman exec -it {}-workspace bash",
+                pod_name
+            );
             tracing::info!("  • Use 'devaipod ssh {}' to connect", pod_name);
             return Ok(());
         }
@@ -486,15 +518,15 @@ async fn cmd_up(
 
     // Success! Print connection info
     tracing::info!("Pod '{}' started successfully.", pod_name);
-    tracing::info!("  • Workspace container: {}", devaipod_pod.workspace_container);
+    tracing::info!(
+        "  • Workspace container: {}",
+        devaipod_pod.workspace_container
+    );
     tracing::info!("  • Agent container: {}", devaipod_pod.agent_container);
     if let Some(ref gator) = devaipod_pod.gator_container {
         tracing::info!("  • Gator container: {}", gator);
     }
-    tracing::info!(
-        "  • Agent server: http://localhost:{}",
-        pod::OPENCODE_PORT
-    );
+    tracing::info!("  • Agent server: http://localhost:{}", pod::OPENCODE_PORT);
     tracing::info!(
         "  • SSH into workspace: podman exec -it {} bash",
         devaipod_pod.workspace_container
@@ -503,7 +535,10 @@ async fn cmd_up(
     // Keep podman service running - when we drop it, the service will stop
     // For now, we just exit after starting. The pod will keep running.
     // In the future, we could wait for a signal or provide a shell.
-    tracing::info!("Pod is running. Use 'podman pod stop {}' to stop.", pod_name);
+    tracing::info!(
+        "Pod is running. Use 'podman pod stop {}' to stop.",
+        pod_name
+    );
 
     // Drop podman service - this will kill the service process
     // but the pod/containers will continue running since podman doesn't
@@ -653,8 +688,8 @@ fn extract_github_issue_context(task: &str) -> Option<String> {
 /// API keys for the agent to function properly.
 fn check_api_keys_configured() {
     let agent_env_vars = config::collect_agent_env_vars();
-    let has_common_keys = std::env::var("ANTHROPIC_API_KEY").is_ok()
-        || std::env::var("OPENAI_API_KEY").is_ok();
+    let has_common_keys =
+        std::env::var("ANTHROPIC_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok();
 
     if agent_env_vars.is_empty() && !has_common_keys {
         eprintln!();
@@ -978,10 +1013,7 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         let status = cmd.status().context("Failed to run podman exec")?;
 
         if !status.success() {
-            bail!(
-                "podman exec failed with exit code {:?}",
-                status.code()
-            );
+            bail!("podman exec failed with exit code {:?}", status.code());
         }
     } else {
         // Interactive mode with TTY
@@ -999,10 +1031,7 @@ fn cmd_ssh(pod_name: &str, stdio: bool, command: &[String]) -> Result<()> {
         let status = cmd.status().context("Failed to run podman exec")?;
 
         if !status.success() {
-            bail!(
-                "podman exec failed with exit code {:?}",
-                status.code()
-            );
+            bail!("podman exec failed with exit code {:?}", status.code());
         }
     }
 
@@ -1114,15 +1143,11 @@ Host {pod}.devaipod
 }
 
 /// List devaipod pods using podman pod ps
-fn cmd_list(json: bool) -> Result<()> {
-    let mut cmd = podman_command();
-    cmd.args(["pod", "ps", "--filter", "name=devaipod-*"]);
-
-    if json {
-        cmd.arg("--format=json");
-    }
-
-    let output = cmd.output().context("Failed to run podman pod ps")?;
+fn cmd_list(json_output: bool) -> Result<()> {
+    let output = podman_command()
+        .args(["pod", "ps", "--filter", "name=devaipod-*", "--format=json"])
+        .output()
+        .context("Failed to run podman pod ps")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1137,11 +1162,85 @@ fn cmd_list(json: bool) -> Result<()> {
         }
     }
 
-    // Print stdout for the user
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    print!("{}", stdout);
+    let pods: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| Vec::new());
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&pods)?);
+        return Ok(());
+    }
+
+    if pods.is_empty() {
+        println!("No devaipod workspaces found.");
+        println!("Use 'devaipod up <path>' to create one.");
+        return Ok(());
+    }
+
+    // Calculate column widths
+    let name_width = pods
+        .iter()
+        .filter_map(|p| p.get("Name").and_then(|v| v.as_str()))
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    // Print header
+    println!(
+        "{:<name_width$}  {:<10}  {:<12}  {}",
+        "NAME",
+        "STATUS",
+        "CONTAINERS",
+        "CREATED",
+        name_width = name_width
+    );
+
+    // Print pods
+    for pod in &pods {
+        let name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("-");
+        let status = pod.get("Status").and_then(|v| v.as_str()).unwrap_or("-");
+        let containers = pod
+            .get("Containers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let created = pod.get("Created").and_then(|v| v.as_str()).unwrap_or("-");
+
+        // Format created time to be more readable (show relative time if possible)
+        let created_display = format_created_time(created);
+
+        // Format status with visual indicator
+        let status_display = match status.to_lowercase().as_str() {
+            "running" => "Running",
+            "stopped" => "Stopped",
+            "exited" => "Exited",
+            "degraded" => "Degraded",
+            _ => status,
+        };
+
+        println!(
+            "{:<name_width$}  {:<10}  {:<12}  {}",
+            name,
+            status_display,
+            format!("{} container{}", containers, if containers == 1 { "" } else { "s" }),
+            created_display,
+            name_width = name_width
+        );
+    }
 
     Ok(())
+}
+
+/// Format a timestamp to a more readable format
+fn format_created_time(timestamp: &str) -> String {
+    // Podman returns timestamps like "2025-01-26T10:30:00.000000000Z"
+    // Try to parse and show a relative or short format
+    if timestamp.len() >= 10 {
+        // Just show the date portion for simplicity
+        timestamp[..10].to_string()
+    } else {
+        timestamp.to_string()
+    }
 }
 
 /// Stop a pod using podman pod stop
@@ -1240,6 +1339,232 @@ fn cmd_logs(pod_name: &str, container: &str, follow: bool, tail: Option<u32>) ->
         );
     }
 
+    Ok(())
+}
+
+/// Show detailed status of a pod
+fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
+    // Get pod info using podman pod inspect
+    let pod_output = podman_command()
+        .args(["pod", "inspect", pod_name])
+        .output()
+        .context("Failed to run podman pod inspect")?;
+
+    if !pod_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pod_output.stderr);
+        if stderr.contains("no such pod") || stderr.contains("not found") {
+            bail!(
+                "Pod '{}' not found. Use 'devaipod list' to see available pods.",
+                pod_name
+            );
+        }
+        bail!("podman pod inspect failed: {}", stderr.trim());
+    }
+
+    let pod_json: serde_json::Value =
+        serde_json::from_slice(&pod_output.stdout).context("Failed to parse pod inspect output")?;
+
+    // Get container list using podman container ls
+    let containers_output = podman_command()
+        .args([
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            &format!("pod={}", pod_name),
+            "--format",
+            "json",
+        ])
+        .output()
+        .context("Failed to run podman container ls")?;
+
+    let containers_json: serde_json::Value = if containers_output.status.success() {
+        serde_json::from_slice(&containers_output.stdout).unwrap_or(serde_json::json!([]))
+    } else {
+        serde_json::json!([])
+    };
+
+    // Check agent health if pod is running
+    let pod_state = pod_json
+        .get("State")
+        .and_then(|s| s.as_str())
+        .unwrap_or("Unknown");
+
+    let agent_health = if pod_state == "Running" {
+        check_agent_health(pod_name)
+    } else {
+        None
+    };
+
+    // Get ports from pod
+    let ports = extract_pod_ports(&pod_json);
+
+    if json_output {
+        // Build JSON output
+        let status = serde_json::json!({
+            "pod": {
+                "name": pod_name,
+                "state": pod_state,
+                "id": pod_json.get("Id").and_then(|v| v.as_str()).unwrap_or(""),
+            },
+            "containers": containers_json,
+            "agent_health": agent_health,
+            "ports": ports,
+        });
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        // Human-readable output
+        println!("Pod: {}", pod_name);
+        println!("Status: {}", format_pod_state(pod_state));
+        if let Some(id) = pod_json.get("Id").and_then(|v| v.as_str()) {
+            // Show short ID
+            println!("ID: {}", &id[..12.min(id.len())]);
+        }
+        println!();
+
+        // Containers section
+        println!("Containers:");
+        if let Some(containers) = containers_json.as_array() {
+            if containers.is_empty() {
+                println!("  (none)");
+            } else {
+                for container in containers {
+                    let name = container
+                        .get("Names")
+                        .and_then(|n| n.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let state = container
+                        .get("State")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    let image = container
+                        .get("Image")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    // Truncate image name for display
+                    let image_display = if image.len() > 40 {
+                        format!("{}...", &image[..37])
+                    } else {
+                        image.to_string()
+                    };
+                    println!(
+                        "  {} - {} ({})",
+                        name,
+                        format_container_state(state),
+                        image_display
+                    );
+                }
+            }
+        }
+        println!();
+
+        // Agent health section
+        println!("Agent Health:");
+        match agent_health {
+            Some(true) => println!("  Healthy (responding at localhost:{})", pod::OPENCODE_PORT),
+            Some(false) => println!("  Unhealthy (not responding)"),
+            None => println!("  Unknown (pod not running)"),
+        }
+        println!();
+
+        // Ports section
+        println!("Exposed Ports:");
+        if ports.is_empty() {
+            println!("  (none)");
+        } else {
+            for port in &ports {
+                println!("  {}", port);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if the agent health endpoint is responding
+fn check_agent_health(pod_name: &str) -> Option<bool> {
+    let workspace_container = format!("{}-workspace", pod_name);
+    let health_url = format!("http://localhost:{}/global/health", pod::OPENCODE_PORT);
+
+    // Try to curl the health endpoint from inside the workspace container
+    let check_cmd = format!("curl -sf '{}' >/dev/null 2>&1", health_url);
+    let result = podman_command()
+        .args(["exec", &workspace_container, "/bin/sh", "-c", &check_cmd])
+        .status();
+
+    match result {
+        Ok(status) => Some(status.success()),
+        Err(_) => None,
+    }
+}
+
+/// Extract exposed ports from pod inspect JSON
+fn extract_pod_ports(pod_json: &serde_json::Value) -> Vec<String> {
+    let mut ports = Vec::new();
+
+    // Ports are typically in InfraConfig.PortBindings
+    if let Some(infra) = pod_json.get("InfraConfig") {
+        if let Some(bindings) = infra.get("PortBindings") {
+            if let Some(obj) = bindings.as_object() {
+                for (container_port, host_bindings) in obj {
+                    if let Some(arr) = host_bindings.as_array() {
+                        for binding in arr {
+                            let host_ip = binding
+                                .get("HostIp")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0.0.0.0");
+                            let host_port = binding
+                                .get("HostPort")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !host_port.is_empty() {
+                                ports.push(format!(
+                                    "{}:{} -> {}",
+                                    host_ip, host_port, container_port
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ports
+}
+
+/// Format pod state for display
+fn format_pod_state(state: &str) -> &str {
+    match state {
+        "Running" => "Running",
+        "Stopped" => "Stopped",
+        "Exited" => "Exited",
+        "Created" => "Created",
+        "Paused" => "Paused",
+        "Degraded" => "Degraded",
+        _ => state,
+    }
+}
+
+/// Format container state for display
+fn format_container_state(state: &str) -> &str {
+    match state.to_lowercase().as_str() {
+        "running" => "running",
+        "exited" => "exited",
+        "created" => "created",
+        "paused" => "paused",
+        "dead" => "dead",
+        "removing" => "removing",
+        _ => state,
+    }
+}
+
+/// Generate shell completions
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    let mut cmd = HostCli::command();
+    clap_complete::generate(shell, &mut cmd, "devaipod", &mut std::io::stdout());
     Ok(())
 }
 
@@ -2123,6 +2448,11 @@ mod tests {
         assert!(subcommands.contains(&"stop"), "Missing 'stop' command");
         assert!(subcommands.contains(&"delete"), "Missing 'delete' command");
         assert!(subcommands.contains(&"logs"), "Missing 'logs' command");
+        assert!(subcommands.contains(&"status"), "Missing 'status' command");
+        assert!(
+            subcommands.contains(&"completions"),
+            "Missing 'completions' command"
+        );
 
         // Should NOT have container-only commands
         assert!(

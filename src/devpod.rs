@@ -124,6 +124,7 @@ pub fn up_with_options(source: &str, options: UpOptions) -> Result<String> {
 }
 
 /// Run `devpod ssh` to connect to a workspace
+#[allow(dead_code)] // Part of devpod integration, kept for potential future use
 pub fn ssh(workspace: &str, command: &[String]) -> Result<()> {
     let mut cmd = Command::new("devpod");
     configure_devpod_env(&mut cmd);
