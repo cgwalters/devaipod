@@ -37,11 +37,17 @@ All containers share the same network namespace, allowing localhost communicatio
 git clone https://github.com/cgwalters/devaipod && cd devaipod
 cargo build --release
 
-# Start a pod for your project
+# Start a pod for a local project
 devaipod up /path/to/your/project
 
-# SSH into the workspace container
-devaipod ssh devaipod-myproject
+# Start from a GitHub repo
+devaipod up https://github.com/org/repo
+
+# Start from a PR and auto-SSH into workspace
+devaipod up https://github.com/org/repo/pull/123 -S
+
+# SSH into the workspace container (prefix is optional)
+devaipod ssh myproject
 
 # Run opencode (connects to sandboxed agent)
 oc
@@ -50,20 +56,38 @@ oc
 ## Commands
 
 ```bash
-devaipod up .              # Create pod with workspace + agent containers
-devaipod list              # List devaipod pods
-devaipod ssh <pod>         # SSH into workspace container
-devaipod ssh-config <pod>  # Generate SSH config (for editor integration)
-devaipod stop <pod>        # Stop a pod
-devaipod delete <pod>      # Delete a pod
-devaipod up . --dry-run    # Show what would be created
+# Workspace lifecycle
+devaipod up .                     # Create pod with workspace + agent containers
+devaipod up . -S                  # Create and SSH into workspace
+devaipod up . "fix the bug"       # Create with task description for agent
+devaipod list                     # List devaipod workspaces
+devaipod status myworkspace       # Show detailed status of a pod
+devaipod logs myworkspace         # View container logs (-c agent for agent logs)
+devaipod stop myworkspace         # Stop a pod
+devaipod delete myworkspace       # Delete a pod
+devaipod up . --dry-run           # Show what would be created
+
+# Connecting to workspaces
+devaipod ssh myworkspace          # SSH into workspace container
+devaipod attach myworkspace       # Attach to agent's tmux session
+devaipod ssh-config myworkspace   # Output SSH config to stdout
+
+# Running agents
+devaipod run "find typos"                    # Run agent with task
+devaipod run --git . "fix the bug"           # Run on local repo
+devaipod run --issue https://github.com/org/repo/issues/123
+
+# Shell completions
+devaipod completions bash         # Generate bash completions
 ```
+
+Note: The `devaipod-` prefix is optional for workspace names.
 
 ### Editor Integration (WIP)
 
-The `ssh-config` command generates an SSH config entry:
+The `ssh-config` command outputs an SSH config entry to stdout:
 ```bash
-devaipod ssh-config my-pod  # Writes to ~/.ssh/config.d/devaipod-my-pod
+devaipod ssh-config my-pod >> ~/.ssh/config
 ```
 
 **Note**: Full SSH support for VSCode/Zed Remote SSH requires an SSH server in
@@ -157,6 +181,8 @@ Projects can specify additional env vars to pass to the agent in devcontainer.js
 | Network isolation | ✅ Optional (proxy-based) |
 | Env allowlist | ✅ Working |
 | GPU passthrough | ✅ Optional (NVIDIA/AMD) |
+| PR/MR URL support | ✅ Working |
+| Remote git URLs | ✅ Working |
 
 ## Documentation
 

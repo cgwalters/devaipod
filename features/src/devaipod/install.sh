@@ -75,16 +75,16 @@ install_packages() {
 install_system_packages() {
     local pkg_manager="$1"
     
-    echo "Installing system packages (bubblewrap, tmux)..."
+    echo "Installing system packages (tmux)..."
     case "$pkg_manager" in
         apt)
-            install_packages apt bubblewrap tmux
+            install_packages apt tmux
             ;;
         apk)
-            install_packages apk bubblewrap tmux
+            install_packages apk tmux
             ;;
         dnf|yum)
-            install_packages "$pkg_manager" bubblewrap tmux
+            install_packages "$pkg_manager" tmux
             ;;
         *)
             echo "WARNING: Cannot install packages with unknown package manager"
@@ -225,7 +225,7 @@ main() {
     
     echo "Detected: package_manager=${pkg_manager}, arch=${arch}"
     
-    # Install system packages (bubblewrap, tmux)
+    # Install system packages (tmux for terminal multiplexing)
     install_system_packages "$pkg_manager" || true
     
     # Create init script and profile for podman

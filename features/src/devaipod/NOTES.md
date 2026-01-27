@@ -4,41 +4,38 @@ This feature requires:
 - Linux-based devcontainer (x86_64 or aarch64)
 - A compatible base image (Debian, Ubuntu, Fedora, or similar)
 
-The feature will automatically install `bubblewrap` (bwrap) which is required
-for the sandboxing functionality.
-
 ## What Gets Installed
 
-- `/usr/local/bin/devaipod` - Main CLI for running sandboxed AI agents
+- `/usr/local/bin/devaipod` - CLI for sandboxed AI agent environments
 
-## Usage Inside Devcontainer
+## Usage
 
-Once installed, you can use devaipod commands inside the devcontainer:
+devaipod is primarily run on the **host** to create podman pods with workspace and agent containers. The devcontainer feature installs the devaipod binary and sets up podman configuration for nested container operations.
 
 ```bash
-# Start a tmux session with AI agent + shell
-devaipod tmux
+# On host: create a workspace pod
+devaipod up /path/to/project
 
-# Get a shell inside the bwrap sandbox
-devaipod enter
+# SSH into the workspace
+devaipod ssh myproject
+
+# Inside workspace: connect to the sandboxed agent
+oc
 ```
 
-## Security Model
+## Architecture
 
-The agent runs in a bubblewrap sandbox with:
-- Read-only access to system directories (`/usr`, `/etc`, `/lib`)
-- Write access only to the workspace directory
-- Isolated home directory (`$HOME/ai` mounted over `$HOME`)
-- PID namespace isolation
+When you run `devaipod up`, it creates a podman pod with:
+- **Workspace container**: Your full development environment
+- **Agent container**: Runs `opencode serve` with security restrictions (dropped capabilities, no-new-privileges, isolated home)
+- **Optional gator container**: service-gator MCP server for scoped external access
 
-For external service access (GitHub, Jira, etc.), agents should use MCP servers
-like [service-gator](https://github.com/cgwalters/service-gator) which provides
-scope-based access control for CLI tools.
+The `oc` command in the workspace connects to the agent via `opencode attach http://localhost:4096`.
 
 ## Container Operations (Podman)
 
 The feature sets up a rootful podman service that both human developers and
-AI agents can use. This is safe because:
+AI agents can use for nested container operations. This is safe because:
 - The devcontainer runs under rootless podman on the host
 - "root" inside the container is actually unprivileged on the real host
 - Even `podman run --privileged` is constrained by the outer user namespace

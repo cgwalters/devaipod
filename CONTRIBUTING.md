@@ -6,9 +6,8 @@ Thank you for your interest in contributing to devaipod!
 
 1. Install Rust (stable toolchain)
 2. Install dependencies:
-   - `bubblewrap` (bwrap) for sandbox testing
-   - `podman` for container tests
-   - `devpod` for full integration tests
+   - `podman` for container operations
+   - Optionally `devpod` for some workflows
 
 ```bash
 # Build

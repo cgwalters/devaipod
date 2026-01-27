@@ -179,6 +179,6 @@ The service-gator container image (`ghcr.io/cgwalters/service-gator`) is automat
 
 ## See Also
 
-- [Sandboxing Model](sandboxing.md) - How the bwrap sandbox works
+- [Sandboxing Model](sandboxing.md) - Security model and container isolation
 - [Secret Management](secrets.md) - Handling API keys and credentials
 - [service-gator README](https://github.com/cgwalters/service-gator) - Full documentation

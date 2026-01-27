@@ -7,8 +7,9 @@ and priorities may shift based on user feedback and practical experience.
 
 Complete native podman implementation:
 
-- **Native CLI commands**: `devaipod up`, `ssh`, `list`, `stop`, `delete` - no
-  devpod dependency for core workflow
+- **Native CLI commands**: `devaipod up`, `ssh`, `list`, `stop`, `delete`,
+  `status`, `logs`, `attach`, `run`, `completions` - no devpod dependency for
+  core workflow
 - **Podman-native multi-container pods**: Workspace, agent, and gator containers
   share a pod with localhost networking between them
 - **Workspace shims**: `oc` and `opencode-agent` commands in workspace run
@@ -25,6 +26,14 @@ Complete native podman implementation:
   external service access (GitHub, JIRA)
 - **Secrets from podman**: Secrets declared in devcontainer.json are fetched
   from `podman secret` store
+- **PR/MR URL support**: Start workspaces directly from GitHub/GitLab/Forgejo
+  pull request URLs
+- **Remote git URLs**: Clone from remote git repositories, not just local paths
+- **Dotfiles installation**: Automatically install user dotfiles in agent
+  container for git config
+
+- **Shell completions**: Generate completions for bash, zsh, fish, etc.
+- **Status and logs commands**: View detailed pod status and container logs
 
 ## Phase 2: Production Readiness
 
@@ -95,5 +104,5 @@ Current constraints that users should be aware of:
   or direct device passthrough) and AMD (via /dev/kfd and /dev/dri/renderD*).
   Configure via `[gpu]` section in `~/.config/devaipod.toml` with options:
   `enabled = true/false/auto`, `target = workspace/agent/all`.
-- **Single agent type**: Only opencode is supported as the agent. Supporting
-  other agents (goose, aider, etc.) would require per-agent configuration.
+- **Single agent type**: Only opencode is currently tested. The `--agent` flag
+  exists but other agents (goose, claude) are untested and may not work.

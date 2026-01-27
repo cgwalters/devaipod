@@ -1,10 +1,10 @@
 # Secret Management
 
-> **Implementation details:** See `src/secrets.rs` and `src/devpod.rs`
+> **Implementation details:** See `src/secrets.rs` and `src/pod.rs`
 
 ## Overview
 
-devaipod bridges `devcontainer.json` secret declarations to podman secrets, passing them to devpod via `--workspace-env`. No source files are modified.
+devaipod carefully partitions environment variables between containers to keep credentials secure. LLM API keys go to the agent, but trusted credentials (like `GH_TOKEN`) stay in workspace and gator containers only.
 
 ## How It Works
 
@@ -34,7 +34,7 @@ devaipod bridges `devcontainer.json` secret declarations to podman secrets, pass
 3. **Run devaipod** - secrets are automatically:
    - Read from devcontainer.json `secrets` field
    - Fetched from podman via `podman secret inspect --showsecret`
-   - Passed to devpod via `--workspace-env NAME=value`
+   - Injected into the appropriate containers
 
 ## Alternative Methods
 
@@ -71,62 +71,49 @@ Pass directly via `containerEnv`:
 
 Configure in your dotfiles repo (e.g., `~/.config/opencode/opencode.json`).
 
-## What Gets Forwarded to Sandbox
+## What Gets Forwarded to Agent Container
 
-The sandbox receives **only** environment variables with the `DEVAIPOD_AGENT_` prefix. The prefix is stripped when forwarding:
+The agent container receives LLM API keys but NOT trusted credentials:
 
-```bash
-# Set in your shell or dotfiles:
-export DEVAIPOD_AGENT_ANTHROPIC_API_KEY="sk-ant-xxx"
-export DEVAIPOD_AGENT_GOOGLE_CLOUD_PROJECT="my-project"
+| Variable Type | Workspace | Agent | Gator |
+|---------------|-----------|-------|-------|
+| `ANTHROPIC_API_KEY` | ✅ | ✅ | ❌ |
+| `OPENAI_API_KEY` | ✅ | ✅ | ❌ |
+| `GEMINI_API_KEY` | ✅ | ✅ | ❌ |
+| `GH_TOKEN` | ✅ | ❌ | ✅ |
+| `GITLAB_TOKEN` | ✅ | ❌ | ✅ |
+| Global env allowlist | ✅ | ✅ | ✅ |
 
-# Agent sees:
-# ANTHROPIC_API_KEY=sk-ant-xxx
-# GOOGLE_CLOUD_PROJECT=my-project
+### Trusted Environment Variables
+
+Configure which credentials go to workspace and gator (but NOT agent) in `~/.config/devaipod.toml`:
+
+```toml
+[trusted.env]
+# These env vars go to workspace and gator containers only
+allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
+
+# Or set explicit values
+[trusted.env.vars]
+GH_TOKEN = "ghp_xxxxxxxxxxxx"
 ```
 
-This makes it explicit which secrets the agent can access. There is no hardcoded allowlist.
+### Global Environment Variables
 
-**NOT forwarded** (kept outside sandbox):
-- `GH_TOKEN` - GitHub access should use MCP servers (like service-gator) running outside the sandbox
-- `ANTHROPIC_API_KEY` (without prefix) - only the prefixed version is forwarded
-- Any env var without the `DEVAIPOD_AGENT_` prefix
+Configure variables that go to ALL containers (including agent):
 
-### Example Setup
+```toml
+[env]
+# Forward from host environment
+allowlist = ["GOOGLE_CLOUD_PROJECT", "SSH_AUTH_SOCK", "VERTEX_LOCATION"]
 
-In your dotfiles or shell profile:
-
-```bash
-# LLM API key - agent needs this
-export DEVAIPOD_AGENT_ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
-
-# Vertex AI config - agent needs this
-export DEVAIPOD_AGENT_GOOGLE_CLOUD_PROJECT="$GOOGLE_CLOUD_PROJECT"
-
-# GH_TOKEN stays unprefixed - for MCP servers running outside sandbox
-export GH_TOKEN="ghp_full_access"
+# Set explicit values
+[env.vars]
+VERTEX_LOCATION = "global"
 ```
-
-### Different Credentials for Agent vs Outer Container
-
-You can give the agent different credentials than human tools in the outer container:
-
-```bash
-# Full-access token for human tools and MCP servers
-export GH_TOKEN="ghp_full_access"
-
-# Restricted token for the agent (or omit to give agent no GH_TOKEN)
-export DEVAIPOD_AGENT_GH_TOKEN="ghp_readonly"
-```
-
-| Variable | Outer Container | Agent Sandbox |
-|----------|-----------------|---------------|
-| `GH_TOKEN` | `ghp_full_access` | (not set) |
-| `DEVAIPOD_AGENT_GH_TOKEN` | `ghp_readonly` | (not set) |
-| `GH_TOKEN` (inside sandbox) | - | `ghp_readonly` |
-
-The `DEVAIPOD_AGENT_*` vars are available in the outer container too (for scripts that need them), but only the stripped versions are forwarded into the sandbox.
 
 ## GitHub Token
 
-`GH_TOKEN` is intentionally NOT forwarded to the sandbox. For GitHub operations, agents should use MCP servers like [service-gator](https://github.com/cgwalters/service-gator) which run outside the sandbox with appropriate access controls.
+`GH_TOKEN` is intentionally NOT forwarded to the agent. For GitHub operations, agents should use MCP servers like [service-gator](https://github.com/cgwalters/service-gator) which run in a separate container with appropriate scope restrictions.
+
+See [Service-gator Integration](service-gator.md) for details.

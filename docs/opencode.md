@@ -2,11 +2,11 @@
 
 ## Overview
 
-[OpenCode](https://github.com/anomalyco/opencode) is an open-source TUI for AI coding agents. devaipod uses OpenCode (v1.1.12) as its default agent inside the bwrap sandbox.
+[OpenCode](https://github.com/anomalyco/opencode) is an open-source TUI for AI coding agents. devaipod runs OpenCode in a sandboxed agent container within a podman pod.
 
 ## Installation
 
-OpenCode is pre-installed in the `ghcr.io/bootc-dev/devenv-debian` base image used by the devcontainer. The devaipod devcontainer feature expects opencode to be available in the base image.
+OpenCode must be available in your devcontainer image. The `ghcr.io/bootc-dev/devenv-debian` base image comes with OpenCode pre-installed.
 
 ## Configuration
 
@@ -31,49 +31,42 @@ OpenCode is configured via `~/.config/opencode/opencode.json`. Set this up in yo
 ## Usage with devaipod
 
 ```bash
-# Run opencode agent on local repo
-devaipod run --git . "explain the main function"
+# Create workspace and SSH in
+devaipod up /path/to/project -S
+# Then run 'oc' inside the workspace to connect to the agent
 
-# Run on a GitHub issue
+# Create workspace with a task for the agent
+devaipod up . "fix the type errors in main.rs"
+
+# Run agent on a GitHub issue
 devaipod run --issue https://github.com/org/repo/issues/123
 
-# Inside devcontainer: tmux with agent + shell
-devaipod tmux
-
-# Inside devcontainer: enter sandbox shell
-devaipod enter
+# Attach to a running agent's tmux session
+devaipod attach myworkspace
 ```
 
 ## Architecture
 
+devaipod uses a podman pod with multiple containers:
+
 ```
-┌─────────────────────────────────────────────┐
-│       DevPod Container                      │
-│  ┌───────────────────────────────────────┐  │
-│  │       bwrap Sandbox                   │  │
-│  │                                       │  │
-│  │   $ opencode run "task..."            │  │
-│  │                                       │  │
-│  │   - Read-only /usr, /etc, /lib        │  │
-│  │   - Isolated $HOME                    │  │
-│  │   - Upcalls via /run/devaipod.sock    │  │
-│  └───────────────────────────────────────┘  │
-└─────────────────────────────────────────────┘
-```
-
-## Alternative Agents
-
-To use a different agent, specify it with `--agent`:
-
-```bash
-devaipod run --git . --agent goose "fix the bug"
+┌───────────────────────────────────────────────────────────────────┐
+│  Podman Pod                                                        │
+│                                                                    │
+│  ┌─────────────────────┐  ┌─────────────────────┐                 │
+│  │ Workspace Container │  │ Agent Container     │                 │
+│  │ • Full dev env      │  │ • opencode serve    │                 │
+│  │ • 'oc' shim         │  │ • Port 4096         │                 │
+│  │ • Your dotfiles     │  │ • Isolated $HOME    │                 │
+│  └─────────────────────┘  └─────────────────────┘                 │
+│                                      │                             │
+│         'oc' ──────────────────────→ │ (localhost:4096)            │
+│                                                                    │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-Or set a default in `~/.config/devaipod.toml`:
+The workspace container has an `oc` shim that runs `opencode attach http://localhost:4096` to connect to the sandboxed agent. All containers share the same network namespace via the pod.
 
-```toml
-[agent]
-default_agent = "goose"
-```
+## Agent Support
 
-The agent binary must be installed in the container image.
+Currently only OpenCode is supported as the AI agent. The agent container runs `opencode serve` and the workspace connects via `opencode attach`.
