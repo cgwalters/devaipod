@@ -199,6 +199,49 @@ echo "Repository cloned successfully at commit {short_commit}"
     Ok(script)
 }
 
+/// Generate a shell script to clone from a PR/MR
+///
+/// The script will:
+/// 1. Clone the PR's head repository
+/// 2. Checkout the specific commit
+/// 3. Add the upstream repository as a remote
+pub fn clone_pr_script(pr_info: &crate::forge::PullRequestInfo, workspace_folder: &str) -> String {
+    format!(
+        r#"
+set -e
+echo "Cloning PR #{number}: {title}"
+mkdir -p "$(dirname "{workspace}")"
+
+# Clone the PR head (fork) repository
+git clone --depth 1 --branch "{branch}" "{head_url}" "{workspace}" 2>&1
+
+cd "{workspace}"
+
+# Fetch the specific commit if it's not in the shallow clone
+if ! git cat-file -e "{commit}" 2>/dev/null; then
+    echo "Fetching specific commit..."
+    git fetch --depth 1 origin "{commit}"
+fi
+
+# Checkout the exact commit
+git checkout "{commit}" 2>&1
+
+# Add upstream as a remote for reference
+git remote add upstream "{upstream_url}" 2>/dev/null || true
+
+echo "PR #{number} cloned successfully at commit {short_commit}"
+"#,
+        number = pr_info.pr_ref.number,
+        title = pr_info.title.replace('"', r#"\""#),
+        workspace = workspace_folder,
+        head_url = pr_info.head_clone_url,
+        branch = pr_info.head_ref,
+        commit = pr_info.head_sha,
+        short_commit = &pr_info.head_sha[..pr_info.head_sha.len().min(8)],
+        upstream_url = pr_info.pr_ref.upstream_url(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,10 +30,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
 url = "2"
+urlencoding = "2"
+reqwest = { version = "0.13", features = ["json"] }
 
 [dev-dependencies]
-tempfile = "3"
 
 [lints.rust]
 unsafe_code = "deny"

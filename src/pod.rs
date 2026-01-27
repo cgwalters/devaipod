@@ -12,6 +12,97 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Context, Result};
 
+use crate::forge::PullRequestInfo;
+use crate::git::GitRepoInfo;
+
+/// Source for workspace content - either a local git repo or a PR/MR
+#[derive(Debug, Clone)]
+pub enum WorkspaceSource {
+    /// Local git repository
+    LocalRepo(GitRepoInfo),
+    /// Pull/Merge request from a forge
+    PullRequest(PullRequestInfo),
+}
+
+impl WorkspaceSource {
+    /// Get labels to attach to the pod
+    pub fn to_labels(&self) -> Vec<(String, String)> {
+        match self {
+            WorkspaceSource::LocalRepo(git_info) => {
+                let mut labels = vec![(
+                    "io.devaipod.commit".to_string(),
+                    git_info.commit_sha.clone(),
+                )];
+                if let Some(ref url) = git_info.remote_url {
+                    // Extract host/owner/repo from URL
+                    if let Some(repo) = extract_repo_from_url(url) {
+                        labels.push(("io.devaipod.repo".to_string(), repo));
+                    }
+                }
+                labels
+            }
+            WorkspaceSource::PullRequest(pr_info) => pr_info.to_labels(),
+        }
+    }
+
+    /// Get the clone script for this source
+    pub fn clone_script(&self, workspace_folder: &str) -> color_eyre::Result<String> {
+        match self {
+            WorkspaceSource::LocalRepo(git_info) => {
+                crate::git::clone_script(git_info, workspace_folder)
+            }
+            WorkspaceSource::PullRequest(pr_info) => {
+                Ok(crate::git::clone_pr_script(pr_info, workspace_folder))
+            }
+        }
+    }
+
+    /// Get a short description for logging
+    pub fn description(&self) -> String {
+        match self {
+            WorkspaceSource::LocalRepo(git_info) => {
+                format!("commit {}", &git_info.commit_sha[..8.min(git_info.commit_sha.len())])
+            }
+            WorkspaceSource::PullRequest(pr_info) => {
+                format!("PR #{}", pr_info.pr_ref.number)
+            }
+        }
+    }
+
+    /// Get the project name for workspace folder derivation
+    ///
+    /// For local repos, this comes from the path.
+    /// For PRs, this is the repository name.
+    pub fn project_name(&self, fallback_path: &std::path::Path) -> String {
+        match self {
+            WorkspaceSource::LocalRepo(_) => fallback_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string()),
+            WorkspaceSource::PullRequest(pr_info) => pr_info.pr_ref.repo.clone(),
+        }
+    }
+}
+
+/// Extract host/owner/repo from a git URL
+fn extract_repo_from_url(url: &str) -> Option<String> {
+    // Handle SSH format: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@") {
+        let rest = rest.replace(':', "/");
+        let rest = rest.trim_end_matches(".git");
+        return Some(rest.to_string());
+    }
+
+    // Handle HTTPS format: https://github.com/owner/repo.git
+    if let Ok(parsed) = url::Url::parse(url) {
+        let host = parsed.host_str()?;
+        let path = parsed.path().trim_start_matches('/').trim_end_matches(".git");
+        return Some(format!("{}/{}", host, path));
+    }
+
+    None
+}
+
 /// Common device paths that should be auto-passed to development containers if they exist on the host.
 ///
 /// These devices are commonly needed for:
@@ -121,8 +212,8 @@ impl DevaipodPod {
     ///
     /// This will:
     /// 1. Build or pull the image from devcontainer config
-    /// 2. Create and initialize the workspace volume (clone git repo)
-    /// 3. Create the pod
+    /// 2. Create and initialize the workspace volume (clone git repo or PR)
+    /// 3. Create the pod with metadata labels
     /// 4. Create workspace, agent, and optionally gator/proxy containers
     ///
     /// Note: Dotfiles installation happens after the pod starts via `install_dotfiles()`.
@@ -134,7 +225,7 @@ impl DevaipodPod {
         enable_gator: bool,
         enable_network_isolation: bool,
         global_config: &Config,
-        git_info: &crate::git::GitRepoInfo,
+        source: &WorkspaceSource,
     ) -> Result<Self> {
         // Resolve bind_home configurations
         let container_home = Self::resolve_container_home(devcontainer_config);
@@ -160,11 +251,8 @@ impl DevaipodPod {
         };
 
         let config = devcontainer_config;
-        // Derive project name from path
-        let project_name = project_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string());
+        // Derive project name from source (for PRs, use repo name; for local, use path)
+        let project_name = source.project_name(project_path);
 
         // Get workspace folder
         let workspace_folder = config.workspace_folder_for_project(&project_name);
@@ -189,16 +277,16 @@ impl DevaipodPod {
         // Create workspace volume and clone repo into it
         let volume_name = format!("{}-workspace", pod_name);
         let volume_already_exists = podman.volume_exists(&volume_name).await?;
-        
+
         if !volume_already_exists {
-            tracing::info!("Creating workspace volume and cloning repository...");
+            tracing::info!("Creating workspace volume and cloning {}...", source.description());
             podman
                 .create_volume(&volume_name)
                 .await
                 .context("Failed to create workspace volume")?;
 
             // Clone the repository into the volume using an init container
-            let clone_script = crate::git::clone_script(git_info, &workspace_folder)?;
+            let clone_script = source.clone_script(&workspace_folder)?;
             let exit_code = podman
                 .run_init_container(
                     &image,
@@ -213,21 +301,19 @@ impl DevaipodPod {
                 // Clean up the volume on failure
                 let _ = podman.remove_volume(&volume_name, true).await;
                 color_eyre::eyre::bail!(
-                    "Failed to clone repository into workspace volume (exit code {})",
+                    "Failed to clone into workspace volume (exit code {})",
                     exit_code
                 );
             }
-            tracing::info!(
-                "Repository cloned at commit {}",
-                &git_info.commit_sha[..git_info.commit_sha.len().min(8)]
-            );
+            tracing::info!("Cloned {}", source.description());
         } else {
             tracing::info!("Using existing workspace volume '{}'", volume_name);
         }
 
-        // Create the pod
+        // Create the pod with metadata labels
+        let labels = source.to_labels();
         podman
-            .create_pod(pod_name)
+            .create_pod(pod_name, &labels)
             .await
             .context("Failed to create pod")?;
 

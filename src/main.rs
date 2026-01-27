@@ -14,6 +14,7 @@ mod compose;
 mod config;
 mod devcontainer;
 mod devpod;
+mod forge;
 mod git;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
@@ -365,6 +366,11 @@ async fn cmd_up(
     dry_run: bool,
     _agent_sidecar: bool,
 ) -> Result<()> {
+    // Check if source is a PR/MR URL
+    if let Some(pr_ref) = forge::parse_pr_url(source) {
+        return cmd_up_pr(config, pr_ref, dry_run).await;
+    }
+
     // Resolve local paths
     let source_path = if source.starts_with("http://")
         || source.starts_with("https://")
@@ -495,6 +501,7 @@ async fn cmd_up(
 
     // Create the pod with all containers
     tracing::info!("Creating pod '{}'...", pod_name);
+    let source = pod::WorkspaceSource::LocalRepo(git_info);
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         project_path,
@@ -503,7 +510,7 @@ async fn cmd_up(
         enable_gator,
         enable_network_isolation,
         config,
-        &git_info,
+        &source,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -585,6 +592,181 @@ async fn cmd_up(
     // require the service to be running for containers to run.
     drop(podman);
 
+    Ok(())
+}
+
+/// Start a development environment from a PR/MR URL
+async fn cmd_up_pr(
+    config: &config::Config,
+    pr_ref: forge::PullRequestRef,
+    dry_run: bool,
+) -> Result<()> {
+    tracing::info!(
+        "Fetching {} PR #{} from {}/{}...",
+        pr_ref.forge_type,
+        pr_ref.number,
+        pr_ref.owner,
+        pr_ref.repo
+    );
+
+    // Fetch PR metadata
+    let pr_info = forge::fetch_pr_info(&pr_ref)
+        .await
+        .context("Failed to fetch PR information")?;
+
+    tracing::info!("PR: {}", pr_info.title);
+    tracing::info!("Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
+
+    // For PRs, we need to clone the upstream repo to get devcontainer.json
+    // Create a temp directory to clone into
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_path = temp_dir.path();
+
+    tracing::info!("Cloning upstream repository to read devcontainer.json...");
+
+    // Clone upstream repo (shallow, just to get devcontainer.json)
+    let clone_output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &pr_ref.upstream_url(),
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to clone upstream repository")?;
+
+    if !clone_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_output.stderr);
+        bail!("Failed to clone upstream repository: {}", stderr);
+    }
+
+    // Find and load devcontainer.json from the cloned repo
+    let devcontainer_json_path = devcontainer::find_devcontainer_json(temp_path)?;
+    let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
+
+    // Derive pod name from repo and PR number
+    let pod_name = format!(
+        "devaipod-{}-pr{}",
+        pr_ref.repo.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .collect::<String>(),
+        pr_ref.number
+    );
+
+    if dry_run {
+        tracing::info!("Dry run mode - would create pod '{}'", pod_name);
+        tracing::info!("  PR: {}", pr_info.pr_ref.short_display());
+        tracing::info!("  Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
+        tracing::info!("  Clone URL: {}", pr_info.head_clone_url);
+        return Ok(());
+    }
+
+    // Start podman service
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    // Check if pod already exists
+    if let Some(status) = podman.get_pod_status(&pod_name).await? {
+        tracing::info!(
+            "Pod '{}' already exists (status: {:?}). Use 'devaipod delete {}' to remove it first.",
+            pod_name,
+            status,
+            pod_name
+        );
+        return Ok(());
+    }
+
+    // Check for gator and network isolation settings
+    let enable_gator = config.service_gator.is_enabled();
+    let enable_network_isolation = config.network_isolation.enabled;
+
+    // Create source from PR info
+    let source = pod::WorkspaceSource::PullRequest(pr_info);
+
+    // Create the pod
+    tracing::info!("Creating pod '{}'...", pod_name);
+    let devaipod_pod = pod::DevaipodPod::create(
+        &podman,
+        temp_path, // Use temp path for image building context
+        &devcontainer_config,
+        &pod_name,
+        enable_gator,
+        enable_network_isolation,
+        config,
+        &source,
+    )
+    .await
+    .context("Failed to create devaipod pod")?;
+
+    // Start the pod
+    tracing::info!("Starting pod...");
+    devaipod_pod
+        .start(&podman)
+        .await
+        .context("Failed to start pod")?;
+
+    // Wait for the agent to be ready
+    devaipod_pod
+        .wait_for_agent_ready(&podman, 120, 500)
+        .await
+        .context("Agent container failed to start")?;
+
+    // Copy bind_home files
+    tracing::info!("Copying bind_home files...");
+    devaipod_pod
+        .copy_bind_home_files(
+            &podman,
+            &devaipod_pod.workspace_bind_home,
+            &devaipod_pod.agent_bind_home,
+            &devaipod_pod.container_home,
+            devcontainer_config.effective_user(),
+        )
+        .await
+        .context("Failed to copy bind_home files")?;
+
+    // Configure nested podman
+    devaipod_pod
+        .configure_nested_podman(&podman)
+        .await
+        .context("Failed to configure nested podman")?;
+
+    // Install dotfiles
+    if let Some(ref dotfiles) = config.dotfiles {
+        devaipod_pod
+            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
+            .await
+            .context("Failed to install dotfiles")?;
+    }
+
+    // Run lifecycle commands
+    tracing::info!("Running lifecycle commands...");
+    devaipod_pod
+        .run_lifecycle_commands(&podman, &devcontainer_config)
+        .await
+        .context("Failed to run lifecycle commands")?;
+
+    // Success!
+    tracing::info!("Pod '{}' started successfully.", pod_name);
+    tracing::info!(
+        "  • Workspace container: {}",
+        devaipod_pod.workspace_container
+    );
+    tracing::info!("  • Agent container: {}", devaipod_pod.agent_container);
+    tracing::info!("  • Agent server: http://localhost:{}", pod::OPENCODE_PORT);
+    tracing::info!(
+        "  • SSH into workspace: podman exec -it {} bash",
+        devaipod_pod.workspace_container
+    );
+
+    tracing::info!(
+        "Pod is running. Use 'podman pod stop {}' to stop.",
+        pod_name
+    );
+
+    drop(podman);
     Ok(())
 }
 
@@ -1206,7 +1388,18 @@ fn cmd_list(json_output: bool) -> Result<()> {
         serde_json::from_slice(&output.stdout).unwrap_or_else(|_| Vec::new());
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&pods)?);
+        // For JSON output, enrich with labels from pod inspect
+        let mut enriched_pods = Vec::new();
+        for pod in &pods {
+            let mut enriched = pod.clone();
+            if let Some(name) = pod.get("Name").and_then(|v| v.as_str()) {
+                if let Some(labels) = get_pod_labels(name) {
+                    enriched["Labels"] = labels;
+                }
+            }
+            enriched_pods.push(enriched);
+        }
+        println!("{}", serde_json::to_string_pretty(&enriched_pods)?);
         return Ok(());
     }
 
@@ -1216,59 +1409,150 @@ fn cmd_list(json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Calculate column widths
-    let name_width = pods
-        .iter()
-        .filter_map(|p| p.get("Name").and_then(|v| v.as_str()))
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
+    // Collect pod info with labels
+    struct PodInfo {
+        name: String,
+        status: String,
+        containers: usize,
+        created: String,
+        repo: Option<String>,
+        pr: Option<String>,
+    }
 
-    // Print header
-    println!(
-        "{:<name_width$}  {:<10}  {:<12}  {}",
-        "NAME",
-        "STATUS",
-        "CONTAINERS",
-        "CREATED",
-        name_width = name_width
-    );
-
-    // Print pods
+    let mut pod_infos: Vec<PodInfo> = Vec::new();
     for pod in &pods {
-        let name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("-");
-        let status = pod.get("Status").and_then(|v| v.as_str()).unwrap_or("-");
+        let name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+        let status = pod.get("Status").and_then(|v| v.as_str()).unwrap_or("-").to_string();
         let containers = pod
             .get("Containers")
             .and_then(|v| v.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
-        let created = pod.get("Created").and_then(|v| v.as_str()).unwrap_or("-");
+        let created = pod.get("Created").and_then(|v| v.as_str()).unwrap_or("-").to_string();
 
-        // Format created time to be more readable (show relative time if possible)
-        let created_display = format_created_time(created);
-
-        // Format status with visual indicator
-        let status_display = match status.to_lowercase().as_str() {
-            "running" => "Running",
-            "stopped" => "Stopped",
-            "exited" => "Exited",
-            "degraded" => "Degraded",
-            _ => status,
+        // Get labels from pod inspect
+        let (repo, pr) = if let Some(labels) = get_pod_labels(&name) {
+            let repo = labels
+                .get("io.devaipod.repo")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let pr = labels
+                .get("io.devaipod.pr")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (repo, pr)
+        } else {
+            (None, None)
         };
 
+        pod_infos.push(PodInfo {
+            name,
+            status,
+            containers,
+            created,
+            repo,
+            pr,
+        });
+    }
+
+    // Calculate column widths
+    let name_width = pod_infos.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
+    let repo_width = pod_infos
+        .iter()
+        .filter_map(|p| p.repo.as_ref())
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+
+    // Check if any pods have repo/PR info
+    let has_repo_info = pod_infos.iter().any(|p| p.repo.is_some());
+
+    // Print header
+    if has_repo_info {
+        println!(
+            "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+            "NAME",
+            "STATUS",
+            "REPO",
+            "PR",
+            "CREATED",
+            name_width = name_width,
+            repo_width = repo_width
+        );
+    } else {
         println!(
             "{:<name_width$}  {:<10}  {:<12}  {}",
-            name,
-            status_display,
-            format!("{} container{}", containers, if containers == 1 { "" } else { "s" }),
-            created_display,
+            "NAME",
+            "STATUS",
+            "CONTAINERS",
+            "CREATED",
             name_width = name_width
         );
     }
 
+    // Print pods
+    for info in &pod_infos {
+        let created_display = format_created_time(&info.created);
+
+        let status_display = match info.status.to_lowercase().as_str() {
+            "running" => "Running",
+            "stopped" => "Stopped",
+            "exited" => "Exited",
+            "degraded" => "Degraded",
+            _ => &info.status,
+        };
+
+        if has_repo_info {
+            let repo_display = info.repo.as_deref().unwrap_or("-");
+            let pr_display = info
+                .pr
+                .as_ref()
+                .map(|n| format!("#{}", n))
+                .unwrap_or_else(|| "-".to_string());
+
+            println!(
+                "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+                info.name,
+                status_display,
+                repo_display,
+                pr_display,
+                created_display,
+                name_width = name_width,
+                repo_width = repo_width
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:<10}  {:<12}  {}",
+                info.name,
+                status_display,
+                format!(
+                    "{} container{}",
+                    info.containers,
+                    if info.containers == 1 { "" } else { "s" }
+                ),
+                created_display,
+                name_width = name_width
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// Get labels for a pod using podman pod inspect
+fn get_pod_labels(pod_name: &str) -> Option<serde_json::Value> {
+    let output = podman_command()
+        .args(["pod", "inspect", "--format", "{{json .Labels}}", pod_name])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(json_str.trim()).ok()
 }
 
 /// Format a timestamp to a more readable format

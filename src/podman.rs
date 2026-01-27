@@ -390,13 +390,18 @@ impl PodmanService {
     ///
     /// Returns the pod ID. Podman implements pods via the API but bollard
     /// doesn't have native support, so we shell out for pod operations.
-    pub async fn create_pod(&self, name: &str) -> Result<String> {
-        let output = self
-            .podman_command()
-            .args(["pod", "create", "--name", name])
-            .output()
-            .await
-            .context("Failed to create pod")?;
+    ///
+    /// Labels can be provided as key-value pairs to attach metadata to the pod.
+    pub async fn create_pod(&self, name: &str, labels: &[(String, String)]) -> Result<String> {
+        let mut cmd = self.podman_command();
+        cmd.args(["pod", "create", "--name", name]);
+
+        // Add labels
+        for (key, value) in labels {
+            cmd.args(["--label", &format!("{}={}", key, value)]);
+        }
+
+        let output = cmd.output().await.context("Failed to create pod")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
