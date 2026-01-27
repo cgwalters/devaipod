@@ -81,6 +81,9 @@ enum HostCommand {
         /// Enable agent sidecar container (experimental)
         #[arg(long)]
         agent_sidecar: bool,
+        /// SSH into workspace after starting
+        #[arg(short = 'S', long)]
+        ssh: bool,
     },
     /// Run an AI agent with a task
     ///
@@ -297,6 +300,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             ide,
             dry_run,
             agent_sidecar,
+            ssh,
         } => {
             cmd_up(
                 &config,
@@ -309,6 +313,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 ide.as_deref(),
                 dry_run,
                 agent_sidecar,
+                ssh,
             )
             .await
         }
@@ -377,10 +382,11 @@ async fn cmd_up(
     _ide: Option<&str>,
     dry_run: bool,
     _agent_sidecar: bool,
+    ssh: bool,
 ) -> Result<()> {
     // Check if source is a PR/MR URL
     if let Some(pr_ref) = forge::parse_pr_url(source) {
-        return cmd_up_pr(config, pr_ref, task, no_prompt, dry_run).await;
+        return cmd_up_pr(config, pr_ref, task, no_prompt, dry_run, ssh).await;
     }
 
     // Resolve local paths
@@ -620,6 +626,11 @@ async fn cmd_up(
     // require the service to be running for containers to run.
     drop(podman);
 
+    // SSH into workspace if requested
+    if ssh {
+        return cmd_ssh(&pod_name, false, &[]);
+    }
+
     Ok(())
 }
 
@@ -630,6 +641,7 @@ async fn cmd_up_pr(
     task: Option<&str>,
     no_prompt: bool,
     dry_run: bool,
+    ssh: bool,
 ) -> Result<()> {
     tracing::info!(
         "Fetching {} PR #{} from {}/{}...",
@@ -815,6 +827,12 @@ async fn cmd_up_pr(
     );
 
     drop(podman);
+
+    // SSH into workspace if requested
+    if ssh {
+        return cmd_ssh(&pod_name, false, &[]);
+    }
+
     Ok(())
 }
 
