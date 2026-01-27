@@ -11,6 +11,8 @@ use color_eyre::eyre::{bail, Context, Result};
 /// Information about a git repository's state
 #[derive(Debug, Clone)]
 pub struct GitRepoInfo {
+    /// Local path to the repository (for local clone support)
+    pub local_path: std::path::PathBuf,
     /// Remote URL (None if no remote configured)
     pub remote_url: Option<String>,
     /// Current commit SHA (full 40-character hash)
@@ -92,6 +94,7 @@ pub fn detect_git_info(project_path: &Path) -> Result<GitRepoInfo> {
     let is_dirty = !dirty_files.is_empty();
 
     Ok(GitRepoInfo {
+        local_path: project_path.to_path_buf(),
         remote_url,
         commit_sha,
         branch,
@@ -151,12 +154,16 @@ fn get_current_branch(project_path: &Path) -> Option<String> {
     None
 }
 
-/// Generate a shell script to clone and checkout a repository
+/// Generate a shell script to clone and checkout a repository from remote
+///
+/// Note: For local repos, prefer `clone_from_local_script` which clones from
+/// the mounted local .git directory, allowing work with unpushed commits.
 ///
 /// The script will:
 /// 1. Clone the repository to the workspace folder
 /// 2. Checkout the specific commit
 /// 3. Optionally checkout a branch if tracking
+#[allow(dead_code)] // Used in tests; may be useful for direct remote clone in future
 pub fn clone_script(git_info: &GitRepoInfo, workspace_folder: &str) -> Result<String> {
     let remote_url = git_info.remote_url.as_ref().ok_or_else(|| {
         color_eyre::eyre::eyre!(
@@ -197,6 +204,68 @@ echo "Repository cloned successfully at commit {short_commit}"
     );
 
     Ok(script)
+}
+
+/// Generate a shell script to clone from a local git repository
+///
+/// This is used when running `devaipod up .` to clone from the local repo
+/// instead of the remote. This allows working with unpushed commits.
+///
+/// The script expects the host's .git directory to be mounted at /mnt/host-git
+///
+/// The script will:
+/// 1. Clone from the mounted local .git directory
+/// 2. Checkout the specific commit
+/// 3. Set up the remote URL for push/pull operations
+/// 4. Chown the workspace to the target user (since we clone as root)
+///
+/// `target_user` is the user who will own the workspace (from devcontainer remoteUser/containerUser)
+pub fn clone_from_local_script(
+    git_info: &GitRepoInfo,
+    workspace_folder: &str,
+    target_user: Option<&str>,
+) -> String {
+    // We'll set up the remote after cloning if available
+    let setup_remote = if let Some(ref url) = git_info.remote_url {
+        format!(
+            r#"
+# Set up origin remote for push/pull
+git remote set-url origin "{url}" 2>/dev/null || git remote add origin "{url}"
+"#,
+            url = url
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"
+set -e
+echo "Cloning from local repository..."
+mkdir -p "$(dirname "{workspace}")"
+
+# Clone from the mounted local .git directory
+# Use --no-hardlinks since we're cloning from a bind mount
+git clone --no-hardlinks /mnt/host-git "{workspace}" 2>&1
+
+cd "{workspace}"
+
+# Checkout the exact commit
+git checkout "{commit}" 2>&1
+{setup_remote}
+{chown_cmd}
+echo "Repository cloned successfully at commit {short_commit}"
+"#,
+        workspace = workspace_folder,
+        commit = git_info.commit_sha,
+        short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
+        setup_remote = setup_remote,
+        chown_cmd = target_user
+            .map(|u| format!(
+                "# Set ownership to target user\nchown -R {u}:{u} \"{workspace_folder}\""
+            ))
+            .unwrap_or_default(),
+    )
 }
 
 /// Generate a shell script to clone from a PR/MR
@@ -379,6 +448,7 @@ mod tests {
     #[test]
     fn test_clone_script_no_remote() {
         let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/tmp/test"),
             remote_url: None,
             commit_sha: "abc123".to_string(),
             branch: None,
@@ -394,6 +464,7 @@ mod tests {
     #[test]
     fn test_clone_script_with_remote() {
         let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/tmp/test"),
             remote_url: Some("https://github.com/test/repo.git".to_string()),
             commit_sha: "abc123def456".to_string(),
             branch: Some("main".to_string()),
@@ -407,5 +478,43 @@ mod tests {
         assert!(script.contains("https://github.com/test/repo.git"));
         assert!(script.contains("/workspaces/test"));
         assert!(script.contains("abc123def456"));
+    }
+
+    #[test]
+    fn test_clone_from_local_script() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: Some("https://github.com/test/repo.git".to_string()),
+            commit_sha: "abc123def456".to_string(),
+            branch: Some("feature".to_string()),
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script = clone_from_local_script(&info, "/workspaces/test", Some("devenv"));
+
+        assert!(script.contains("git clone"));
+        assert!(script.contains("/mnt/host-git"));
+        assert!(script.contains("/workspaces/test"));
+        assert!(script.contains("abc123def456"));
+        assert!(script.contains("origin"));
+        assert!(script.contains("chown -R devenv:devenv"));
+    }
+
+    #[test]
+    fn test_clone_from_local_script_no_user() {
+        let info = GitRepoInfo {
+            local_path: std::path::PathBuf::from("/home/user/project"),
+            remote_url: Some("https://github.com/test/repo.git".to_string()),
+            commit_sha: "abc123def456".to_string(),
+            branch: Some("feature".to_string()),
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script = clone_from_local_script(&info, "/workspaces/test", None);
+
+        assert!(script.contains("git clone"));
+        assert!(!script.contains("chown"));
     }
 }

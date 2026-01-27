@@ -386,6 +386,27 @@ impl PodmanService {
         }
     }
 
+    /// Get the default user configured in an image
+    ///
+    /// Returns the user from the image's config, or None if not set or empty.
+    pub async fn get_image_user(&self, image: &str) -> Result<Option<String>> {
+        let info = self
+            .client
+            .inspect_image(image)
+            .await
+            .context("Failed to inspect image")?;
+
+        // The user is in config.user
+        if let Some(config) = info.config {
+            if let Some(user) = config.user {
+                if !user.is_empty() {
+                    return Ok(Some(user));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Create a pod (containers sharing network namespace)
     ///
     /// Returns the pod ID. Podman implements pods via the API but bollard
@@ -576,12 +597,16 @@ impl PodmanService {
     ///
     /// This creates a temporary container, runs a command, and removes it.
     /// Useful for initializing volumes before the main containers start.
+    ///
+    /// `extra_binds` allows mounting additional host paths (e.g., for cloning from local git).
+    /// Each entry is a "host_path:container_path" string.
     pub async fn run_init_container(
         &self,
         image: &str,
         volume_name: &str,
         mount_path: &str,
         command: &[&str],
+        extra_binds: &[String],
     ) -> Result<i32> {
         let container_name = format!("{}-init", volume_name);
 
@@ -601,6 +626,19 @@ impl PodmanService {
             "-v".to_string(),
             format!("{}:{}", volume_name, mount_path),
         ];
+
+        // Add extra bind mounts (with SELinux label disable and root user if any are present)
+        // Root is needed because bind mounts from the host may have different UID mappings
+        if !extra_binds.is_empty() {
+            args.push("--security-opt".to_string());
+            args.push("label=disable".to_string());
+            args.push("--user".to_string());
+            args.push("0".to_string());
+        }
+        for bind in extra_binds {
+            args.push("-v".to_string());
+            args.push(bind.clone());
+        }
 
         args.push(image.to_string());
         args.extend(command.iter().map(|s| s.to_string()));

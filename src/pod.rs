@@ -45,18 +45,6 @@ impl WorkspaceSource {
         }
     }
 
-    /// Get the clone script for this source
-    pub fn clone_script(&self, workspace_folder: &str) -> color_eyre::Result<String> {
-        match self {
-            WorkspaceSource::LocalRepo(git_info) => {
-                crate::git::clone_script(git_info, workspace_folder)
-            }
-            WorkspaceSource::PullRequest(pr_info) => {
-                Ok(crate::git::clone_pr_script(pr_info, workspace_folder))
-            }
-        }
-    }
-
     /// Get a short description for logging
     pub fn description(&self) -> String {
         match self {
@@ -226,6 +214,7 @@ impl DevaipodPod {
         enable_network_isolation: bool,
         global_config: &Config,
         source: &WorkspaceSource,
+        extra_labels: &[(String, String)],
     ) -> Result<Self> {
         // Resolve bind_home configurations
         let container_home = Self::resolve_container_home(devcontainer_config);
@@ -286,13 +275,41 @@ impl DevaipodPod {
                 .context("Failed to create workspace volume")?;
 
             // Clone the repository into the volume using an init container
-            let clone_script = source.clone_script(&workspace_folder)?;
+            // For local repos, we mount the .git directory and clone from there
+            // This allows working with unpushed commits
+            //
+            // Determine the target user for chown: prefer devcontainer config, fall back to image
+            let target_user = if let Some(user) = devcontainer_config.effective_user() {
+                Some(user.to_string())
+            } else {
+                // Get user from image config
+                podman.get_image_user(&image).await.unwrap_or(None)
+            };
+            let (clone_script, extra_binds) = match source {
+                WorkspaceSource::LocalRepo(git_info) => {
+                    let script = crate::git::clone_from_local_script(
+                        git_info,
+                        &workspace_folder,
+                        target_user.as_deref(),
+                    );
+                    // Mount the local .git directory read-only
+                    let git_dir = git_info.local_path.join(".git");
+                    let bind = format!("{}:/mnt/host-git:ro", git_dir.display());
+                    (script, vec![bind])
+                }
+                WorkspaceSource::PullRequest(pr_info) => {
+                    let script = crate::git::clone_pr_script(pr_info, &workspace_folder);
+                    (script, vec![])
+                }
+            };
+
             let exit_code = podman
                 .run_init_container(
                     &image,
                     &volume_name,
                     "/workspaces",
                     &["/bin/sh", "-c", &clone_script],
+                    &extra_binds,
                 )
                 .await
                 .context("Failed to run init container for git clone")?;
@@ -311,7 +328,8 @@ impl DevaipodPod {
         }
 
         // Create the pod with metadata labels
-        let labels = source.to_labels();
+        let mut labels = source.to_labels();
+        labels.extend(extra_labels.iter().cloned());
         podman
             .create_pod(pod_name, &labels)
             .await
@@ -1011,7 +1029,11 @@ fi
 
 echo "devaipod: opencode agent at http://localhost:{port}"
 echo "devaipod: use 'opencode-agent' or 'oc' to connect (in ~/.local/bin)"
-exec sleep infinity
+
+# Handle SIGTERM gracefully for clean shutdown
+trap 'exit 0' TERM INT
+# Sleep in background so trap works, wait for it
+while true; do sleep 86400 & wait $!; done
 "#,
                     port = OPENCODE_PORT
                 ),
@@ -1244,7 +1266,8 @@ mod tests {
         assert!(cmd[2].contains("opencode-agent")); // Creates shim
         assert!(cmd[2].contains("opencode attach")); // Shim uses attach
         assert!(cmd[2].contains(&format!("http://localhost:{}", OPENCODE_PORT)));
-        assert!(cmd[2].contains("sleep infinity"));
+        assert!(cmd[2].contains("trap")); // Has SIGTERM trap for graceful shutdown
+        assert!(cmd[2].contains("sleep")); // Sleeps to keep container running
         assert!(!container_config.drop_all_caps);
         assert!(!container_config.no_new_privileges);
     }

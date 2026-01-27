@@ -55,14 +55,20 @@ enum HostCommand {
     ///   devaipod up https://github.com/user/repo
     ///   devaipod up https://github.com/user/repo --agent goose
     Up {
-        /// Source: local path or git URL
+        /// Source: local path, git URL, or PR URL
         source: String,
+        /// Task description for the AI agent (also stored as workspace description)
+        #[arg(value_name = "TASK")]
+        task: Option<String>,
         /// AI agent to run: goose, claude, opencode (default: from config or goose)
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Don't start AI agent automatically
         #[arg(long)]
         no_agent: bool,
+        /// Store task description but don't send it to the agent as a prompt
+        #[arg(short = 'n', long)]
+        no_prompt: bool,
         /// DevPod provider to use (default: docker)
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
@@ -147,8 +153,8 @@ enum HostCommand {
     Delete {
         /// Workspace name
         workspace: String,
-        /// Skip confirmation
-        #[arg(long)]
+        /// Force deletion (stop running containers first)
+        #[arg(short, long)]
         force: bool,
     },
     /// View container logs
@@ -283,8 +289,10 @@ async fn run_host(cli: HostCli) -> Result<()> {
     match cli.command {
         HostCommand::Up {
             source,
+            task,
             agent,
             no_agent,
+            no_prompt,
             provider,
             ide,
             dry_run,
@@ -293,6 +301,8 @@ async fn run_host(cli: HostCli) -> Result<()> {
             cmd_up(
                 &config,
                 &source,
+                task.as_deref(),
+                no_prompt,
                 agent.as_deref(),
                 no_agent,
                 provider.as_deref(),
@@ -359,6 +369,8 @@ fn run_container(cli: ContainerCli) -> Result<()> {
 async fn cmd_up(
     config: &config::Config,
     source: &str,
+    task: Option<&str>,
+    no_prompt: bool,
     _agent: Option<&str>,
     _no_agent: bool,
     _provider: Option<&str>,
@@ -368,7 +380,7 @@ async fn cmd_up(
 ) -> Result<()> {
     // Check if source is a PR/MR URL
     if let Some(pr_ref) = forge::parse_pr_url(source) {
-        return cmd_up_pr(config, pr_ref, dry_run).await;
+        return cmd_up_pr(config, pr_ref, task, no_prompt, dry_run).await;
     }
 
     // Resolve local paths
@@ -502,6 +514,13 @@ async fn cmd_up(
     // Create the pod with all containers
     tracing::info!("Creating pod '{}'...", pod_name);
     let source = pod::WorkspaceSource::LocalRepo(git_info);
+
+    // Build extra labels for task description
+    let mut extra_labels = Vec::new();
+    if let Some(task_desc) = task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
+    }
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         project_path,
@@ -511,6 +530,7 @@ async fn cmd_up(
         enable_network_isolation,
         config,
         &source,
+        &extra_labels,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -578,10 +598,18 @@ async fn cmd_up(
         "  • SSH into workspace: podman exec -it {} bash",
         devaipod_pod.workspace_container
     );
+    if let Some(task_desc) = task {
+        tracing::info!("  • Task: {}", task_desc);
+    }
 
-    // Keep podman service running - when we drop it, the service will stop
-    // For now, we just exit after starting. The pod will keep running.
-    // In the future, we could wait for a signal or provide a shell.
+    // Send task to agent if provided and not --no-prompt
+    if let Some(task_desc) = task {
+        if !no_prompt {
+            tracing::info!("Sending task to agent...");
+            send_task_to_agent(task_desc).await?;
+        }
+    }
+
     tracing::info!(
         "Pod is running. Use 'podman pod stop {}' to stop.",
         pod_name
@@ -599,6 +627,8 @@ async fn cmd_up(
 async fn cmd_up_pr(
     config: &config::Config,
     pr_ref: forge::PullRequestRef,
+    task: Option<&str>,
+    no_prompt: bool,
     dry_run: bool,
 ) -> Result<()> {
     tracing::info!(
@@ -686,6 +716,12 @@ async fn cmd_up_pr(
     // Create source from PR info
     let source = pod::WorkspaceSource::PullRequest(pr_info);
 
+    // Build extra labels for task description
+    let mut extra_labels = Vec::new();
+    if let Some(task_desc) = task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
+    }
+
     // Create the pod
     tracing::info!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -697,6 +733,7 @@ async fn cmd_up_pr(
         enable_network_isolation,
         config,
         &source,
+        &extra_labels,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -760,6 +797,17 @@ async fn cmd_up_pr(
         "  • SSH into workspace: podman exec -it {} bash",
         devaipod_pod.workspace_container
     );
+    if let Some(task_desc) = task {
+        tracing::info!("  • Task: {}", task_desc);
+    }
+
+    // Send task to agent if provided and not --no-prompt
+    if let Some(task_desc) = task {
+        if !no_prompt {
+            tracing::info!("Sending task to agent...");
+            send_task_to_agent(task_desc).await?;
+        }
+    }
 
     tracing::info!(
         "Pod is running. Use 'podman pod stop {}' to stop.",
@@ -767,6 +815,32 @@ async fn cmd_up_pr(
     );
 
     drop(podman);
+    Ok(())
+}
+
+/// Send a task prompt to the agent via HTTP API
+async fn send_task_to_agent(task: &str) -> Result<()> {
+    let url = format!("http://localhost:{}/session/new", pod::OPENCODE_PORT);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "prompt": task
+        }))
+        .send()
+        .await
+        .context("Failed to connect to agent")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!("Agent returned {}: {}", status, body);
+        // Don't fail - the pod is running, user can send task manually
+    } else {
+        tracing::info!("Task sent to agent successfully");
+    }
+
     Ok(())
 }
 
@@ -1417,6 +1491,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
         created: String,
         repo: Option<String>,
         pr: Option<String>,
+        task: Option<String>,
     }
 
     let mut pod_infos: Vec<PodInfo> = Vec::new();
@@ -1431,7 +1506,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
         let created = pod.get("Created").and_then(|v| v.as_str()).unwrap_or("-").to_string();
 
         // Get labels from pod inspect
-        let (repo, pr) = if let Some(labels) = get_pod_labels(&name) {
+        let (repo, pr, task) = if let Some(labels) = get_pod_labels(&name) {
             let repo = labels
                 .get("io.devaipod.repo")
                 .and_then(|v| v.as_str())
@@ -1440,9 +1515,13 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 .get("io.devaipod.pr")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            (repo, pr)
+            let task = labels
+                .get("io.devaipod.task")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (repo, pr, task)
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         pod_infos.push(PodInfo {
@@ -1452,6 +1531,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
             created,
             repo,
             pr,
+            task,
         });
     }
 
@@ -1465,20 +1545,44 @@ fn cmd_list(json_output: bool) -> Result<()> {
         .unwrap_or(0)
         .max(4);
 
-    // Check if any pods have repo/PR info
+    // Check if any pods have repo/PR/task info
     let has_repo_info = pod_infos.iter().any(|p| p.repo.is_some());
+    let has_task_info = pod_infos.iter().any(|p| p.task.is_some());
 
     // Print header
     if has_repo_info {
+        if has_task_info {
+            println!(
+                "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {:<30}  {}",
+                "NAME",
+                "STATUS",
+                "REPO",
+                "PR",
+                "TASK",
+                "CREATED",
+                name_width = name_width,
+                repo_width = repo_width
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+                "NAME",
+                "STATUS",
+                "REPO",
+                "PR",
+                "CREATED",
+                name_width = name_width,
+                repo_width = repo_width
+            );
+        }
+    } else if has_task_info {
         println!(
-            "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+            "{:<name_width$}  {:<10}  {:<30}  {}",
             "NAME",
             "STATUS",
-            "REPO",
-            "PR",
+            "TASK",
             "CREATED",
-            name_width = name_width,
-            repo_width = repo_width
+            name_width = name_width
         );
     } else {
         println!(
@@ -1503,6 +1607,19 @@ fn cmd_list(json_output: bool) -> Result<()> {
             _ => &info.status,
         };
 
+        // Truncate task to 30 chars for display
+        let task_display = info
+            .task
+            .as_ref()
+            .map(|t| {
+                if t.len() > 30 {
+                    format!("{}...", &t[..27])
+                } else {
+                    t.clone()
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
+
         if has_repo_info {
             let repo_display = info.repo.as_deref().unwrap_or("-");
             let pr_display = info
@@ -1511,15 +1628,38 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 .map(|n| format!("#{}", n))
                 .unwrap_or_else(|| "-".to_string());
 
+            if has_task_info {
+                println!(
+                    "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {:<30}  {}",
+                    info.name,
+                    status_display,
+                    repo_display,
+                    pr_display,
+                    task_display,
+                    created_display,
+                    name_width = name_width,
+                    repo_width = repo_width
+                );
+            } else {
+                println!(
+                    "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+                    info.name,
+                    status_display,
+                    repo_display,
+                    pr_display,
+                    created_display,
+                    name_width = name_width,
+                    repo_width = repo_width
+                );
+            }
+        } else if has_task_info {
             println!(
-                "{:<name_width$}  {:<10}  {:<repo_width$}  {:<6}  {}",
+                "{:<name_width$}  {:<10}  {:<30}  {}",
                 info.name,
                 status_display,
-                repo_display,
-                pr_display,
+                task_display,
                 created_display,
-                name_width = name_width,
-                repo_width = repo_width
+                name_width = name_width
             );
         } else {
             println!(
@@ -1599,6 +1739,21 @@ fn cmd_stop(pod_name: &str) -> Result<()> {
 /// Delete a pod using podman pod rm
 fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
     tracing::info!("Deleting pod '{}'...", pod_name);
+
+    // Stop the pod first (graceful shutdown)
+    // This gives containers time to handle SIGTERM before we remove them
+    let stop_output = podman_command()
+        .args(["pod", "stop", pod_name])
+        .output()
+        .context("Failed to run podman pod stop")?;
+
+    if !stop_output.status.success() {
+        // Pod might already be stopped, or might not exist - continue with rm
+        tracing::debug!(
+            "Pod stop returned non-zero (may already be stopped): {}",
+            String::from_utf8_lossy(&stop_output.stderr).trim()
+        );
+    }
 
     let mut cmd = podman_command();
     cmd.args(["pod", "rm"]);
