@@ -981,8 +981,15 @@ fn extract_github_issue_context(task: &str) -> Option<String> {
 /// Check if any API keys are configured for the AI agent and warn if not
 ///
 /// This helps users on first run understand that they need to configure
-/// API keys for the agent to function properly.
+/// API keys for the agent to function properly. Only warns if no config
+/// file exists - if the user has a config file, we assume they've set
+/// things up properly (e.g. via secrets, env vars in config, etc).
 fn check_api_keys_configured() {
+    // If a config file exists, assume the user has configured things properly
+    if config::config_path().exists() {
+        return;
+    }
+
     let agent_env_vars = config::collect_agent_env_vars();
     let has_common_keys =
         std::env::var("ANTHROPIC_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok();
@@ -990,10 +997,8 @@ fn check_api_keys_configured() {
     if agent_env_vars.is_empty() && !has_common_keys {
         eprintln!();
         eprintln!("Warning: No API keys detected for the AI agent.");
-        eprintln!("   Set environment variables to pass keys to the agent:");
-        eprintln!("     export DEVAIPOD_AGENT_ANTHROPIC_API_KEY='your-key'");
-        eprintln!("   Or use common key names directly:");
-        eprintln!("     export ANTHROPIC_API_KEY='your-key'");
+        eprintln!("   Create a config file at ~/.config/devaipod.toml");
+        eprintln!("   See: https://github.com/cgwalters/devaipod#configuration");
         eprintln!();
     }
 }
