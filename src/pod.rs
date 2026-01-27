@@ -191,6 +191,7 @@ pub struct DevaipodPod {
     /// Name of the agent container
     pub agent_container: String,
     /// Name of the gator container (if enabled)
+    #[allow(dead_code)] // Stored for future container management
     pub gator_container: Option<String>,
     /// Name of the proxy container (if network isolation enabled)
     #[allow(dead_code)] // Used for container management
