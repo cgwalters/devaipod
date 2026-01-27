@@ -664,6 +664,7 @@ exec sleep infinity
             drop_all_caps: false,
             cap_add: config.cap_add.clone(),
             no_new_privileges: false,
+            ..Default::default()
         }
     }
 
@@ -789,6 +790,7 @@ exec sleep infinity
             drop_all_caps: true,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
+            ..Default::default()
         }
     }
 
@@ -813,6 +815,7 @@ exec sleep infinity
             drop_all_caps: true,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
+            ..Default::default()
         }
     }
 

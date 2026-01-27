@@ -55,6 +55,9 @@ pub struct Config {
     /// Network isolation configuration for agent container
     #[serde(default, rename = "network-isolation")]
     pub network_isolation: NetworkIsolationConfig,
+    /// GPU passthrough configuration
+    #[serde(default)]
+    pub gpu: GpuPassthroughConfig,
     /// Bind paths from host $HOME to container $HOME (applies to all containers)
     /// Paths are relative to $HOME on both sides
     #[serde(default)]
@@ -169,6 +172,75 @@ impl NetworkIsolationConfig {
         self.proxy_image
             .as_deref()
             .unwrap_or("docker.io/ubuntu/squid:latest")
+    }
+}
+
+// =============================================================================
+// GPU passthrough configuration
+// =============================================================================
+
+/// GPU passthrough configuration for containers
+///
+/// When enabled, GPUs are passed through to the workspace container.
+/// Supports NVIDIA (via CDI or direct device passthrough) and AMD GPUs.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GpuPassthroughConfig {
+    /// Whether to enable GPU passthrough (default: false)
+    /// Set to "auto" to auto-detect and enable if GPUs are available
+    #[serde(default)]
+    pub enabled: GpuEnabled,
+    /// Which containers should get GPU access
+    /// Options: "workspace" (default), "agent", "all"
+    #[serde(default = "default_gpu_target")]
+    pub target: String,
+}
+
+fn default_gpu_target() -> String {
+    "workspace".to_string()
+}
+
+/// GPU enablement mode
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuEnabled {
+    /// Disabled (default)
+    #[default]
+    #[serde(alias = "false")]
+    Disabled,
+    /// Enabled
+    #[serde(alias = "true")]
+    Enabled,
+    /// Auto-detect and enable if GPUs available
+    Auto,
+}
+
+impl Default for GpuPassthroughConfig {
+    fn default() -> Self {
+        Self {
+            enabled: GpuEnabled::default(),
+            target: default_gpu_target(),
+        }
+    }
+}
+
+impl GpuPassthroughConfig {
+    /// Check if GPU should be enabled for the workspace container
+    pub fn workspace_enabled(&self, has_gpus: bool) -> bool {
+        match self.enabled {
+            GpuEnabled::Disabled => false,
+            GpuEnabled::Enabled => self.target == "workspace" || self.target == "all",
+            GpuEnabled::Auto => has_gpus && (self.target == "workspace" || self.target == "all"),
+        }
+    }
+
+    /// Check if GPU should be enabled for the agent container
+    #[allow(dead_code)]
+    pub fn agent_enabled(&self, has_gpus: bool) -> bool {
+        match self.enabled {
+            GpuEnabled::Disabled => false,
+            GpuEnabled::Enabled => self.target == "agent" || self.target == "all",
+            GpuEnabled::Auto => has_gpus && (self.target == "agent" || self.target == "all"),
+        }
     }
 }
 
@@ -1093,5 +1165,237 @@ proxy_image = "my-proxy:latest"
         assert!(all_domains.contains(&"api.anthropic.com".to_string()));
         assert!(all_domains.contains(&"api.openai.com".to_string()));
         assert!(all_domains.contains(&"custom.api.com".to_string()));
+    }
+
+    // =========================================================================
+    // GPU configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_gpu_config_default() {
+        let config = GpuPassthroughConfig::default();
+        assert_eq!(config.enabled, GpuEnabled::Disabled);
+        assert_eq!(config.target, "workspace");
+    }
+
+    #[test]
+    fn test_gpu_enabled_default() {
+        assert_eq!(GpuEnabled::default(), GpuEnabled::Disabled);
+    }
+
+    #[test]
+    fn test_parse_gpu_enabled_true() {
+        let toml = r#"
+[gpu]
+enabled = "enabled"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.enabled, GpuEnabled::Enabled);
+    }
+
+    #[test]
+    fn test_parse_gpu_enabled_false() {
+        let toml = r#"
+[gpu]
+enabled = "disabled"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.enabled, GpuEnabled::Disabled);
+    }
+
+    #[test]
+    fn test_parse_gpu_enabled_auto() {
+        let toml = r#"
+[gpu]
+enabled = "auto"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.enabled, GpuEnabled::Auto);
+    }
+
+    #[test]
+    fn test_parse_gpu_target_workspace() {
+        let toml = r#"
+[gpu]
+enabled = "enabled"
+target = "workspace"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.target, "workspace");
+    }
+
+    #[test]
+    fn test_parse_gpu_target_agent() {
+        let toml = r#"
+[gpu]
+enabled = "enabled"
+target = "agent"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.target, "agent");
+    }
+
+    #[test]
+    fn test_parse_gpu_target_all() {
+        let toml = r#"
+[gpu]
+enabled = "enabled"
+target = "all"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.target, "all");
+    }
+
+    #[test]
+    fn test_gpu_workspace_enabled_disabled_mode() {
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Disabled,
+            target: "workspace".to_string(),
+        };
+        // Disabled means no GPU regardless of has_gpus
+        assert!(!config.workspace_enabled(true));
+        assert!(!config.workspace_enabled(false));
+    }
+
+    #[test]
+    fn test_gpu_workspace_enabled_enabled_mode() {
+        // target = workspace
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Enabled,
+            target: "workspace".to_string(),
+        };
+        assert!(config.workspace_enabled(true));
+        assert!(config.workspace_enabled(false)); // Enabled ignores has_gpus
+
+        // target = agent
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Enabled,
+            target: "agent".to_string(),
+        };
+        assert!(!config.workspace_enabled(true));
+        assert!(!config.workspace_enabled(false));
+
+        // target = all
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Enabled,
+            target: "all".to_string(),
+        };
+        assert!(config.workspace_enabled(true));
+        assert!(config.workspace_enabled(false));
+    }
+
+    #[test]
+    fn test_gpu_workspace_enabled_auto_mode() {
+        // target = workspace
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Auto,
+            target: "workspace".to_string(),
+        };
+        assert!(config.workspace_enabled(true)); // GPUs available
+        assert!(!config.workspace_enabled(false)); // No GPUs
+
+        // target = agent
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Auto,
+            target: "agent".to_string(),
+        };
+        assert!(!config.workspace_enabled(true));
+        assert!(!config.workspace_enabled(false));
+
+        // target = all
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Auto,
+            target: "all".to_string(),
+        };
+        assert!(config.workspace_enabled(true));
+        assert!(!config.workspace_enabled(false));
+    }
+
+    #[test]
+    fn test_gpu_agent_enabled_disabled_mode() {
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Disabled,
+            target: "agent".to_string(),
+        };
+        // Disabled means no GPU regardless of has_gpus
+        assert!(!config.agent_enabled(true));
+        assert!(!config.agent_enabled(false));
+    }
+
+    #[test]
+    fn test_gpu_agent_enabled_enabled_mode() {
+        // target = agent
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Enabled,
+            target: "agent".to_string(),
+        };
+        assert!(config.agent_enabled(true));
+        assert!(config.agent_enabled(false)); // Enabled ignores has_gpus
+
+        // target = workspace
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Enabled,
+            target: "workspace".to_string(),
+        };
+        assert!(!config.agent_enabled(true));
+        assert!(!config.agent_enabled(false));
+
+        // target = all
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Enabled,
+            target: "all".to_string(),
+        };
+        assert!(config.agent_enabled(true));
+        assert!(config.agent_enabled(false));
+    }
+
+    #[test]
+    fn test_gpu_agent_enabled_auto_mode() {
+        // target = agent
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Auto,
+            target: "agent".to_string(),
+        };
+        assert!(config.agent_enabled(true)); // GPUs available
+        assert!(!config.agent_enabled(false)); // No GPUs
+
+        // target = workspace
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Auto,
+            target: "workspace".to_string(),
+        };
+        assert!(!config.agent_enabled(true));
+        assert!(!config.agent_enabled(false));
+
+        // target = all
+        let config = GpuPassthroughConfig {
+            enabled: GpuEnabled::Auto,
+            target: "all".to_string(),
+        };
+        assert!(config.agent_enabled(true));
+        assert!(!config.agent_enabled(false));
+    }
+
+    #[test]
+    fn test_parse_gpu_config_full() {
+        let toml = r#"
+[gpu]
+enabled = "auto"
+target = "all"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.enabled, GpuEnabled::Auto);
+        assert_eq!(config.gpu.target, "all");
+    }
+
+    #[test]
+    fn test_gpu_config_in_minimal_config() {
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        // Default GPU config should be disabled
+        assert_eq!(config.gpu.enabled, GpuEnabled::Disabled);
+        assert_eq!(config.gpu.target, "workspace");
+        assert!(!config.gpu.workspace_enabled(true));
+        assert!(!config.gpu.agent_enabled(true));
     }
 }

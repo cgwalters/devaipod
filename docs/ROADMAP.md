@@ -91,7 +91,9 @@ Current constraints that users should be aware of:
 - **Lifecycle commands only run in workspace**: onCreateCommand etc. run in
   the workspace container, not the agent container. The agent starts with
   whatever is in the image.
-- **No GPU support**: Agent container doesn't have GPU passthrough configured.
-  Local LLM inference would require this.
+- **GPU support**: ✅ GPU passthrough is now available for both NVIDIA (via CDI
+  or direct device passthrough) and AMD (via /dev/kfd and /dev/dri/renderD*).
+  Configure via `[gpu]` section in `~/.config/devaipod.toml` with options:
+  `enabled = true/false/auto`, `target = workspace/agent/all`.
 - **Single agent type**: Only opencode is supported as the agent. Supporting
   other agents (goose, aider, etc.) would require per-agent configuration.

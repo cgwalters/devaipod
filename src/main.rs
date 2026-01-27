@@ -14,6 +14,7 @@ mod compose;
 mod config;
 mod devcontainer;
 mod devpod;
+mod gpu;
 mod pod;
 mod podman;
 mod proxy;

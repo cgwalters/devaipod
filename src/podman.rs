@@ -473,6 +473,29 @@ impl PodmanService {
             args.push("--security-opt=no-new-privileges".to_string());
         }
 
+        // Additional security options (e.g., for GPU passthrough)
+        for opt in &config.security_opts {
+            args.push(format!("--security-opt={}", opt));
+        }
+
+        // Device passthrough (for GPUs)
+        for device in &config.devices {
+            args.push("--device".to_string());
+            args.push(device.clone());
+        }
+
+        // CDI devices (for NVIDIA GPUs with CDI)
+        for cdi in &config.cdi_devices {
+            args.push("--device".to_string());
+            args.push(cdi.clone());
+        }
+
+        // Additional groups (e.g., video for AMD GPUs)
+        for group in &config.groups {
+            args.push("--group-add".to_string());
+            args.push(group.clone());
+        }
+
         // Image
         args.push(image.to_string());
 
@@ -754,6 +777,14 @@ pub struct ContainerConfig {
     pub cap_add: Vec<String>,
     /// Prevent gaining new privileges
     pub no_new_privileges: bool,
+    /// Device paths to pass through (e.g., /dev/nvidia0)
+    pub devices: Vec<String>,
+    /// CDI device names (e.g., nvidia.com/gpu=all)
+    pub cdi_devices: Vec<String>,
+    /// Security options (e.g., label=disable)
+    pub security_opts: Vec<String>,
+    /// Additional groups to add
+    pub groups: Vec<String>,
 }
 
 /// Mount configuration

@@ -129,6 +129,7 @@ Projects can specify which env vars to pass to the agent in devcontainer.json:
 | service-gator integration | ✅ Optional |
 | Network isolation | ✅ Optional (proxy-based) |
 | Env allowlist | ✅ Working |
+| GPU passthrough | ✅ Optional (NVIDIA/AMD) |
 
 ## Documentation
 

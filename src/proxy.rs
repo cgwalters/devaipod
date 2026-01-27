@@ -92,6 +92,7 @@ exec squid -f /tmp/squid/squid.conf -N
         drop_all_caps: true,
         cap_add: vec!["NET_BIND_SERVICE".to_string()],
         no_new_privileges: true,
+        ..Default::default()
     }
 }
 
