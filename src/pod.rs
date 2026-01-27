@@ -1048,7 +1048,7 @@ echo "Nested podman configured successfully"
     /// Create container config for the workspace container
     fn workspace_container_config(
         _project_path: &Path,
-        _workspace_folder: &str,
+        workspace_folder: &str,
         user: Option<&str>,
         config: &DevcontainerConfig,
         _bind_home: &BindHomeConfig,
@@ -1141,9 +1141,8 @@ echo "Nested podman configured successfully"
         ContainerConfig {
             mounts,
             env,
-            // Don't set workdir initially - workspace folder doesn't exist until we clone
-            // The clone step will create it, and lifecycle commands run in that directory
-            workdir: None,
+            // Set workdir to the workspace folder - where the cloned repo lives
+            workdir: Some(workspace_folder.to_string()),
             user: user.map(|u| u.to_string()),
             // Keep the container running, create opencode shim in user's bin, print agent connection info
             command: Some(vec![
@@ -1421,8 +1420,8 @@ mod tests {
         assert_eq!(container_config.volume_mounts[0].0, "test-volume");
         assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
         assert_eq!(container_config.user, Some("vscode".to_string()));
-        // workdir is None initially - workspace folder created by clone step
-        assert!(container_config.workdir.is_none());
+        // workdir is set to the workspace folder
+        assert_eq!(container_config.workdir, Some("/workspaces/myproject".to_string()));
         // Verify command is a shell script that creates shim, prints agent info, and sleeps
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
