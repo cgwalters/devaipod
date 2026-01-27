@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Context, Result};
 
+/// Common device paths that should be auto-passed to development containers if they exist on the host.
+///
+/// These devices are commonly needed for:
+/// - /dev/fuse: Overlay filesystems, podman/buildah operations, FUSE mounts
+/// - /dev/net/tun: VPN tools, network tunneling, container networking
+/// - /dev/kvm: Hardware virtualization for VM-based testing (e.g., bootc testing)
+const DEV_PASSTHROUGH_PATHS: &[&str] = &["/dev/fuse", "/dev/net/tun", "/dev/kvm"];
+
 use crate::config::{Config, DotfilesConfig};
 use crate::devcontainer::DevcontainerConfig;
 use crate::podman::{ContainerConfig, MountConfig, PodmanService};
@@ -130,7 +138,12 @@ impl DevaipodPod {
         let image_source = config.image_source(devcontainer_dir)?;
         let image_tag = format!("devaipod-{}", pod_name);
         let image = podman
-            .ensure_image(&image_source, &image_tag)
+            .ensure_image(
+                &image_source,
+                &image_tag,
+                config.has_features(),
+                Some(project_path),
+            )
             .await
             .context("Failed to ensure container image")?;
 
@@ -626,6 +639,17 @@ echo "Dotfiles installed successfully"
             readonly: false,
         }];
 
+        // Auto-detect development devices to pass through
+        let devices: Vec<String> = DEV_PASSTHROUGH_PATHS
+            .iter()
+            .filter(|path| Path::new(path).exists())
+            .map(|path| path.to_string())
+            .collect();
+
+        if !devices.is_empty() {
+            tracing::debug!("Auto-detected devices for workspace container: {:?}", devices);
+        }
+
         ContainerConfig {
             mounts,
             env,
@@ -664,6 +688,9 @@ exec sleep infinity
             drop_all_caps: false,
             cap_add: config.cap_add.clone(),
             no_new_privileges: false,
+            devices,
+            security_opts: config.security_opt.clone(),
+            privileged: config.privileged,
             ..Default::default()
         }
     }
@@ -988,6 +1015,55 @@ mod tests {
         assert_eq!(OPENCODE_PORT, 4096);
         assert_eq!(GATOR_PORT, 8765);
         assert_eq!(GATOR_IMAGE, "ghcr.io/cgwalters/service-gator:latest");
+    }
+
+    #[test]
+    fn test_dev_passthrough_paths() {
+        // Verify the device passthrough paths are what we expect
+        assert!(DEV_PASSTHROUGH_PATHS.contains(&"/dev/fuse"));
+        assert!(DEV_PASSTHROUGH_PATHS.contains(&"/dev/net/tun"));
+        assert!(DEV_PASSTHROUGH_PATHS.contains(&"/dev/kvm"));
+        assert_eq!(DEV_PASSTHROUGH_PATHS.len(), 3);
+    }
+
+    #[test]
+    fn test_workspace_config_devices_detection() {
+        // This test verifies that the workspace container config will include
+        // devices from DEV_PASSTHROUGH_PATHS if they exist on the host.
+        // We can't guarantee which devices exist, but we can test that the
+        // devices field only contains paths that actually exist.
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+        );
+
+        // All devices in the config should actually exist on the host
+        for device in &container_config.devices {
+            assert!(
+                Path::new(device).exists(),
+                "Device {} is in config but doesn't exist on host",
+                device
+            );
+        }
+
+        // All devices should be from our passthrough list
+        for device in &container_config.devices {
+            assert!(
+                DEV_PASSTHROUGH_PATHS.contains(&device.as_str()),
+                "Device {} not in DEV_PASSTHROUGH_PATHS",
+                device
+            );
+        }
     }
 
     #[test]

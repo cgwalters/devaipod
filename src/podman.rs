@@ -28,6 +28,15 @@ use tokio::process::Command;
 
 use crate::devcontainer::ImageSource;
 
+/// Check if the devcontainer CLI is available on the system
+fn devcontainer_cli_available() -> bool {
+    std::process::Command::new("devcontainer")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Status of a podman pod
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PodStatus {
@@ -276,8 +285,83 @@ impl PodmanService {
         Ok(())
     }
 
+    /// Build an image using the devcontainer CLI
+    ///
+    /// This delegates to `devcontainer build` which handles:
+    /// - Feature installation
+    /// - Dockerfile builds with features layered on top
+    /// - Complex build configurations
+    ///
+    /// Returns the image name on success.
+    pub async fn build_with_devcontainer_cli(
+        &self,
+        project_path: &Path,
+        tag: &str,
+    ) -> Result<String> {
+        tracing::info!(
+            "Building image {} using devcontainer CLI (features detected)",
+            tag
+        );
+
+        let output = Command::new("devcontainer")
+            .args([
+                "build",
+                "--workspace-folder",
+                &project_path.to_string_lossy(),
+                "--image-name",
+                tag,
+            ])
+            .output()
+            .await
+            .context("Failed to run devcontainer build")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            bail!(
+                "devcontainer build failed:\nstdout: {}\nstderr: {}",
+                stdout,
+                stderr
+            );
+        }
+
+        tracing::info!("Image built with devcontainer CLI: {}", tag);
+        Ok(tag.to_string())
+    }
+
     /// Ensure an image is available (pull or build as needed)
-    pub async fn ensure_image(&self, source: &ImageSource, tag: &str) -> Result<String> {
+    ///
+    /// If `has_features` is true and the devcontainer CLI is available,
+    /// this will use `devcontainer build` to handle feature installation.
+    /// Otherwise, it falls back to direct podman operations (and warns if
+    /// features will be ignored).
+    pub async fn ensure_image(
+        &self,
+        source: &ImageSource,
+        tag: &str,
+        has_features: bool,
+        project_path: Option<&Path>,
+    ) -> Result<String> {
+        // If features are present, try to use devcontainer CLI
+        if has_features {
+            if devcontainer_cli_available() {
+                if let Some(path) = project_path {
+                    return self.build_with_devcontainer_cli(path, tag).await;
+                } else {
+                    tracing::warn!(
+                        "Features detected but project path not provided; \
+                         falling back to direct build (features will be ignored)"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "devcontainer.json has features but devcontainer CLI is not installed. \
+                     Features will be ignored. Install with: npm install -g @devcontainers/cli"
+                );
+            }
+        }
+
+        // Fall back to direct podman operations
         match source {
             ImageSource::Image(image) => {
                 // Check if image exists locally first
@@ -494,6 +578,11 @@ impl PodmanService {
         for group in &config.groups {
             args.push("--group-add".to_string());
             args.push(group.clone());
+        }
+
+        // Privileged mode (for nested containers/VMs)
+        if config.privileged {
+            args.push("--privileged".to_string());
         }
 
         // Image
@@ -777,7 +866,7 @@ pub struct ContainerConfig {
     pub cap_add: Vec<String>,
     /// Prevent gaining new privileges
     pub no_new_privileges: bool,
-    /// Device paths to pass through (e.g., /dev/nvidia0)
+    /// Device paths to pass through (e.g., /dev/nvidia0, /dev/kvm)
     pub devices: Vec<String>,
     /// CDI device names (e.g., nvidia.com/gpu=all)
     pub cdi_devices: Vec<String>,
@@ -785,6 +874,8 @@ pub struct ContainerConfig {
     pub security_opts: Vec<String>,
     /// Additional groups to add
     pub groups: Vec<String>,
+    /// Run container in privileged mode (for nested containers/VMs)
+    pub privileged: bool,
 }
 
 /// Mount configuration
@@ -820,4 +911,11 @@ mod tests {
 
     // Integration tests that require podman would go here
     // For unit tests, we'd mock the podman interactions
+
+    #[test]
+    fn test_devcontainer_cli_available() {
+        // This test just verifies the function doesn't panic
+        // The actual result depends on whether devcontainer CLI is installed
+        let _available = devcontainer_cli_available();
+    }
 }

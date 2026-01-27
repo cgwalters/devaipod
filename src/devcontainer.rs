@@ -319,6 +319,11 @@ impl DevcontainerConfig {
             .map(|d| d.allowed_domains.clone())
             .unwrap_or_default()
     }
+
+    /// Check if this configuration has any features defined
+    pub fn has_features(&self) -> bool {
+        !self.features.is_empty()
+    }
 }
 
 /// Find the devcontainer.json file for a project
@@ -581,5 +586,33 @@ mod tests {
     fn test_allowed_domains_empty_when_no_customizations() {
         let config = DevcontainerConfig::default();
         assert!(config.allowed_domains().is_empty());
+    }
+
+    #[test]
+    fn test_has_features_empty() {
+        let config = DevcontainerConfig::default();
+        assert!(!config.has_features());
+    }
+
+    #[test]
+    fn test_has_features_with_features() {
+        let json = r#"{
+            "image": "mcr.microsoft.com/devcontainers/rust:1",
+            "features": {
+                "ghcr.io/devcontainers/features/node:1": {}
+            }
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert!(config.has_features());
+    }
+
+    #[test]
+    fn test_has_features_empty_object() {
+        let json = r#"{
+            "image": "mcr.microsoft.com/devcontainers/rust:1",
+            "features": {}
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.has_features());
     }
 }
