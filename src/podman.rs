@@ -216,7 +216,7 @@ impl PodmanService {
     pub async fn pull_image(&self, image: &str) -> Result<()> {
         use bollard::image::CreateImageOptions;
 
-        tracing::info!("Pulling image: {}", image);
+        tracing::debug!("Pulling image: {}", image);
 
         let options = CreateImageOptions {
             from_image: image,
@@ -231,7 +231,7 @@ impl PodmanService {
             }
         }
 
-        tracing::info!("Image pulled: {}", image);
+        tracing::debug!("Image pulled: {}", image);
         Ok(())
     }
 
@@ -245,8 +245,7 @@ impl PodmanService {
         target: Option<&str>,
     ) -> Result<()> {
         tracing::info!(
-            "Building image {} from {}",
-            tag,
+            "Building image from {}...",
             context_path.join(dockerfile).display()
         );
 
@@ -274,7 +273,7 @@ impl PodmanService {
                 // Print build output, trimming trailing newline
                 let output = stream.trim_end();
                 if !output.is_empty() {
-                    tracing::info!("Build: {}", output);
+                    tracing::debug!("Build: {}", output);
                 }
             }
             if let Some(error) = info.error {
@@ -282,7 +281,7 @@ impl PodmanService {
             }
         }
 
-        tracing::info!("Image built: {}", tag);
+        tracing::debug!("Image built: {}", tag);
         Ok(())
     }
 
@@ -430,7 +429,7 @@ impl PodmanService {
         }
 
         let pod_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        tracing::info!(
+        tracing::debug!(
             "Created pod: {} ({})",
             name,
             &pod_id[..pod_id.len().min(12)]
@@ -482,7 +481,7 @@ impl PodmanService {
             bail!("Failed to start pod: {}", stderr);
         }
 
-        tracing::info!("Started pod: {}", name);
+        tracing::debug!("Started pod: {}", name);
         Ok(())
     }
 
@@ -832,12 +831,37 @@ impl PodmanService {
     }
 
     /// Execute a command in a running container
+    ///
+    /// If `quiet` is true, output is captured and only shown on failure.
+    /// If `quiet` is false, output is streamed to stdout/stderr.
     pub async fn exec(
         &self,
         container: &str,
         cmd: &[&str],
         user: Option<&str>,
         workdir: Option<&str>,
+    ) -> Result<i64> {
+        self.exec_impl(container, cmd, user, workdir, false).await
+    }
+
+    /// Execute a command quietly (capture output, only show on failure)
+    pub async fn exec_quiet(
+        &self,
+        container: &str,
+        cmd: &[&str],
+        user: Option<&str>,
+        workdir: Option<&str>,
+    ) -> Result<i64> {
+        self.exec_impl(container, cmd, user, workdir, true).await
+    }
+
+    async fn exec_impl(
+        &self,
+        container: &str,
+        cmd: &[&str],
+        user: Option<&str>,
+        workdir: Option<&str>,
+        quiet: bool,
     ) -> Result<i64> {
         let exec = self
             .client
@@ -861,15 +885,26 @@ impl PodmanService {
             .await
             .context("Failed to start exec")?;
 
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+
         match result {
             StartExecResults::Attached { mut output, .. } => {
                 while let Some(chunk) = output.next().await {
                     match chunk {
                         Ok(bollard::container::LogOutput::StdOut { message }) => {
-                            tokio::io::stdout().write_all(&message).await?;
+                            if quiet {
+                                stdout_buf.extend_from_slice(&message);
+                            } else {
+                                tokio::io::stdout().write_all(&message).await?;
+                            }
                         }
                         Ok(bollard::container::LogOutput::StdErr { message }) => {
-                            tokio::io::stderr().write_all(&message).await?;
+                            if quiet {
+                                stderr_buf.extend_from_slice(&message);
+                            } else {
+                                tokio::io::stderr().write_all(&message).await?;
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -888,7 +923,19 @@ impl PodmanService {
             .await
             .context("Failed to inspect exec")?;
 
-        Ok(inspect.exit_code.unwrap_or(-1))
+        let exit_code = inspect.exit_code.unwrap_or(-1);
+
+        // If quiet mode and command failed, show the captured output
+        if quiet && exit_code != 0 {
+            if !stdout_buf.is_empty() {
+                tokio::io::stdout().write_all(&stdout_buf).await?;
+            }
+            if !stderr_buf.is_empty() {
+                tokio::io::stderr().write_all(&stderr_buf).await?;
+            }
+        }
+
+        Ok(exit_code)
     }
 
     /// Get container logs

@@ -285,7 +285,7 @@ impl DevaipodPod {
         let volume_already_exists = podman.volume_exists(&volume_name).await?;
 
         if !volume_already_exists {
-            tracing::info!("Creating workspace volume and cloning {}...", source.description());
+            tracing::debug!("Creating workspace volume and cloning {}...", source.description());
             podman
                 .create_volume(&volume_name)
                 .await
@@ -347,9 +347,9 @@ impl DevaipodPod {
                     exit_code
                 );
             }
-            tracing::info!("Cloned {}", source.description());
+            tracing::debug!("Cloned {}", source.description());
         } else {
-            tracing::info!("Using existing workspace volume '{}'", volume_name);
+            tracing::debug!("Using existing workspace volume '{}'", volume_name);
         }
 
         // Create the pod with metadata labels
@@ -459,7 +459,7 @@ impl DevaipodPod {
         let container_count = 2
             + if gator_container.is_some() { 1 } else { 0 }
             + if proxy_container.is_some() { 1 } else { 0 };
-        tracing::info!(
+        tracing::debug!(
             "Created pod '{}' with {} containers",
             pod_name,
             container_count
@@ -486,7 +486,7 @@ impl DevaipodPod {
             .await
             .with_context(|| format!("Failed to start pod: {}", self.pod_name))?;
 
-        tracing::info!("Started pod '{}'", self.pod_name);
+        tracing::debug!("Started pod '{}'", self.pod_name);
         Ok(())
     }
 
@@ -507,7 +507,7 @@ impl DevaipodPod {
         let poll_interval = Duration::from_millis(poll_interval_ms);
         let start = Instant::now();
 
-        tracing::info!("Waiting for agent to be ready...");
+        tracing::debug!("Waiting for agent to be ready...");
 
         loop {
             // Check if we've exceeded timeout
@@ -534,7 +534,7 @@ impl DevaipodPod {
 
             match result {
                 Ok(0) => {
-                    tracing::info!("Agent ready after {:.1}s", start.elapsed().as_secs_f64());
+                    tracing::debug!("Agent ready after {:.1}s", start.elapsed().as_secs_f64());
                     return Ok(());
                 }
                 Ok(_) | Err(_) => {
@@ -602,7 +602,7 @@ impl DevaipodPod {
         user: Option<&str>,
         home_override: Option<&str>,
     ) -> Result<()> {
-        tracing::info!("Installing dotfiles in {} from {}...", container, dotfiles.url);
+        tracing::debug!("Installing dotfiles in {} from {}...", container, dotfiles.url);
 
         // Optional HOME override (needed for agent container)
         let home_export = home_override
@@ -652,7 +652,7 @@ elif [ -f "./install-dotfiles.sh" ]; then
 elif [ -d "./dotfiles" ]; then
     # rsync dotfiles/ to home, preserving any existing files
     if command -v rsync >/dev/null 2>&1; then
-        rsync -av --ignore-existing ./dotfiles/ "$HOME/"
+        rsync -a --ignore-existing ./dotfiles/ "$HOME/"
     else
         cp -rn ./dotfiles/. "$HOME/" 2>/dev/null || cp -r ./dotfiles/. "$HOME/"
     fi
@@ -668,7 +668,7 @@ echo "Dotfiles installed successfully"
         };
 
         let exit_code = podman
-            .exec(
+            .exec_quiet(
                 container,
                 &["/bin/sh", "-c", &install_script],
                 user,
@@ -684,7 +684,7 @@ echo "Dotfiles installed successfully"
                 exit_code
             );
         } else {
-            tracing::info!("Dotfiles installed in {}", container);
+            tracing::debug!("Dotfiles installed in {}", container);
         }
 
         Ok(())
@@ -703,7 +703,7 @@ echo "Dotfiles installed successfully"
 
         // onCreateCommand
         if let Some(cmd) = &config.on_create_command {
-            tracing::info!("Running onCreateCommand...");
+            tracing::debug!("Running onCreateCommand...");
             self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
                 .await
                 .context("onCreateCommand failed")?;
@@ -711,7 +711,7 @@ echo "Dotfiles installed successfully"
 
         // postCreateCommand
         if let Some(cmd) = &config.post_create_command {
-            tracing::info!("Running postCreateCommand...");
+            tracing::debug!("Running postCreateCommand...");
             self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
                 .await
                 .context("postCreateCommand failed")?;
@@ -719,7 +719,7 @@ echo "Dotfiles installed successfully"
 
         // postStartCommand
         if let Some(cmd) = &config.post_start_command {
-            tracing::info!("Running postStartCommand...");
+            tracing::debug!("Running postStartCommand...");
             self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
                 .await
                 .context("postStartCommand failed")?;
@@ -875,7 +875,7 @@ echo "Configured opencode with service-gator MCP at {}"
                 exit_code
             );
         } else {
-            tracing::info!("Configured agent opencode with service-gator MCP");
+            tracing::debug!("Configured agent opencode with service-gator MCP");
         }
 
         Ok(())
@@ -974,10 +974,10 @@ fi
 echo "Nested podman configured successfully"
 "#;
 
-        tracing::info!("Configuring nested podman support...");
+        tracing::debug!("Configuring nested podman support...");
 
         let exit_code = podman
-            .exec(
+            .exec_quiet(
                 &self.workspace_container,
                 &["/bin/sh", "-c", script],
                 None,
@@ -987,7 +987,7 @@ echo "Nested podman configured successfully"
             .context("Failed to run nested podman configuration")?;
 
         if exit_code != 0 {
-            tracing::warn!(
+            tracing::debug!(
                 "Nested podman configuration returned exit code {} (may not be available)",
                 exit_code
             );

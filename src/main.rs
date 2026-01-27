@@ -40,6 +40,10 @@ struct HostCli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Quiet mode (only show warnings and errors)
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: HostCommand,
 }
@@ -271,25 +275,31 @@ async fn main() -> Result<()> {
     // Detect context BEFORE parsing args - this determines which CLI we use
     if is_inside_devcontainer() {
         // Container mode - use default log level
-        init_tracing(false);
+        init_tracing(false, false);
         let cli = ContainerCli::parse();
         run_container(cli)
     } else {
         // Host mode - parse CLI first to check for --verbose flag
         let cli = HostCli::parse();
-        init_tracing(cli.verbose);
+        init_tracing(cli.verbose, cli.quiet);
         run_host(cli).await
     }
 }
 
 /// Initialize tracing with the appropriate log level
-fn init_tracing(verbose: bool) {
+fn init_tracing(verbose: bool, quiet: bool) {
     let format = tracing_subscriber::fmt::format()
         .without_time()
         .with_target(false)
         .compact();
 
-    let default_level = if verbose { "debug" } else { "info" };
+    let default_level = if verbose {
+        "debug"
+    } else if quiet {
+        "warn"
+    } else {
+        "info"
+    };
 
     tracing_subscriber::fmt()
         .event_format(format)
@@ -503,7 +513,7 @@ async fn cmd_up(
     }
 
     // Start podman service
-    tracing::info!("Starting podman service...");
+    tracing::debug!("Starting podman service...");
     let podman = podman::PodmanService::spawn()
         .await
         .context("Failed to start podman service")?;
@@ -515,26 +525,16 @@ async fn cmd_up(
         .context("Failed to check pod status")?
     {
         if status.is_running() {
-            tracing::info!("Pod '{}' is already running", pod_name);
-            tracing::info!(
-                "  • SSH into workspace: podman exec -it {}-workspace bash",
-                pod_name
-            );
-            tracing::info!("  • Use 'devaipod ssh {}' to connect", pod_name);
+            tracing::info!("Pod '{}' already running", pod_name);
             return Ok(());
         } else {
             // Pod exists but is stopped - start it
-            tracing::info!("Pod '{}' exists but is stopped, starting...", pod_name);
+            tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
             podman
                 .start_pod(&pod_name)
                 .await
                 .context("Failed to start existing pod")?;
             tracing::info!("Pod '{}' started", pod_name);
-            tracing::info!(
-                "  • SSH into workspace: podman exec -it {}-workspace bash",
-                pod_name
-            );
-            tracing::info!("  • Use 'devaipod ssh {}' to connect", pod_name);
             return Ok(());
         }
     }
@@ -554,7 +554,7 @@ async fn cmd_up(
     let enable_network_isolation = config.network_isolation.enabled;
 
     // Create the pod with all containers
-    tracing::info!("Creating pod '{}'...", pod_name);
+    tracing::debug!("Creating pod '{}'...", pod_name);
     let source = pod::WorkspaceSource::LocalRepo(git_info);
 
     // Build extra labels for task description
@@ -579,7 +579,6 @@ async fn cmd_up(
     .context("Failed to create devaipod pod")?;
 
     // Start the pod
-    tracing::info!("Starting pod...");
     devaipod_pod
         .start(&podman)
         .await
@@ -593,7 +592,7 @@ async fn cmd_up(
 
     // Copy bind_home files into containers (using podman cp instead of bind mounts
     // to avoid permission issues with rootless podman)
-    tracing::info!("Copying bind_home files...");
+    tracing::debug!("Copying bind_home files...");
     devaipod_pod
         .copy_bind_home_files(
             &podman,
@@ -633,43 +632,27 @@ async fn cmd_up(
     }
 
     // Run lifecycle commands (onCreateCommand, postCreateCommand, postStartCommand)
-    tracing::info!("Running lifecycle commands...");
+    tracing::debug!("Running lifecycle commands...");
     devaipod_pod
         .run_lifecycle_commands(&podman, &devcontainer_config)
         .await
         .context("Failed to run lifecycle commands")?;
 
     // Success! Print connection info
-    tracing::info!("Pod '{}' started successfully.", pod_name);
+    tracing::info!("Pod '{}' ready", pod_name);
+    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
     tracing::info!(
-        "  • Workspace container: {}",
+        "  SSH: podman exec -it {} bash",
         devaipod_pod.workspace_container
     );
-    tracing::info!("  • Agent container: {}", devaipod_pod.agent_container);
-    if let Some(ref gator) = devaipod_pod.gator_container {
-        tracing::info!("  • Gator container: {}", gator);
-    }
-    tracing::info!("  • Agent server: http://localhost:{}", pod::OPENCODE_PORT);
-    tracing::info!(
-        "  • SSH into workspace: podman exec -it {} bash",
-        devaipod_pod.workspace_container
-    );
-    if let Some(task_desc) = task {
-        tracing::info!("  • Task: {}", task_desc);
-    }
 
     // Send task to agent if provided and not --no-prompt
     if let Some(task_desc) = task {
         if !no_prompt {
-            tracing::info!("Sending task to agent...");
+            tracing::debug!("Sending task to agent...");
             send_task_to_agent(task_desc).await?;
         }
     }
-
-    tracing::info!(
-        "Pod is running. Use 'podman pod stop {}' to stop.",
-        pod_name
-    );
 
     // Drop podman service - this will kill the service process
     // but the pod/containers will continue running since podman doesn't
@@ -694,8 +677,7 @@ async fn cmd_up_pr(
     ssh: bool,
 ) -> Result<()> {
     tracing::info!(
-        "Fetching {} PR #{} from {}/{}...",
-        pr_ref.forge_type,
+        "Setting up PR #{} ({}/{})...",
         pr_ref.number,
         pr_ref.owner,
         pr_ref.repo
@@ -706,15 +688,15 @@ async fn cmd_up_pr(
         .await
         .context("Failed to fetch PR information")?;
 
-    tracing::info!("PR: {}", pr_info.title);
-    tracing::info!("Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
+    tracing::debug!("PR: {}", pr_info.title);
+    tracing::debug!("Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
 
     // For PRs, we clone from the PR head to get the devcontainer.json from the PR
     // (not from upstream main, which may not have the devcontainer.json yet)
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_path = temp_dir.path();
 
-    tracing::info!("Cloning PR head to read devcontainer.json...");
+    tracing::debug!("Cloning PR head to read devcontainer.json...");
 
     // Clone from the PR's head repository and checkout the specific commit
     let clone_output = tokio::process::Command::new("git")
@@ -788,7 +770,7 @@ async fn cmd_up_pr(
 
     // Create the pod
     // Note: For PR workflows, we use the file-based service_gator config (no CLI override yet)
-    tracing::info!("Creating pod '{}'...", pod_name);
+    tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         temp_path, // Use temp path for image building context
@@ -805,7 +787,6 @@ async fn cmd_up_pr(
     .context("Failed to create devaipod pod")?;
 
     // Start the pod
-    tracing::info!("Starting pod...");
     devaipod_pod
         .start(&podman)
         .await
@@ -818,7 +799,7 @@ async fn cmd_up_pr(
         .context("Agent container failed to start")?;
 
     // Copy bind_home files
-    tracing::info!("Copying bind_home files...");
+    tracing::debug!("Copying bind_home files...");
     devaipod_pod
         .copy_bind_home_files(
             &podman,
@@ -850,40 +831,27 @@ async fn cmd_up_pr(
     }
 
     // Run lifecycle commands
-    tracing::info!("Running lifecycle commands...");
+    tracing::debug!("Running lifecycle commands...");
     devaipod_pod
         .run_lifecycle_commands(&podman, &devcontainer_config)
         .await
         .context("Failed to run lifecycle commands")?;
 
     // Success!
-    tracing::info!("Pod '{}' started successfully.", pod_name);
+    tracing::info!("Pod '{}' ready", pod_name);
+    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
     tracing::info!(
-        "  • Workspace container: {}",
+        "  SSH: podman exec -it {} bash",
         devaipod_pod.workspace_container
     );
-    tracing::info!("  • Agent container: {}", devaipod_pod.agent_container);
-    tracing::info!("  • Agent server: http://localhost:{}", pod::OPENCODE_PORT);
-    tracing::info!(
-        "  • SSH into workspace: podman exec -it {} bash",
-        devaipod_pod.workspace_container
-    );
-    if let Some(task_desc) = task {
-        tracing::info!("  • Task: {}", task_desc);
-    }
 
     // Send task to agent if provided and not --no-prompt
     if let Some(task_desc) = task {
         if !no_prompt {
-            tracing::info!("Sending task to agent...");
+            tracing::debug!("Sending task to agent...");
             send_task_to_agent(task_desc).await?;
         }
     }
-
-    tracing::info!(
-        "Pod is running. Use 'podman pod stop {}' to stop.",
-        pod_name
-    );
 
     drop(podman);
 
@@ -905,7 +873,7 @@ async fn cmd_up_remote(
     ssh: bool,
     service_gator_scopes: &[String],
 ) -> Result<()> {
-    tracing::info!("Cloning remote repository: {}", remote_url);
+    tracing::info!("Setting up {}...", remote_url);
 
     // Extract repo name from URL for naming
     let repo_name = git::extract_repo_name(remote_url)
@@ -915,7 +883,7 @@ async fn cmd_up_remote(
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_path = temp_dir.path();
 
-    tracing::info!("Cloning repository to read devcontainer.json...");
+    tracing::debug!("Cloning repository to read devcontainer.json...");
 
     // Clone the repository (shallow clone for speed)
     let clone_output = tokio::process::Command::new("git")
@@ -1017,7 +985,7 @@ async fn cmd_up_remote(
 
     if let Some((forge_type, ref owner_repo)) = auto_gator_info {
         if matches!(forge_type, forge::ForgeType::GitHub) {
-            tracing::info!("Auto-enabled service-gator for {} (read + draft PRs)", owner_repo);
+            tracing::debug!("Auto-enabled service-gator for {} (read + draft PRs)", owner_repo);
         }
     }
 
@@ -1029,11 +997,10 @@ async fn cmd_up_remote(
     // Check if pod already exists
     if let Some(status) = podman.get_pod_status(&pod_name).await? {
         if status.is_running() {
-            tracing::info!("Pod '{}' is already running", pod_name);
-            tracing::info!("  Use 'devaipod ssh {}' to connect", pod_name);
+            tracing::info!("Pod '{}' already running", pod_name);
             return Ok(());
         } else {
-            tracing::info!("Pod '{}' exists but is stopped, starting...", pod_name);
+            tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
             podman
                 .start_pod(&pod_name)
                 .await
@@ -1061,7 +1028,7 @@ async fn cmd_up_remote(
     }
 
     // Create the pod
-    tracing::info!("Creating pod '{}'...", pod_name);
+    tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         temp_path,
@@ -1078,7 +1045,6 @@ async fn cmd_up_remote(
     .context("Failed to create devaipod pod")?;
 
     // Start the pod
-    tracing::info!("Starting pod...");
     devaipod_pod
         .start(&podman)
         .await
@@ -1091,7 +1057,7 @@ async fn cmd_up_remote(
         .context("Agent container failed to start")?;
 
     // Copy bind_home files
-    tracing::info!("Copying bind_home files...");
+    tracing::debug!("Copying bind_home files...");
     devaipod_pod
         .copy_bind_home_files(
             &podman,
@@ -1130,36 +1096,23 @@ async fn cmd_up_remote(
     }
 
     // Run lifecycle commands
-    tracing::info!("Running lifecycle commands...");
+    tracing::debug!("Running lifecycle commands...");
     devaipod_pod
         .run_lifecycle_commands(&podman, &devcontainer_config)
         .await
         .context("Failed to run lifecycle commands")?;
 
     // Success!
-    tracing::info!("Pod '{}' started successfully.", pod_name);
-    tracing::info!(
-        "  Workspace container: {}",
-        devaipod_pod.workspace_container
-    );
-    tracing::info!("  Agent container: {}", devaipod_pod.agent_container);
-    tracing::info!("  Agent server: http://localhost:{}", pod::OPENCODE_PORT);
-    if let Some(task_desc) = task {
-        tracing::info!("  Task: {}", task_desc);
-    }
+    tracing::info!("Pod '{}' ready", pod_name);
+    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
 
     // Send task to agent if provided and not --no-prompt
     if let Some(task_desc) = task {
         if !no_prompt {
-            tracing::info!("Sending task to agent...");
+            tracing::debug!("Sending task to agent...");
             send_task_to_agent(task_desc).await?;
         }
     }
-
-    tracing::info!(
-        "Pod is running. Use 'podman pod stop {}' to stop.",
-        pod_name
-    );
 
     drop(podman);
 
@@ -1191,7 +1144,7 @@ async fn send_task_to_agent(task: &str) -> Result<()> {
         tracing::warn!("Agent returned {}: {}", status, body);
         // Don't fail - the pod is running, user can send task manually
     } else {
-        tracing::info!("Task sent to agent successfully");
+        tracing::debug!("Task sent to agent successfully");
     }
 
     Ok(())

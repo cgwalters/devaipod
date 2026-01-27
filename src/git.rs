@@ -2,6 +2,16 @@
 //!
 //! This module provides utilities for detecting git repository state and
 //! cloning repositories into containers.
+//!
+//! ## TODO: Git mirror support
+//!
+//! For faster cloning in environments with many workspaces, we should support
+//! local git mirrors/caches. This would allow:
+//! - Cloning from a local mirror instead of remote for frequently-used repos
+//! - Using `--reference` to share object storage between clones
+//! - Automatic mirror population/updates
+//!
+//! See: git clone --reference, git clone --dissociate
 
 use std::path::Path;
 use std::process::Command;
@@ -184,24 +194,16 @@ pub fn clone_script(git_info: &GitRepoInfo, workspace_folder: &str) -> Result<St
         )
     })?;
 
-    // Use depth 1 for faster cloning, then fetch the specific commit if needed
-    // /workspaces is mounted as tmpfs so it's writable
     let script = format!(
         r#"
 set -e
 echo "Cloning repository..."
 mkdir -p "$(dirname "{workspace}")"
 
-# Clone with depth 1 for speed (we'll fetch the specific commit if needed)
-git clone --depth 1 "{url}" "{workspace}" 2>&1
+# Full clone to ensure all history is available for git operations
+git clone "{url}" "{workspace}" 2>&1
 
 cd "{workspace}"
-
-# Fetch the specific commit if it's not in the shallow clone
-if ! git cat-file -e "{commit}" 2>/dev/null; then
-    echo "Fetching specific commit..."
-    git fetch --depth 1 origin "{commit}"
-fi
 
 # Checkout the exact commit
 git checkout "{commit}" 2>&1
@@ -292,16 +294,10 @@ set -e
 echo "Cloning PR #{number}: {title}"
 mkdir -p "$(dirname "{workspace}")"
 
-# Clone the PR head (fork) repository
-git clone --depth 1 --branch "{branch}" "{head_url}" "{workspace}" 2>&1
+# Full clone of PR head (fork) repository for complete git history
+git clone --branch "{branch}" "{head_url}" "{workspace}" 2>&1
 
 cd "{workspace}"
-
-# Fetch the specific commit if it's not in the shallow clone
-if ! git cat-file -e "{commit}" 2>/dev/null; then
-    echo "Fetching specific commit..."
-    git fetch --depth 1 origin "{commit}"
-fi
 
 # Checkout the exact commit
 git checkout "{commit}" 2>&1
@@ -338,8 +334,8 @@ set -e
 echo "Cloning repository from {url}..."
 mkdir -p "$(dirname "{workspace}")"
 
-# Clone the repository
-git clone --depth 1 --branch "{branch}" "{url}" "{workspace}" 2>&1
+# Full clone for complete git history
+git clone --branch "{branch}" "{url}" "{workspace}" 2>&1
 
 cd "{workspace}"
 {chown_cmd}
