@@ -27,6 +27,34 @@ use crate::podman::{ContainerConfig, MountConfig, PodmanService};
 /// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
 
+/// Attempt to resolve environment variable values containing devcontainer variable syntax.
+///
+/// Devcontainer supports variable substitution like `${containerEnv:PATH}` which cannot be
+/// fully resolved outside of VS Code. This function attempts partial resolution:
+///
+/// - For patterns like `${containerEnv:VAR}:/additional/path`, extracts the static suffix
+/// - Returns `None` if the value cannot be meaningfully resolved
+///
+/// Returns `Some(resolved_value)` if resolved, or `None` if the variable should be skipped.
+fn resolve_env_value(value: &str) -> Option<String> {
+    if !value.contains("${") {
+        return Some(value.to_string());
+    }
+
+    // For patterns like ${containerEnv:VAR}:/some/path, extract the static suffix
+    // This preserves useful paths like /usr/local/cargo/bin from PATH extensions
+    if let Some(idx) = value.find("}:") {
+        let suffix = &value[idx + 2..];
+        // Only use suffix if it's non-empty and doesn't contain more variable references
+        if !suffix.is_empty() && !suffix.contains("${") {
+            return Some(suffix.to_string());
+        }
+    }
+
+    // Cannot resolve this value
+    None
+}
+
 /// Port for the service-gator MCP server
 pub const GATOR_PORT: u16 = 8765;
 
@@ -622,9 +650,40 @@ echo "Dotfiles installed successfully"
         // Merge remote_env (these typically take precedence)
         env.extend(config.remote_env.clone());
 
-        // Filter out env vars containing devcontainer variable syntax like ${containerEnv:PATH}
-        // These cannot be resolved outside of VS Code and would be passed literally.
-        env.retain(|_key, value| !value.contains("${"));
+        // Resolve env vars containing devcontainer variable syntax like ${containerEnv:PATH}.
+        // These cannot be fully resolved outside of VS Code. We attempt partial resolution
+        // (e.g., extracting static suffixes) and warn about variables we can't resolve.
+        let mut skipped_vars = Vec::new();
+        env.retain(|key, value| {
+            if !value.contains("${") {
+                return true; // Keep as-is
+            }
+            // Try to resolve the value
+            if let Some(_resolved) = resolve_env_value(value) {
+                // Note: we can't update the value in-place here, so we'll do a second pass
+                true
+            } else {
+                skipped_vars.push(key.clone());
+                false
+            }
+        });
+
+        // Second pass: resolve values that contain variable references
+        for value in env.values_mut() {
+            if value.contains("${") {
+                if let Some(resolved) = resolve_env_value(value) {
+                    *value = resolved;
+                }
+            }
+        }
+
+        if !skipped_vars.is_empty() {
+            tracing::warn!(
+                "Skipping environment variables with unresolved references: {:?}. \
+                 Variable substitution like ${{containerEnv:PATH}} is not yet fully supported.",
+                skipped_vars
+            );
+        }
 
         // Tell opencode in workspace to connect to agent's server
         env.insert(
@@ -640,15 +699,30 @@ echo "Dotfiles installed successfully"
         }];
 
         // Auto-detect development devices to pass through
-        let devices: Vec<String> = DEV_PASSTHROUGH_PATHS
+        let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
             .iter()
             .filter(|path| Path::new(path).exists())
             .map(|path| path.to_string())
             .collect();
 
-        if !devices.is_empty() {
-            tracing::debug!("Auto-detected devices for workspace container: {:?}", devices);
+        // Add devices from runArgs (e.g., --device=/dev/kvm)
+        for device_arg in config.device_args() {
+            // Parse --device=/dev/foo format (--device /dev/foo is two separate args)
+            if let Some(device_spec) = device_arg.strip_prefix("--device=") {
+                // Handle potential :options suffix (e.g., /dev/kvm:rwm)
+                let path = device_spec.split(':').next().unwrap_or(device_spec);
+                if !path.is_empty() && !devices.contains(&path.to_string()) {
+                    devices.push(path.to_string());
+                }
+            }
         }
+
+        if !devices.is_empty() {
+            tracing::debug!("Devices for workspace container: {:?}", devices);
+        }
+
+        // Check if privileged mode is requested (either directly or via runArgs)
+        let privileged = config.privileged || config.has_privileged_run_arg();
 
         ContainerConfig {
             mounts,
@@ -690,7 +764,7 @@ exec sleep infinity
             no_new_privileges: false,
             devices,
             security_opts: config.security_opt.clone(),
-            privileged: config.privileged,
+            privileged,
             ..Default::default()
         }
     }
@@ -1096,6 +1170,120 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_env_value_no_variable() {
+        // Simple values without variables pass through unchanged
+        assert_eq!(
+            super::resolve_env_value("/usr/bin:/usr/local/bin"),
+            Some("/usr/bin:/usr/local/bin".to_string())
+        );
+        assert_eq!(
+            super::resolve_env_value("simple_value"),
+            Some("simple_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_value_extracts_suffix() {
+        // Pattern like ${containerEnv:PATH}:/additional/path should extract the suffix
+        assert_eq!(
+            super::resolve_env_value("${containerEnv:PATH}:/usr/local/cargo/bin"),
+            Some("/usr/local/cargo/bin".to_string())
+        );
+        // Multiple path components in suffix
+        assert_eq!(
+            super::resolve_env_value("${containerEnv:PATH}:/foo:/bar:/baz"),
+            Some("/foo:/bar:/baz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_env_value_unresolvable() {
+        // Pure variable reference with no static suffix
+        assert_eq!(super::resolve_env_value("${containerEnv:PATH}"), None);
+        // Variable reference with empty suffix
+        assert_eq!(super::resolve_env_value("${containerEnv:PATH}:"), None);
+        // Suffix that also contains variable references
+        assert_eq!(
+            super::resolve_env_value("${containerEnv:PATH}:${localEnv:HOME}"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_workspace_config_resolves_env_with_suffix() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut config = DevcontainerConfig::default();
+        // This is the pattern from bootc's devcontainer.json
+        config.remote_env.insert(
+            "PATH".to_string(),
+            "${containerEnv:PATH}:/usr/local/cargo/bin".to_string(),
+        );
+        // A simple env var that should pass through
+        config.remote_env.insert("SIMPLE".to_string(), "value".to_string());
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+        );
+
+        // PATH should be resolved to just the suffix
+        assert_eq!(
+            container_config.env.get("PATH"),
+            Some(&"/usr/local/cargo/bin".to_string())
+        );
+        // Simple var should pass through unchanged
+        assert_eq!(
+            container_config.env.get("SIMPLE"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_workspace_config_skips_unresolvable_env() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut config = DevcontainerConfig::default();
+        // Pure variable reference with no suffix - can't be resolved
+        config.remote_env.insert(
+            "UNRESOLVABLE".to_string(),
+            "${containerEnv:SOME_VAR}".to_string(),
+        );
+        // A simple env var that should pass through
+        config.remote_env.insert("SIMPLE".to_string(), "value".to_string());
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+        );
+
+        // UNRESOLVABLE should be skipped
+        assert!(
+            !container_config.env.contains_key("UNRESOLVABLE"),
+            "Unresolvable env var should be skipped"
+        );
+        // Simple var should pass through unchanged
+        assert_eq!(
+            container_config.env.get("SIMPLE"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[test]
     fn test_workspace_config_with_caps() {
         let project_path = Path::new("/project");
         let workspace_folder = "/workspaces/project";
@@ -1182,5 +1370,96 @@ mod tests {
         // Should NOT have proxy env vars set
         assert!(!container_config.env.contains_key("HTTP_PROXY"));
         assert!(!container_config.env.contains_key("HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn test_workspace_config_with_run_args_privileged() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut config = DevcontainerConfig::default();
+        // Set privileged via runArgs (like bootc does)
+        config.run_args = vec!["--privileged".to_string()];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+        );
+
+        // Privileged should be true from runArgs
+        assert!(
+            container_config.privileged,
+            "privileged should be true when --privileged is in runArgs"
+        );
+    }
+
+    #[test]
+    fn test_workspace_config_with_run_args_device() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut config = DevcontainerConfig::default();
+        // Add a device via runArgs
+        config.run_args = vec!["--device=/dev/custom".to_string()];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+        );
+
+        // Device should be in the devices list
+        assert!(
+            container_config.devices.contains(&"/dev/custom".to_string()),
+            "devices should include /dev/custom from runArgs"
+        );
+    }
+
+    #[test]
+    fn test_workspace_config_privileged_direct_vs_run_args() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        // Test direct privileged field
+        let mut config1 = DevcontainerConfig::default();
+        config1.privileged = true;
+
+        let container_config1 = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config1,
+            &bind_home,
+            container_home,
+        );
+        assert!(container_config1.privileged, "direct privileged field should work");
+
+        // Test both set
+        let mut config2 = DevcontainerConfig::default();
+        config2.privileged = true;
+        config2.run_args = vec!["--privileged".to_string()];
+
+        let container_config2 = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config2,
+            &bind_home,
+            container_home,
+        );
+        assert!(container_config2.privileged, "both set should still be privileged");
     }
 }

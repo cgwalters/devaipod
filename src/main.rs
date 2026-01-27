@@ -821,25 +821,61 @@ fn run_agent_with_task(workspace: &str, agent: &str, task: &str, repos: &[String
 }
 
 /// Attach to running AI agent
-fn cmd_attach(workspace: &str) -> Result<()> {
-    tracing::info!("Attaching to agent in {}...", workspace);
+///
+/// Uses podman exec to attach to a tmux session in the workspace container.
+/// If no tmux session exists, falls back to starting an interactive shell.
+fn cmd_attach(pod_name: &str) -> Result<()> {
+    let container = format!("{}-workspace", pod_name);
 
-    let status = ProcessCommand::new("devpod")
+    // First check if the container exists and is running
+    let check_output = podman_command()
+        .args(["container", "exists", &container])
+        .status();
+
+    match check_output {
+        Ok(status) if !status.success() => {
+            bail!(
+                "Container '{}' not found. Is the pod running?\n\
+                 Use 'devaipod list' to see running pods.",
+                container
+            );
+        }
+        Err(e) => {
+            bail!("Failed to check container status: {}", e);
+        }
+        _ => {}
+    }
+
+    tracing::info!("Attaching to agent in {}...", container);
+
+    // Try to attach to tmux session named "agent"
+    let status = podman_command()
         .args([
-            "ssh",
-            workspace,
-            "--",
+            "exec",
+            "-it",
+            &container,
             "tmux",
             "attach-session",
             "-t",
             "agent",
         ])
         .status()
-        .context("Failed to run devpod ssh")?;
+        .context("Failed to attach to workspace")?;
 
+    // If tmux session doesn't exist, fall back to interactive shell
     if !status.success() {
-        tracing::warn!("No agent session found. Starting shell...");
-        devpod::ssh(workspace, &[])?;
+        tracing::info!("No tmux session 'agent' found, starting interactive shell...");
+        let shell_status = podman_command()
+            .args(["exec", "-it", &container, "/bin/bash"])
+            .status()
+            .context("Failed to exec into workspace")?;
+
+        if !shell_status.success() {
+            bail!(
+                "Failed to start shell in container (exit code: {:?})",
+                shell_status.code()
+            );
+        }
     }
 
     Ok(())

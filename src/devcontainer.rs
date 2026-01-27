@@ -88,6 +88,10 @@ pub struct DevcontainerConfig {
     /// Tool-specific customizations (VS Code, devaipod, etc.)
     #[serde(default)]
     pub customizations: Option<Customizations>,
+
+    /// Additional arguments to pass to podman/docker run
+    #[serde(default)]
+    pub run_args: Vec<String>,
 }
 
 /// Tool-specific customizations in devcontainer.json
@@ -151,6 +155,7 @@ impl Default for DevcontainerConfig {
             cap_add: Vec::new(),
             security_opt: Vec::new(),
             customizations: None,
+            run_args: Vec::new(),
         }
     }
 }
@@ -323,6 +328,20 @@ impl DevcontainerConfig {
     /// Check if this configuration has any features defined
     pub fn has_features(&self) -> bool {
         !self.features.is_empty()
+    }
+
+    /// Check if --privileged is in runArgs
+    pub fn has_privileged_run_arg(&self) -> bool {
+        self.run_args.iter().any(|arg| arg == "--privileged")
+    }
+
+    /// Get device passthrough args from runArgs (e.g., --device=/dev/kvm)
+    pub fn device_args(&self) -> Vec<String> {
+        self.run_args
+            .iter()
+            .filter(|arg| arg.starts_with("--device"))
+            .cloned()
+            .collect()
     }
 }
 
@@ -614,5 +633,50 @@ mod tests {
         }"#;
         let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
         assert!(!config.has_features());
+    }
+
+    #[test]
+    fn test_parse_run_args() {
+        let json = r#"{
+            "image": "quay.io/centos-bootc/bootc:stream9",
+            "runArgs": ["--privileged"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.run_args, vec!["--privileged"]);
+        assert!(config.has_privileged_run_arg());
+    }
+
+    #[test]
+    fn test_run_args_with_devices() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--privileged", "--device=/dev/kvm", "--device=/dev/fuse:rwm"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert!(config.has_privileged_run_arg());
+
+        let device_args = config.device_args();
+        assert_eq!(device_args.len(), 2);
+        assert!(device_args.contains(&"--device=/dev/kvm".to_string()));
+        assert!(device_args.contains(&"--device=/dev/fuse:rwm".to_string()));
+    }
+
+    #[test]
+    fn test_run_args_empty() {
+        let config = DevcontainerConfig::default();
+        assert!(config.run_args.is_empty());
+        assert!(!config.has_privileged_run_arg());
+        assert!(config.device_args().is_empty());
+    }
+
+    #[test]
+    fn test_run_args_no_privileged() {
+        let json = r#"{
+            "image": "foo",
+            "runArgs": ["--device=/dev/kvm"]
+        }"#;
+        let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.has_privileged_run_arg());
+        assert_eq!(config.device_args(), vec!["--device=/dev/kvm"]);
     }
 }
