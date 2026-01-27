@@ -205,6 +205,9 @@ impl DevaipodPod {
     /// 4. Create workspace, agent, and optionally gator/proxy containers
     ///
     /// Note: Dotfiles installation happens after the pod starts via `install_dotfiles()`.
+    ///
+    /// The `service_gator_config` parameter should be the merged config from file + CLI.
+    /// If None, uses the config from `global_config.service_gator`.
     pub async fn create(
         podman: &PodmanService,
         project_path: &Path,
@@ -215,6 +218,7 @@ impl DevaipodPod {
         global_config: &Config,
         source: &WorkspaceSource,
         extra_labels: &[(String, String)],
+        service_gator_config: Option<&crate::config::ServiceGatorConfig>,
     ) -> Result<Self> {
         // Resolve bind_home configurations
         let container_home = Self::resolve_container_home(devcontainer_config);
@@ -349,6 +353,7 @@ impl DevaipodPod {
             &workspace_bind_home,
             &container_home,
             &volume_name,
+            global_config,
         );
         podman
             .create_container(&workspace_container, &image, pod_name, workspace_config)
@@ -400,6 +405,7 @@ impl DevaipodPod {
             Some(devcontainer_config),
             enable_network_isolation,
             &volume_name,
+            global_config,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -414,7 +420,9 @@ impl DevaipodPod {
                 .await
                 .context("Failed to pull service-gator image")?;
 
-            let gator_config = Self::gator_container_config();
+            // Use provided service_gator_config or fall back to global_config.service_gator
+            let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
+            let gator_config = Self::gator_container_config(Some(sg_config), global_config);
             podman
                 .create_container(&gator_container_name, GATOR_IMAGE, pod_name, gator_config)
                 .await
@@ -789,6 +797,69 @@ echo "Dotfiles installed successfully"
         Ok(())
     }
 
+    /// Configure opencode in the agent container to use service-gator MCP
+    ///
+    /// This writes the opencode configuration file inside the agent container
+    /// to include service-gator as an MCP server. The config is written via
+    /// podman exec since the agent's config dir is inside the container.
+    pub async fn configure_agent_opencode(
+        &self,
+        podman: &PodmanService,
+        sg_config: &crate::config::ServiceGatorConfig,
+    ) -> Result<()> {
+        if !sg_config.is_enabled() {
+            tracing::debug!("service-gator not enabled, skipping opencode MCP config");
+            return Ok(());
+        }
+
+        // The agent's HOME is /tmp/agent-home, and opencode config goes in ~/.config/opencode/
+        // service-gator runs in the gator container and is accessible at localhost:GATOR_PORT
+        let mcp_url = format!("http://localhost:{}/mcp", GATOR_PORT);
+
+        // Create the config JSON
+        let config_json = serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": {
+                "service-gator": {
+                    "type": "remote",
+                    "url": mcp_url,
+                    "enabled": true
+                }
+            }
+        });
+
+        let config_content = serde_json::to_string_pretty(&config_json)
+            .context("Failed to serialize opencode config")?;
+
+        // Write the config file inside the agent container
+        let script = format!(
+            r#"
+mkdir -p /tmp/agent-home/.config/opencode
+cat > /tmp/agent-home/.config/opencode/opencode.json << 'OPENCODE_CONFIG'
+{}
+OPENCODE_CONFIG
+echo "Configured opencode with service-gator MCP at {}"
+"#,
+            config_content, mcp_url
+        );
+
+        let exit_code = podman
+            .exec(&self.agent_container, &["/bin/sh", "-c", &script], None, None)
+            .await
+            .context("Failed to configure opencode in agent container")?;
+
+        if exit_code != 0 {
+            tracing::warn!(
+                "Failed to configure opencode in agent (exit code {})",
+                exit_code
+            );
+        } else {
+            tracing::info!("Configured agent opencode with service-gator MCP");
+        }
+
+        Ok(())
+    }
+
     /// Configure nested podman support in the workspace container
     ///
     /// This configures the container environment for running podman inside the container:
@@ -962,10 +1033,18 @@ echo "Nested podman configured successfully"
         _bind_home: &BindHomeConfig,
         _container_home: &str,
         volume_name: &str,
+        global_config: &crate::config::Config,
     ) -> ContainerConfig {
         let mut env = config.container_env.clone();
         // Merge remote_env (these typically take precedence)
         env.extend(config.remote_env.clone());
+
+        // Add env vars from global config (allowlist + explicit vars)
+        env.extend(global_config.env.collect());
+
+        // Add trusted env vars (these go to workspace and gator, NOT agent)
+        // This is where credentials like GH_TOKEN are forwarded for service-gator
+        env.extend(global_config.trusted_env.collect());
 
         // Resolve env vars containing devcontainer variable syntax like ${containerEnv:PATH}.
         // These cannot be fully resolved outside of VS Code. We attempt partial resolution
@@ -1111,6 +1190,7 @@ while true; do sleep 86400 & wait $!; done
         devcontainer_config: Option<&DevcontainerConfig>,
         use_proxy: bool,
         volume_name: &str,
+        global_config: &crate::config::Config,
     ) -> ContainerConfig {
         // Use /tmp as agent home - it's always writable and isolated per container.
         // In the future we could mount a named volume for persistent agent state.
@@ -1137,6 +1217,7 @@ while true; do sleep 86400 & wait $!; done
         // 1. DEVAIPOD_AGENT_* vars: strip prefix and forward (e.g., DEVAIPOD_AGENT_FOO=bar -> FOO=bar)
         // 2. Common API key env vars: forward as-is
         // 3. Vars from devcontainer.json customizations.devaipod.env_allowlist
+        // 4. Vars from global config env.allowlist and env.vars
         const API_KEY_VARS: &[&str] = &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -1169,6 +1250,9 @@ while true; do sleep 86400 & wait $!; done
                 env.insert(key, value);
             }
         }
+
+        // Add env vars from global config (allowlist + explicit vars)
+        env.extend(global_config.env.collect());
 
         // If network isolation is enabled, route traffic through the proxy
         if use_proxy {
@@ -1228,20 +1312,37 @@ while true; do sleep 86400 & wait $!; done
     /// Create container config for the gator (service-gator) container
     ///
     /// Runs with minimal privileges as an MCP server.
-    fn gator_container_config() -> ContainerConfig {
+    /// Receives trusted env vars (GH_TOKEN, etc.) and scope configuration.
+    fn gator_container_config(
+        sg_config: Option<&crate::config::ServiceGatorConfig>,
+        global_config: &Config,
+    ) -> ContainerConfig {
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), "/tmp".to_string());
+
+        // Add trusted env vars (GH_TOKEN, GITLAB_TOKEN, JIRA_API_TOKEN, etc.)
+        // These are the credentials that service-gator needs to access external services
+        env.extend(global_config.trusted_env.collect());
+
+        // Build the command with scope arguments from config
+        let mut command = vec![
+            "service-gator".to_string(),
+            "--mcp-server".to_string(),
+            format!("0.0.0.0:{}", GATOR_PORT),
+        ];
+
+        // Add scope arguments from service-gator config
+        if let Some(config) = sg_config {
+            let scope_args = crate::service_gator::config_to_cli_args(config);
+            command.extend(scope_args);
+        }
 
         ContainerConfig {
             mounts: vec![],
             env,
             workdir: None,
             user: None,
-            command: Some(vec![
-                "service-gator".to_string(),
-                "--mcp-server".to_string(),
-                format!("0.0.0.0:{}", GATOR_PORT),
-            ]),
+            command: Some(command),
             // Minimal privileges
             drop_all_caps: true,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
@@ -1282,6 +1383,7 @@ mod tests {
         let container_home = "/home/vscode";
 
         let volume_name = "test-volume";
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1290,6 +1392,7 @@ mod tests {
             &bind_home,
             container_home,
             volume_name,
+            &global_config,
         );
 
         // Volume mount for workspace
@@ -1319,6 +1422,7 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             project_path,
             workspace_folder,
@@ -1327,6 +1431,7 @@ mod tests {
             None,
             false,
             "test-volume",
+            &global_config,
         );
 
         // Volume mount for workspace
@@ -1366,6 +1471,7 @@ mod tests {
         };
         let container_home = "/home/vscode";
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             project_path,
             workspace_folder,
@@ -1374,6 +1480,7 @@ mod tests {
             None,
             false,
             "test-volume",
+            &global_config,
         );
 
         // No bind mounts - we clone the repo into the container instead
@@ -1387,7 +1494,8 @@ mod tests {
 
     #[test]
     fn test_gator_container_config() {
-        let container_config = DevaipodPod::gator_container_config();
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::gator_container_config(None, &global_config);
 
         // Verify no mounts (gator doesn't need project access)
         assert!(container_config.mounts.is_empty());
@@ -1405,6 +1513,28 @@ mod tests {
             container_config.cap_add,
             vec!["NET_BIND_SERVICE".to_string()]
         );
+    }
+
+    #[test]
+    fn test_gator_container_config_with_scopes() {
+        let mut sg_config = crate::config::ServiceGatorConfig::default();
+        sg_config.gh.repos.insert(
+            "myorg/myrepo".to_string(),
+            crate::config::GhRepoPermission {
+                read: true,
+                create_draft: true,
+                ..Default::default()
+            },
+        );
+
+        let global_config = crate::config::Config::default();
+        let container_config = DevaipodPod::gator_container_config(Some(&sg_config), &global_config);
+
+        // Verify command includes scope arguments
+        let cmd = container_config.command.as_ref().unwrap();
+        assert!(cmd.contains(&"--gh-repo".to_string()));
+        // The repo arg should contain myorg/myrepo
+        assert!(cmd.iter().any(|s| s.contains("myorg/myrepo")));
     }
 
     #[test]
@@ -1448,6 +1578,7 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1456,6 +1587,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
 
         // All devices in the config should actually exist on the host
@@ -1492,6 +1624,7 @@ mod tests {
             .remote_env
             .insert("BAZ".to_string(), "qux".to_string());
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1500,6 +1633,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
 
         assert_eq!(container_config.env.get("FOO"), Some(&"bar".to_string()));
@@ -1575,6 +1709,7 @@ mod tests {
             .remote_env
             .insert("SIMPLE".to_string(), "value".to_string());
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1583,6 +1718,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
 
         // PATH should include default PATH plus the suffix from devcontainer.json
@@ -1615,6 +1751,7 @@ mod tests {
             .remote_env
             .insert("SIMPLE".to_string(), "value".to_string());
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1623,6 +1760,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
 
         // UNRESOLVABLE should be skipped
@@ -1647,6 +1785,7 @@ mod tests {
         let mut config = DevcontainerConfig::default();
         config.cap_add = vec!["SYS_PTRACE".to_string()];
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1655,6 +1794,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
 
         assert_eq!(container_config.cap_add, vec!["SYS_PTRACE".to_string()]);
@@ -1686,6 +1826,7 @@ mod tests {
         let container_home = "/home/vscode";
 
         // Test with network isolation enabled
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             project_path,
             workspace_folder,
@@ -1694,6 +1835,7 @@ mod tests {
             None,
             true, // use_proxy
             "test-volume",
+            &global_config,
         );
 
         // Should have proxy env vars set
@@ -1714,6 +1856,7 @@ mod tests {
         let container_home = "/home/vscode";
 
         // Test without network isolation
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             project_path,
             workspace_folder,
@@ -1722,6 +1865,7 @@ mod tests {
             None,
             false, // no proxy
             "test-volume",
+            &global_config,
         );
 
         // Should NOT have proxy env vars set
@@ -1740,6 +1884,7 @@ mod tests {
         // Set privileged via runArgs (like bootc does)
         config.run_args = vec!["--privileged".to_string()];
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1748,6 +1893,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
 
         // Privileged should be true from runArgs
@@ -1768,6 +1914,7 @@ mod tests {
         // Add a device via runArgs
         config.run_args = vec!["--device=/dev/custom".to_string()];
 
+        let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1776,6 +1923,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
 
         // Device should be in the devices list
@@ -1798,6 +1946,7 @@ mod tests {
         let mut config1 = DevcontainerConfig::default();
         config1.privileged = true;
 
+        let global_config = crate::config::Config::default();
         let container_config1 = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -1806,6 +1955,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
         assert!(
             container_config1.privileged,
@@ -1825,6 +1975,7 @@ mod tests {
             &bind_home,
             container_home,
             "test-volume",
+            &global_config,
         );
         assert!(
             container_config2.privileged,

@@ -39,6 +39,14 @@ pub struct Config {
     /// Agent configuration
     #[serde(default)]
     pub agent: AgentConfig,
+    /// Environment variable configuration for containers
+    #[serde(default)]
+    pub env: EnvConfig,
+    /// Trusted environment variable configuration (workspace + gator only, NOT agent)
+    /// Use this for credentials like GH_TOKEN that should be available to
+    /// trusted containers but not the sandboxed AI agent.
+    #[serde(default, rename = "trusted")]
+    pub trusted_env: TrustedEnvConfig,
     /// Dotfiles configuration
     #[serde(default)]
     pub dotfiles: Option<DotfilesConfig>,
@@ -77,6 +85,90 @@ pub struct BindHomePaths {
     /// Paths relative to $HOME to bind mount
     #[serde(default)]
     pub paths: Vec<String>,
+}
+
+/// Environment variable configuration for containers
+///
+/// Configures environment variables to inject into both workspace and agent containers.
+/// This provides a central place to configure env vars needed for LLM providers,
+/// cloud credentials, editor preferences, etc.
+///
+/// Example configuration:
+/// ```toml
+/// [env]
+/// # Forward these env vars from host (if they exist)
+/// allowlist = ["GOOGLE_CLOUD_PROJECT", "SSH_AUTH_SOCK"]
+///
+/// # Set these explicitly
+/// [env.vars]
+/// VERTEX_LOCATION = "global"
+/// EDITOR = "vim"
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct EnvConfig {
+    /// Environment variable names to forward from host to containers.
+    /// These are looked up in the current environment when the pod is created.
+    /// If the variable doesn't exist on the host, it's silently skipped.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    /// Environment variables to set explicitly in containers.
+    /// These take precedence over allowlist if both specify the same key.
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
+}
+
+impl EnvConfig {
+    /// Collect environment variables to inject into containers.
+    ///
+    /// Returns a HashMap combining:
+    /// 1. Variables from allowlist (looked up in current environment)
+    /// 2. Variables from vars (explicit values, take precedence over allowlist)
+    pub fn collect(&self) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+
+        // First, add env vars from allowlist (looked up from current environment)
+        for key in &self.allowlist {
+            if let Ok(value) = std::env::var(key) {
+                result.insert(key.clone(), value);
+            }
+        }
+
+        // Then, add/override with explicit env vars
+        for (key, value) in &self.vars {
+            result.insert(key.clone(), value.clone());
+        }
+
+        result
+    }
+}
+
+/// Trusted environment variable configuration
+///
+/// These environment variables are forwarded to trusted containers only
+/// (workspace and gator), NOT to the sandboxed AI agent. This is where
+/// you configure credentials like GH_TOKEN that service-gator needs
+/// but that should not be exposed directly to the AI agent.
+///
+/// Example configuration:
+/// ```toml
+/// [trusted.env]
+/// allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
+///
+/// [trusted.env.vars]
+/// SOME_SECRET = "explicit_value"
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct TrustedEnvConfig {
+    /// Environment settings for trusted containers
+    #[serde(default)]
+    pub env: EnvConfig,
+}
+
+impl TrustedEnvConfig {
+    /// Collect environment variables for trusted containers.
+    pub fn collect(&self) -> HashMap<String, String> {
+        self.env.collect()
+    }
 }
 
 /// Dotfiles configuration for provisioning user dotfiles in workspaces
@@ -1399,5 +1491,223 @@ target = "all"
         assert_eq!(config.gpu.target, "workspace");
         assert!(!config.gpu.workspace_enabled(true));
         assert!(!config.gpu.agent_enabled(true));
+    }
+
+    // =========================================================================
+    // EnvConfig tests
+    // =========================================================================
+
+    #[test]
+    fn test_env_config_default() {
+        let config = EnvConfig::default();
+        assert!(config.allowlist.is_empty());
+        assert!(config.vars.is_empty());
+        assert!(config.collect().is_empty());
+    }
+
+    #[test]
+    fn test_parse_env_allowlist() {
+        let toml = r#"
+[env]
+allowlist = ["GOOGLE_CLOUD_PROJECT", "SSH_AUTH_SOCK", "VERTEX_LOCATION"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.env.allowlist.len(), 3);
+        assert!(config
+            .env
+            .allowlist
+            .contains(&"GOOGLE_CLOUD_PROJECT".to_string()));
+        assert!(config.env.allowlist.contains(&"SSH_AUTH_SOCK".to_string()));
+        assert!(config
+            .env
+            .allowlist
+            .contains(&"VERTEX_LOCATION".to_string()));
+    }
+
+    #[test]
+    fn test_parse_env_vars() {
+        let toml = r#"
+[env.vars]
+VERTEX_LOCATION = "global"
+EDITOR = "vim"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.env.vars.len(), 2);
+        assert_eq!(
+            config.env.vars.get("VERTEX_LOCATION"),
+            Some(&"global".to_string())
+        );
+        assert_eq!(config.env.vars.get("EDITOR"), Some(&"vim".to_string()));
+    }
+
+    #[test]
+    fn test_parse_env_combined() {
+        let toml = r#"
+[env]
+allowlist = ["GOOGLE_CLOUD_PROJECT"]
+
+[env.vars]
+VERTEX_LOCATION = "global"
+EDITOR = "vim"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.env.allowlist.len(), 1);
+        assert_eq!(config.env.vars.len(), 2);
+    }
+
+    #[test]
+    fn test_env_config_collect_with_vars() {
+        let mut env = EnvConfig::default();
+        env.vars.insert("FOO".to_string(), "bar".to_string());
+        env.vars.insert("BAZ".to_string(), "qux".to_string());
+
+        let collected = env.collect();
+        assert_eq!(collected.get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(collected.get("BAZ"), Some(&"qux".to_string()));
+    }
+
+    #[test]
+    fn test_env_config_vars_override_allowlist() {
+        // Set an env var that's in the allowlist
+        std::env::set_var("TEST_OVERRIDE_VAR", "from_env");
+
+        let mut env = EnvConfig::default();
+        env.allowlist.push("TEST_OVERRIDE_VAR".to_string());
+        // Explicit vars should override
+        env.vars
+            .insert("TEST_OVERRIDE_VAR".to_string(), "from_config".to_string());
+
+        let collected = env.collect();
+        assert_eq!(
+            collected.get("TEST_OVERRIDE_VAR"),
+            Some(&"from_config".to_string())
+        );
+
+        // Cleanup
+        std::env::remove_var("TEST_OVERRIDE_VAR");
+    }
+
+    #[test]
+    fn test_env_config_allowlist_skips_missing() {
+        let mut env = EnvConfig::default();
+        // This var shouldn't exist
+        env.allowlist
+            .push("DEFINITELY_NOT_SET_VAR_12345".to_string());
+
+        let collected = env.collect();
+        assert!(!collected.contains_key("DEFINITELY_NOT_SET_VAR_12345"));
+    }
+
+    // =========================================================================
+    // TrustedEnvConfig tests
+    // =========================================================================
+
+    #[test]
+    fn test_trusted_env_default() {
+        let config = TrustedEnvConfig::default();
+        assert!(config.env.allowlist.is_empty());
+        assert!(config.env.vars.is_empty());
+        assert!(config.collect().is_empty());
+    }
+
+    #[test]
+    fn test_parse_trusted_env_allowlist() {
+        let toml = r#"
+[trusted.env]
+allowlist = ["GH_TOKEN", "GITLAB_TOKEN", "JIRA_API_TOKEN"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.trusted_env.env.allowlist.len(), 3);
+        assert!(config
+            .trusted_env
+            .env
+            .allowlist
+            .contains(&"GH_TOKEN".to_string()));
+        assert!(config
+            .trusted_env
+            .env
+            .allowlist
+            .contains(&"GITLAB_TOKEN".to_string()));
+        assert!(config
+            .trusted_env
+            .env
+            .allowlist
+            .contains(&"JIRA_API_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn test_parse_trusted_env_vars() {
+        let toml = r#"
+[trusted.env.vars]
+SOME_SECRET = "explicit_value"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.trusted_env.env.vars.len(), 1);
+        assert_eq!(
+            config.trusted_env.env.vars.get("SOME_SECRET"),
+            Some(&"explicit_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_trusted_env_combined_with_regular_env() {
+        let toml = r#"
+# Regular env - goes to all containers including agent
+[env]
+allowlist = ["GOOGLE_CLOUD_PROJECT"]
+
+[env.vars]
+VERTEX_LOCATION = "global"
+
+# Trusted env - only goes to workspace and gator, NOT agent
+[trusted.env]
+allowlist = ["GH_TOKEN", "GITLAB_TOKEN"]
+
+[trusted.env.vars]
+JIRA_API_TOKEN = "from_config"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        // Regular env
+        assert_eq!(config.env.allowlist.len(), 1);
+        assert!(config
+            .env
+            .allowlist
+            .contains(&"GOOGLE_CLOUD_PROJECT".to_string()));
+        assert_eq!(config.env.vars.len(), 1);
+
+        // Trusted env - separate from regular
+        assert_eq!(config.trusted_env.env.allowlist.len(), 2);
+        assert!(config
+            .trusted_env
+            .env
+            .allowlist
+            .contains(&"GH_TOKEN".to_string()));
+        assert_eq!(config.trusted_env.env.vars.len(), 1);
+        assert_eq!(
+            config.trusted_env.env.vars.get("JIRA_API_TOKEN"),
+            Some(&"from_config".to_string())
+        );
+    }
+
+    #[test]
+    fn test_trusted_env_collect() {
+        std::env::set_var("TEST_TRUSTED_VAR", "trusted_value");
+
+        let mut trusted = TrustedEnvConfig::default();
+        trusted.env.allowlist.push("TEST_TRUSTED_VAR".to_string());
+        trusted
+            .env
+            .vars
+            .insert("EXPLICIT_VAR".to_string(), "explicit".to_string());
+
+        let collected = trusted.collect();
+        assert_eq!(
+            collected.get("TEST_TRUSTED_VAR"),
+            Some(&"trusted_value".to_string())
+        );
+        assert_eq!(collected.get("EXPLICIT_VAR"), Some(&"explicit".to_string()));
+
+        std::env::remove_var("TEST_TRUSTED_VAR");
     }
 }

@@ -54,6 +54,8 @@ enum HostCommand {
     ///   devaipod up .
     ///   devaipod up https://github.com/user/repo
     ///   devaipod up https://github.com/user/repo --agent goose
+    ///   devaipod up . --service-gator=github:readonly-all
+    ///   devaipod up . --service-gator=github:myorg/myrepo
     Up {
         /// Source: local path, git URL, or PR URL
         source: String,
@@ -84,6 +86,18 @@ enum HostCommand {
         /// SSH into workspace after starting
         #[arg(short = 'S', long)]
         ssh: bool,
+        /// Configure service-gator scopes for AI agent access to external services.
+        ///
+        /// Format: service:scope where service is github, gitlab, jira, etc.
+        /// Can be specified multiple times.
+        ///
+        /// Examples:
+        ///   --service-gator=github:readonly-all       # Read-only access to all GitHub repos
+        ///   --service-gator=github:myorg/myrepo       # Read access to specific repo
+        ///   --service-gator=github:myorg/*            # Read access to all repos in org
+        ///   --service-gator=github:myorg/repo:write   # Write access to specific repo
+        #[arg(long = "service-gator", value_name = "SCOPE")]
+        service_gator_scopes: Vec<String>,
     },
     /// Run an AI agent with a task
     ///
@@ -301,6 +315,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             dry_run,
             agent_sidecar,
             ssh,
+            service_gator_scopes,
         } => {
             cmd_up(
                 &config,
@@ -314,6 +329,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 dry_run,
                 agent_sidecar,
                 ssh,
+                &service_gator_scopes,
             )
             .await
         }
@@ -383,6 +399,7 @@ async fn cmd_up(
     dry_run: bool,
     _agent_sidecar: bool,
     ssh: bool,
+    service_gator_scopes: &[String],
 ) -> Result<()> {
     // Check if source is a PR/MR URL
     if let Some(pr_ref) = forge::parse_pr_url(source) {
@@ -512,8 +529,17 @@ async fn cmd_up(
         }
     }
 
-    // Check if gator should be enabled
-    let enable_gator = config.service_gator.is_enabled();
+    // Parse CLI service-gator scopes and merge with file config
+    let service_gator_config = if !service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(service_gator_scopes)
+            .context("Failed to parse --service-gator scopes")?;
+        service_gator::merge_configs(&config.service_gator, &cli_scopes)
+    } else {
+        config.service_gator.clone()
+    };
+
+    // Check if gator should be enabled (from merged config)
+    let enable_gator = service_gator_config.is_enabled();
     // Check if network isolation should be enabled
     let enable_network_isolation = config.network_isolation.enabled;
 
@@ -537,6 +563,7 @@ async fn cmd_up(
         config,
         &source,
         &extra_labels,
+        Some(&service_gator_config),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -567,6 +594,14 @@ async fn cmd_up(
         )
         .await
         .context("Failed to copy bind_home files")?;
+
+    // Configure opencode in agent container to use service-gator MCP
+    if enable_gator {
+        devaipod_pod
+            .configure_agent_opencode(&podman, &service_gator_config)
+            .await
+            .context("Failed to configure agent opencode")?;
+    }
 
     // Configure nested podman support (adjusts subuid/subgid for container's UID namespace)
     devaipod_pod
@@ -740,6 +775,7 @@ async fn cmd_up_pr(
     }
 
     // Create the pod
+    // Note: For PR workflows, we use the file-based service_gator config (no CLI override yet)
     tracing::info!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -751,6 +787,7 @@ async fn cmd_up_pr(
         config,
         &source,
         &extra_labels,
+        None, // Use config.service_gator for PR workflows
     )
     .await
     .context("Failed to create devaipod pod")?;

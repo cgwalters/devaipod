@@ -90,7 +90,17 @@ The agent container runs with restricted privileges:
 
 The workspace container retains normal privileges for development tasks.
 
-For controlled access to external services (like creating PRs), configure service-gator in your `~/.config/devaipod.toml`.
+For controlled access to external services (like creating PRs), use the `--service-gator` flag or configure in your `~/.config/devaipod.toml`:
+
+```bash
+# Grant the agent read-only access to all GitHub repos
+devaipod up . --service-gator=github:readonly-all
+
+# Grant read access to specific repos only
+devaipod up . --service-gator=github:myorg/myrepo
+```
+
+Credentials like `GH_TOKEN` are forwarded only to trusted containers (workspace, gator), never to the agent. See [Service-gator Integration](docs/service-gator.md) for full details.
 
 ### Network Isolation
 
@@ -103,9 +113,26 @@ enabled = true
 allowed_domains = ["api.custom.com"]  # Additional domains (LLM APIs allowed by default)
 ```
 
+### Global Environment Variables
+
+Configure environment variables to inject into all containers (workspace + agent) in `~/.config/devaipod.toml`:
+
+```toml
+[env]
+# Forward these from host environment (if they exist)
+allowlist = ["GOOGLE_CLOUD_PROJECT", "SSH_AUTH_SOCK", "VERTEX_LOCATION"]
+
+# Set these explicitly
+[env.vars]
+VERTEX_LOCATION = "global"
+EDITOR = "vim"
+```
+
+This is useful for cloud provider credentials, editor preferences, and other env vars needed in both containers.
+
 ### Per-Project Environment Variables
 
-Projects can specify which env vars to pass to the agent in devcontainer.json:
+Projects can specify additional env vars to pass to the agent in devcontainer.json:
 
 ```json
 {
