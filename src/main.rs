@@ -535,6 +535,12 @@ async fn cmd_up(
         .await
         .context("Failed to copy bind_home files")?;
 
+    // Configure nested podman support (adjusts subuid/subgid for container's UID namespace)
+    devaipod_pod
+        .configure_nested_podman(&podman)
+        .await
+        .context("Failed to configure nested podman")?;
+
     // Install dotfiles BEFORE lifecycle commands so bashrc, gitconfig, etc. are available
     if let Some(ref dotfiles) = config.dotfiles {
         devaipod_pod
