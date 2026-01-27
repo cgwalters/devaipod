@@ -14,6 +14,7 @@ mod compose;
 mod config;
 mod devcontainer;
 mod devpod;
+#[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
 mod pod;
 mod podman;
