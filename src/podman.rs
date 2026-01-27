@@ -15,12 +15,11 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use bollard::container::{
-    Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
+    LogsOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::BuildImageOptions;
-use bollard::models::{HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
 use color_eyre::eyre::{bail, Context, Result};
 use futures_util::StreamExt;
@@ -194,6 +193,7 @@ impl PodmanService {
     }
 
     /// Get the bollard client
+    #[allow(dead_code)] // Part of public API for future use
     pub fn client(&self) -> &Docker {
         &self.client
     }
@@ -370,6 +370,7 @@ impl PodmanService {
     }
 
     /// Stop a pod
+    #[allow(dead_code)] // Part of public API, will be used by stop command
     pub async fn stop_pod(&self, name: &str) -> Result<()> {
         let output = self
             .podman_command()
@@ -391,6 +392,7 @@ impl PodmanService {
     }
 
     /// Remove a pod and all its containers
+    #[allow(dead_code)] // Part of public API, will be used by delete command
     pub async fn remove_pod(&self, name: &str, force: bool) -> Result<()> {
         let mut args: Vec<&str> = vec!["pod", "rm"];
         if force {
@@ -497,6 +499,7 @@ impl PodmanService {
     }
 
     /// Start a container
+    #[allow(dead_code)] // Part of public API
     pub async fn start_container(&self, name: &str) -> Result<()> {
         self.client
             .start_container(name, None::<StartContainerOptions<String>>)
@@ -507,6 +510,7 @@ impl PodmanService {
     }
 
     /// Stop a container
+    #[allow(dead_code)] // Part of public API
     pub async fn stop_container(&self, name: &str, timeout_secs: i64) -> Result<()> {
         let options = StopContainerOptions { t: timeout_secs };
         self.client
@@ -762,7 +766,7 @@ pub struct MountConfig {
 
 /// Create a tar archive of a directory
 async fn create_tar_archive(path: &Path) -> Result<Vec<u8>> {
-    use std::io::Write;
+    
 
     let path = path.to_path_buf();
     

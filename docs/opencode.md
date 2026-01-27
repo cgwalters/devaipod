@@ -69,7 +69,7 @@ To use a different agent, specify it with `--agent`:
 devaipod run --git . --agent goose "fix the bug"
 ```
 
-Or set a default in `~/.config/devc.toml`:
+Or set a default in `~/.config/devaipod.toml`:
 
 ```toml
 [agent]

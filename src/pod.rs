@@ -30,7 +30,8 @@ const GATOR_IMAGE: &str = "ghcr.io/cgwalters/service-gator:latest";
 pub struct BindHomeConfig {
     /// Paths to bind (relative to $HOME)
     pub paths: Vec<String>,
-    /// Whether mounts should be read-only
+    /// Whether mounts should be read-only (used for agent container mounts)
+    #[allow(dead_code)] // Will be used when implementing readonly bind mounts
     pub readonly: bool,
 }
 
@@ -53,8 +54,10 @@ pub struct DevaipodPod {
     /// Name of the gator container (if enabled)
     pub gator_container: Option<String>,
     /// Name of the proxy container (if network isolation enabled)
+    #[allow(dead_code)] // Used for container management
     pub proxy_container: Option<String>,
     /// The image used for workspace and agent containers
+    #[allow(dead_code)] // Stored for reference, used in operations
     pub image: String,
     /// Workspace folder inside the container
     pub workspace_folder: String,
@@ -487,6 +490,7 @@ echo "Dotfiles installed successfully"
     }
 
     /// Stop the pod
+    #[allow(dead_code)] // Part of public API, will be used by stop command
     pub async fn stop(&self, podman: &PodmanService) -> Result<()> {
         podman
             .stop_pod(&self.pod_name)
@@ -498,6 +502,7 @@ echo "Dotfiles installed successfully"
     }
 
     /// Remove the pod and all containers
+    #[allow(dead_code)] // Part of public API, will be used by delete command
     pub async fn remove(&self, podman: &PodmanService, force: bool) -> Result<()> {
         podman
             .remove_pod(&self.pod_name, force)

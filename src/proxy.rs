@@ -11,7 +11,7 @@
 //! - This provides defense-in-depth without requiring special privileges
 
 use crate::config::NetworkIsolationConfig;
-use crate::podman::{ContainerConfig, MountConfig};
+use crate::podman::ContainerConfig;
 
 /// Port for the squid proxy
 pub const PROXY_PORT: u16 = 3128;

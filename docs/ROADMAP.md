@@ -45,9 +45,10 @@ Making devaipod reliable for daily use:
   - Dedicated agent image with opencode pre-installed
   - Runtime install of opencode into workspace image
   - Sidecar approach with shared volume
-- **Network sandboxing for agent**: Restrict agent network access to LLM API
-  endpoints only. Options include HTTPS proxy with allowlist, iptables rules
-  in network namespace, or DNS-based filtering.
+- **Network sandboxing for agent**: ✅ Implemented via HTTPS proxy with
+  domain allowlist. Enable with `[network-isolation] enabled = true` in config.
+  Default allowed domains include api.anthropic.com, api.openai.com, etc.
+  Additional domains can be configured globally or per-project.
 
 ## Phase 3: Kubernetes Support
 
@@ -84,9 +85,9 @@ Current constraints that users should be aware of:
 - **Agent requires opencode in the image**: The agent container runs `opencode
   serve`, so opencode must be installed in the devcontainer image. There's no
   automatic injection yet.
-- **No network isolation yet**: Agent has full network access. This is needed
-  for LLM API calls, but also means the agent could exfiltrate data to
-  arbitrary endpoints.
+- **Network isolation is optional**: By default, agent has full network access.
+  Enable `[network-isolation] enabled = true` to restrict to LLM API endpoints.
+  Non-HTTP traffic is not blocked by the proxy (use for HTTP/HTTPS APIs only).
 - **Lifecycle commands only run in workspace**: onCreateCommand etc. run in
   the workspace container, not the agent container. The agent starts with
   whatever is in the image.

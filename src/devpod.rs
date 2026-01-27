@@ -154,6 +154,7 @@ pub fn ssh(workspace: &str, command: &[String]) -> Result<()> {
 }
 
 /// Run `devpod list` to show workspaces
+#[allow(dead_code)] // Part of devpod integration, kept for potential future use
 pub fn list(json: bool) -> Result<()> {
     let mut cmd = Command::new("devpod");
     configure_devpod_env(&mut cmd);
@@ -186,6 +187,7 @@ pub fn list(json: bool) -> Result<()> {
 }
 
 /// Run `devpod stop` to stop a workspace
+#[allow(dead_code)] // Part of devpod integration, kept for potential future use
 pub fn stop(workspace: &str) -> Result<()> {
     tracing::info!("Stopping workspace '{}'", workspace);
 
@@ -212,6 +214,7 @@ pub fn stop(workspace: &str) -> Result<()> {
 }
 
 /// Run `devpod delete` to delete a workspace
+#[allow(dead_code)] // Part of devpod integration, kept for potential future use
 pub fn delete(workspace: &str, force: bool) -> Result<()> {
     tracing::info!("Deleting workspace '{}'", workspace);
 

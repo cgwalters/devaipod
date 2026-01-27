@@ -17,8 +17,10 @@ use serde::Deserialize;
 ///
 /// We only parse the fields we need for our multi-container setup.
 /// The full spec has many more fields, but we intentionally keep this minimal.
+/// Some fields are parsed for future use but not yet implemented.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields are parsed for forward compatibility, used incrementally
 pub struct DevcontainerConfig {
     /// Container name (used for naming the pod)
     pub name: Option<String>,

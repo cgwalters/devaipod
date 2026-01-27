@@ -76,6 +76,8 @@ extension or the CLI workflow.
 - **Sandboxed agent** - agent container runs with dropped capabilities, no-new-privileges
 - **Workspace shims** - `oc` and `opencode-agent` commands run `opencode attach http://localhost:4096`
 - **API keys from environment** - agent receives `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.
+- **Network isolation** - optionally restrict agent to allowed LLM API domains via proxy
+- **Env allowlist** - per-project env vars in devcontainer.json customizations
 - **Toolbox compatible** - works inside toolbox containers
 
 ## Security
@@ -90,6 +92,31 @@ The workspace container retains normal privileges for development tasks.
 
 For controlled access to external services (like creating PRs), configure service-gator in your `~/.config/devaipod.toml`.
 
+### Network Isolation
+
+When enabled, agent network access is restricted to allowed LLM API endpoints via an HTTPS proxy:
+
+```toml
+# ~/.config/devaipod.toml
+[network-isolation]
+enabled = true
+allowed_domains = ["api.custom.com"]  # Additional domains (LLM APIs allowed by default)
+```
+
+### Per-Project Environment Variables
+
+Projects can specify which env vars to pass to the agent in devcontainer.json:
+
+```json
+{
+  "customizations": {
+    "devaipod": {
+      "envAllowlist": ["MY_API_KEY", "CUSTOM_TOKEN"]
+    }
+  }
+}
+```
+
 ## Status
 
 | Feature | Status |
@@ -100,7 +127,8 @@ For controlled access to external services (like creating PRs), configure servic
 | Dockerfile builds | ✅ Working |
 | Lifecycle commands | ✅ Working |
 | service-gator integration | ✅ Optional |
-| Network isolation | 🟡 Not yet (full network access) |
+| Network isolation | ✅ Optional (proxy-based) |
+| Env allowlist | ✅ Working |
 
 ## Documentation
 
