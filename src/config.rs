@@ -52,6 +52,9 @@ pub struct Config {
     /// Service-gator MCP server configuration
     #[serde(default, rename = "service-gator")]
     pub service_gator: ServiceGatorConfig,
+    /// Network isolation configuration for agent container
+    #[serde(default, rename = "network-isolation")]
+    pub network_isolation: NetworkIsolationConfig,
     /// Bind paths from host $HOME to container $HOME (applies to all containers)
     /// Paths are relative to $HOME on both sides
     #[serde(default)]
@@ -104,10 +107,70 @@ pub const AGENT_ENV_PREFIX: &str = "DEVAIPOD_AGENT_";
 /// Default agent to use when none is specified in config or CLI.
 pub const DEFAULT_AGENT: &str = "opencode";
 
-// TODO: Support a static allowlist in devcontainer.json, e.g.:
-// "customizations": { "devaipod": { "env_allowlist": ["ANTHROPIC_API_KEY"] } }
-// This would let projects define which env vars the agent needs without
-// requiring users to set DEVAIPOD_AGENT_* prefixes.
+// =============================================================================
+// Network isolation configuration
+// =============================================================================
+
+/// Default domains allowed for agent network access (LLM API endpoints)
+pub const DEFAULT_ALLOWED_DOMAINS: &[&str] = &[
+    "api.anthropic.com",
+    "api.openai.com",
+    "api.together.xyz",
+    "generativelanguage.googleapis.com",
+    "api.groq.com",
+    "api.mistral.ai",
+    "openrouter.ai",
+    "api.cohere.ai",
+    "api.x.ai",
+];
+
+/// Network isolation configuration for the agent container
+///
+/// Uses an HTTPS forward proxy to restrict agent network access to
+/// only allowed domains (LLM API endpoints). This provides defense-in-depth
+/// security without requiring special privileges.
+#[derive(Debug, Deserialize, Clone)]
+pub struct NetworkIsolationConfig {
+    /// Whether to enable network isolation (default: false)
+    /// When enabled, the agent can only access domains in the allowlist.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Additional domains to allow beyond the defaults
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Proxy image to use (default: docker.io/ubuntu/squid:latest)
+    #[serde(default)]
+    pub proxy_image: Option<String>,
+}
+
+impl Default for NetworkIsolationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: Vec::new(),
+            proxy_image: None,
+        }
+    }
+}
+
+impl NetworkIsolationConfig {
+    /// Get all allowed domains (defaults + user-configured)
+    pub fn all_allowed_domains(&self) -> Vec<String> {
+        let mut domains: Vec<String> = DEFAULT_ALLOWED_DOMAINS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        domains.extend(self.allowed_domains.clone());
+        domains
+    }
+
+    /// Get the proxy image to use
+    pub fn proxy_image(&self) -> &str {
+        self.proxy_image
+            .as_deref()
+            .unwrap_or("docker.io/ubuntu/squid:latest")
+    }
+}
 
 /// Collect environment variables prefixed with DEVAIPOD_AGENT_ and return them
 /// with the prefix stripped.
@@ -988,5 +1051,47 @@ paths = [".config/gcloud/application_default_credentials.json"]
         assert!(config.bind_home.is_empty());
         assert!(config.bind_home_workspace.is_none());
         assert!(config.bind_home_agent.is_none());
+    }
+
+    #[test]
+    fn test_parse_network_isolation() {
+        let toml = r#"
+[network-isolation]
+enabled = true
+allowed_domains = ["api.custom.com", "internal.example.org"]
+proxy_image = "my-proxy:latest"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.network_isolation.enabled);
+        assert_eq!(
+            config.network_isolation.allowed_domains,
+            vec!["api.custom.com", "internal.example.org"]
+        );
+        assert_eq!(
+            config.network_isolation.proxy_image,
+            Some("my-proxy:latest".to_string())
+        );
+    }
+
+    #[test]
+    fn test_network_isolation_defaults() {
+        let config = NetworkIsolationConfig::default();
+        assert!(!config.enabled);
+        assert!(config.allowed_domains.is_empty());
+        assert!(config.proxy_image.is_none());
+        assert_eq!(config.proxy_image(), "docker.io/ubuntu/squid:latest");
+    }
+
+    #[test]
+    fn test_network_isolation_all_domains() {
+        let mut config = NetworkIsolationConfig::default();
+        config.allowed_domains = vec!["custom.api.com".to_string()];
+
+        let all_domains = config.all_allowed_domains();
+
+        // Should contain defaults + custom
+        assert!(all_domains.contains(&"api.anthropic.com".to_string()));
+        assert!(all_domains.contains(&"api.openai.com".to_string()));
+        assert!(all_domains.contains(&"custom.api.com".to_string()));
     }
 }

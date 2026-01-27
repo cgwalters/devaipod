@@ -180,7 +180,7 @@ services:
       retries: 30
 
   gator:
-    image: ghcr.io/devaipod/service-gator:latest
+    image: ghcr.io/cgwalters/service-gator:latest
     environment:
       - GH_TOKEN
       - JIRA_API_TOKEN

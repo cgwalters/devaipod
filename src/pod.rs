@@ -159,6 +159,7 @@ impl DevaipodPod {
             &workspace_folder,
             &agent_bind_home,
             &container_home,
+            Some(devcontainer_config),
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -574,11 +575,15 @@ exec sleep infinity
     /// - Drops all capabilities except NET_BIND_SERVICE
     /// - Sets no-new-privileges
     /// - Uses a separate home directory
+    ///
+    /// If `devcontainer_config` is provided, env vars from its `customizations.devaipod.env_allowlist`
+    /// will be forwarded to the agent.
     fn agent_container_config(
         project_path: &Path,
         workspace_folder: &str,
         bind_home: &BindHomeConfig,
         _container_home: &str,
+        devcontainer_config: Option<&DevcontainerConfig>,
     ) -> ContainerConfig {
         // Use /tmp as agent home - it's always writable and isolated per container.
         // In the future we could mount a named volume for persistent agent state.
@@ -595,6 +600,7 @@ exec sleep infinity
         // Forward API keys to the agent container for LLM access
         // 1. DEVAIPOD_AGENT_* vars: strip prefix and forward (e.g., DEVAIPOD_AGENT_FOO=bar -> FOO=bar)
         // 2. Common API key env vars: forward as-is
+        // 3. Vars from devcontainer.json customizations.devaipod.env_allowlist
         const API_KEY_VARS: &[&str] = &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -617,6 +623,13 @@ exec sleep infinity
                 }
             } else if API_KEY_VARS.contains(&key.as_str()) {
                 // Forward common API key vars directly
+                env.insert(key, value);
+            }
+        }
+
+        // Forward env vars from devcontainer.json's customizations.devaipod.env_allowlist
+        if let Some(config) = devcontainer_config {
+            for (key, value) in config.collect_allowlist_env_vars() {
                 env.insert(key, value);
             }
         }
@@ -764,6 +777,7 @@ mod tests {
             workspace_folder,
             &bind_home,
             container_home,
+            None,
         );
 
         // Verify mounts
@@ -806,6 +820,7 @@ mod tests {
             workspace_folder,
             &bind_home,
             container_home,
+            None,
         );
 
         // Agent should only have the project mount, not bind_home mounts
