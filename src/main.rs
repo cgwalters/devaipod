@@ -580,6 +580,11 @@ async fn cmd_up(
             .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
             .await
             .context("Failed to install dotfiles")?;
+        // Also install in agent container so .gitconfig is available for git operations
+        devaipod_pod
+            .install_dotfiles_agent(&podman, dotfiles)
+            .await
+            .context("Failed to install dotfiles in agent")?;
     }
 
     // Run lifecycle commands (onCreateCommand, postCreateCommand, postStartCommand)
@@ -788,6 +793,11 @@ async fn cmd_up_pr(
             .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
             .await
             .context("Failed to install dotfiles")?;
+        // Also install in agent container so .gitconfig is available for git operations
+        devaipod_pod
+            .install_dotfiles_agent(&podman, dotfiles)
+            .await
+            .context("Failed to install dotfiles in agent")?;
     }
 
     // Run lifecycle commands

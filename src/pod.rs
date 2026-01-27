@@ -520,6 +520,41 @@ impl DevaipodPod {
     ///
     /// This should be called after the pod starts but BEFORE lifecycle commands,
     /// so that bashrc, gitconfig, and other dotfiles are available for lifecycle scripts.
+    pub async fn install_dotfiles(
+        &self,
+        podman: &PodmanService,
+        dotfiles: &DotfilesConfig,
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.install_dotfiles_in_container(
+            podman,
+            dotfiles,
+            &self.workspace_container,
+            user,
+            None, // use container's HOME
+        )
+        .await
+    }
+
+    /// Install dotfiles in the agent container
+    ///
+    /// This ensures .gitconfig and other dotfiles are available for git operations.
+    pub async fn install_dotfiles_agent(
+        &self,
+        podman: &PodmanService,
+        dotfiles: &DotfilesConfig,
+    ) -> Result<()> {
+        self.install_dotfiles_in_container(
+            podman,
+            dotfiles,
+            &self.agent_container,
+            None,
+            Some("/tmp/agent-home"), // agent uses explicit HOME
+        )
+        .await
+    }
+
+    /// Install dotfiles in a container
     ///
     /// The install process:
     /// 1. Clone the dotfiles repo to a temp directory
@@ -530,22 +565,27 @@ impl DevaipodPod {
     /// 1. If `install.sh` exists, run it
     /// 2. Else if `install-dotfiles.sh` exists, run it
     /// 3. Else if `dotfiles/` directory exists, rsync to home
-    pub async fn install_dotfiles(
+    async fn install_dotfiles_in_container(
         &self,
         podman: &PodmanService,
         dotfiles: &DotfilesConfig,
+        container: &str,
         user: Option<&str>,
+        home_override: Option<&str>,
     ) -> Result<()> {
-        tracing::info!("Installing dotfiles from {}...", dotfiles.url);
+        tracing::info!("Installing dotfiles in {} from {}...", container, dotfiles.url);
+
+        // Optional HOME override (needed for agent container)
+        let home_export = home_override
+            .map(|h| format!("export HOME={}\n", h))
+            .unwrap_or_default();
 
         // Build the installation script
-        // We clone to a temp dir, run the install, then clean up
         let install_script = if let Some(script) = &dotfiles.script {
-            // User specified a custom script
             format!(
                 r#"
 set -e
-DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
+{home_export}DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
 rm -rf "$DOTFILES_TMP"
 git clone --depth 1 "{url}" "$DOTFILES_TMP"
 cd "$DOTFILES_TMP"
@@ -560,15 +600,15 @@ fi
 rm -rf "$DOTFILES_TMP"
 echo "Dotfiles installed successfully"
 "#,
+                home_export = home_export,
                 url = dotfiles.url,
                 script = script
             )
         } else {
-            // Default behavior: try install.sh, install-dotfiles.sh, or rsync dotfiles/
             format!(
                 r#"
 set -e
-DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
+{home_export}DOTFILES_TMP="$HOME/.dotfiles-install-tmp"
 rm -rf "$DOTFILES_TMP"
 git clone --depth 1 "{url}" "$DOTFILES_TMP"
 cd "$DOTFILES_TMP"
@@ -593,28 +633,29 @@ fi
 rm -rf "$DOTFILES_TMP"
 echo "Dotfiles installed successfully"
 "#,
+                home_export = home_export,
                 url = dotfiles.url
             )
         };
 
         let exit_code = podman
             .exec(
-                &self.workspace_container,
+                container,
                 &["/bin/sh", "-c", &install_script],
                 user,
                 Some(&self.workspace_folder),
             )
             .await
-            .context("Failed to install dotfiles")?;
+            .with_context(|| format!("Failed to install dotfiles in {}", container))?;
 
         if exit_code != 0 {
-            // Log warning but don't fail - dotfiles are nice to have, not critical
             tracing::warn!(
-                "Dotfiles installation exited with code {}. Continuing anyway.",
+                "Dotfiles installation in {} exited with code {}. Continuing anyway.",
+                container,
                 exit_code
             );
         } else {
-            tracing::info!("Dotfiles installed successfully");
+            tracing::info!("Dotfiles installed in {}", container);
         }
 
         Ok(())
