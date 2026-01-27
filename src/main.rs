@@ -406,23 +406,33 @@ async fn cmd_up(
         return cmd_up_pr(config, pr_ref, task, no_prompt, dry_run, ssh).await;
     }
 
-    // Resolve local paths
-    let source_path = if source.starts_with("http://")
+    // Resolve local paths - if it looks like a URL, treat it as remote
+    let is_remote_url = source.starts_with("http://")
         || source.starts_with("https://")
-        || source.starts_with("git@")
-    {
-        None
-    } else {
-        std::path::Path::new(source).canonicalize().ok()
-    };
+        || source.starts_with("git@");
 
-    // Podman-native path requires a local path (can't modify remote repos)
+    if is_remote_url {
+        return cmd_up_remote(
+            config,
+            source,
+            task,
+            no_prompt,
+            dry_run,
+            ssh,
+            service_gator_scopes,
+        )
+        .await;
+    }
+
+    let source_path = std::path::Path::new(source).canonicalize().ok();
+
+    // Local path is required for non-remote sources
     let project_path = match source_path {
         Some(ref p) => p,
         None => {
             bail!(
-                "Podman-native mode requires a local path, not a remote URL. \
-                 Clone the repository first and use the local path."
+                "Path '{}' does not exist or is not accessible.",
+                source
             );
         }
     };
@@ -858,6 +868,242 @@ async fn cmd_up_pr(
     );
     if let Some(task_desc) = task {
         tracing::info!("  • Task: {}", task_desc);
+    }
+
+    // Send task to agent if provided and not --no-prompt
+    if let Some(task_desc) = task {
+        if !no_prompt {
+            tracing::info!("Sending task to agent...");
+            send_task_to_agent(task_desc).await?;
+        }
+    }
+
+    tracing::info!(
+        "Pod is running. Use 'podman pod stop {}' to stop.",
+        pod_name
+    );
+
+    drop(podman);
+
+    // SSH into workspace if requested
+    if ssh {
+        return cmd_ssh(&pod_name, false, &[]);
+    }
+
+    Ok(())
+}
+
+/// Start a development environment from a remote git URL
+async fn cmd_up_remote(
+    config: &config::Config,
+    remote_url: &str,
+    task: Option<&str>,
+    no_prompt: bool,
+    dry_run: bool,
+    ssh: bool,
+    service_gator_scopes: &[String],
+) -> Result<()> {
+    tracing::info!("Cloning remote repository: {}", remote_url);
+
+    // Extract repo name from URL for naming
+    let repo_name = git::extract_repo_name(remote_url)
+        .unwrap_or_else(|| "project".to_string());
+
+    // Clone the repository to a temp directory to read devcontainer.json and get default branch
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_path = temp_dir.path();
+
+    tracing::info!("Cloning repository to read devcontainer.json...");
+
+    // Clone the repository (shallow clone for speed)
+    let clone_output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            remote_url,
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to clone repository")?;
+
+    if !clone_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_output.stderr);
+        bail!("Failed to clone repository: {}", stderr);
+    }
+
+    // Get the default branch name
+    let branch_output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(temp_path)
+        .output()
+        .await
+        .context("Failed to get default branch")?;
+
+    let default_branch = if branch_output.status.success() {
+        String::from_utf8_lossy(&branch_output.stdout).trim().to_string()
+    } else {
+        "main".to_string() // Fallback
+    };
+
+    // Find and load devcontainer.json from the cloned repo
+    let devcontainer_json_path = devcontainer::find_devcontainer_json(temp_path)?;
+    let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
+
+    // Derive pod name from repo name
+    let pod_name = format!(
+        "devaipod-{}",
+        repo_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .collect::<String>()
+    );
+
+    if dry_run {
+        tracing::info!("Dry run mode - would create pod '{}'", pod_name);
+        tracing::info!("  Remote URL: {}", remote_url);
+        tracing::info!("  Default branch: {}", default_branch);
+        if let Some(task_desc) = task {
+            tracing::info!("  Task: {}", task_desc);
+        }
+        return Ok(());
+    }
+
+    // Start podman service
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    // Check if pod already exists
+    if let Some(status) = podman.get_pod_status(&pod_name).await? {
+        if status.is_running() {
+            tracing::info!("Pod '{}' is already running", pod_name);
+            tracing::info!("  Use 'devaipod ssh {}' to connect", pod_name);
+            return Ok(());
+        } else {
+            tracing::info!("Pod '{}' exists but is stopped, starting...", pod_name);
+            podman
+                .start_pod(&pod_name)
+                .await
+                .context("Failed to start existing pod")?;
+            tracing::info!("Pod '{}' started", pod_name);
+            return Ok(());
+        }
+    }
+
+    // Parse CLI service-gator scopes and merge with file config
+    let service_gator_config = if !service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(service_gator_scopes)
+            .context("Failed to parse --service-gator scopes")?;
+        service_gator::merge_configs(&config.service_gator, &cli_scopes)
+    } else {
+        config.service_gator.clone()
+    };
+
+    let enable_gator = service_gator_config.is_enabled();
+    let enable_network_isolation = config.network_isolation.enabled;
+
+    // Create source from remote repo info
+    let remote_info = git::RemoteRepoInfo {
+        remote_url: remote_url.to_string(),
+        default_branch: default_branch.clone(),
+        repo_name: repo_name.clone(),
+    };
+    let source = pod::WorkspaceSource::RemoteRepo(remote_info);
+
+    // Build extra labels for task description
+    let mut extra_labels = Vec::new();
+    if let Some(task_desc) = task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
+    }
+
+    // Create the pod
+    tracing::info!("Creating pod '{}'...", pod_name);
+    let devaipod_pod = pod::DevaipodPod::create(
+        &podman,
+        temp_path,
+        &devcontainer_config,
+        &pod_name,
+        enable_gator,
+        enable_network_isolation,
+        config,
+        &source,
+        &extra_labels,
+        Some(&service_gator_config),
+    )
+    .await
+    .context("Failed to create devaipod pod")?;
+
+    // Start the pod
+    tracing::info!("Starting pod...");
+    devaipod_pod
+        .start(&podman)
+        .await
+        .context("Failed to start pod")?;
+
+    // Wait for the agent to be ready
+    devaipod_pod
+        .wait_for_agent_ready(&podman, 120, 500)
+        .await
+        .context("Agent container failed to start")?;
+
+    // Copy bind_home files
+    tracing::info!("Copying bind_home files...");
+    devaipod_pod
+        .copy_bind_home_files(
+            &podman,
+            &devaipod_pod.workspace_bind_home,
+            &devaipod_pod.agent_bind_home,
+            &devaipod_pod.container_home,
+            devcontainer_config.effective_user(),
+        )
+        .await
+        .context("Failed to copy bind_home files")?;
+
+    // Configure opencode in agent container to use service-gator MCP
+    if enable_gator {
+        devaipod_pod
+            .configure_agent_opencode(&podman, &service_gator_config)
+            .await
+            .context("Failed to configure agent opencode")?;
+    }
+
+    // Configure nested podman
+    devaipod_pod
+        .configure_nested_podman(&podman)
+        .await
+        .context("Failed to configure nested podman")?;
+
+    // Install dotfiles
+    if let Some(ref dotfiles) = config.dotfiles {
+        devaipod_pod
+            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
+            .await
+            .context("Failed to install dotfiles")?;
+        devaipod_pod
+            .install_dotfiles_agent(&podman, dotfiles)
+            .await
+            .context("Failed to install dotfiles in agent")?;
+    }
+
+    // Run lifecycle commands
+    tracing::info!("Running lifecycle commands...");
+    devaipod_pod
+        .run_lifecycle_commands(&podman, &devcontainer_config)
+        .await
+        .context("Failed to run lifecycle commands")?;
+
+    // Success!
+    tracing::info!("Pod '{}' started successfully.", pod_name);
+    tracing::info!(
+        "  Workspace container: {}",
+        devaipod_pod.workspace_container
+    );
+    tracing::info!("  Agent container: {}", devaipod_pod.agent_container);
+    tracing::info!("  Agent server: http://localhost:{}", pod::OPENCODE_PORT);
+    if let Some(task_desc) = task {
+        tracing::info!("  Task: {}", task_desc);
     }
 
     // Send task to agent if provided and not --no-prompt

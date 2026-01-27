@@ -13,13 +13,15 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Context, Result};
 
 use crate::forge::PullRequestInfo;
-use crate::git::GitRepoInfo;
+use crate::git::{GitRepoInfo, RemoteRepoInfo};
 
-/// Source for workspace content - either a local git repo or a PR/MR
+/// Source for workspace content - local git repo, remote URL, or PR/MR
 #[derive(Debug, Clone)]
 pub enum WorkspaceSource {
     /// Local git repository
     LocalRepo(GitRepoInfo),
+    /// Remote git repository (URL only)
+    RemoteRepo(RemoteRepoInfo),
     /// Pull/Merge request from a forge
     PullRequest(PullRequestInfo),
 }
@@ -41,6 +43,13 @@ impl WorkspaceSource {
                 }
                 labels
             }
+            WorkspaceSource::RemoteRepo(remote_info) => {
+                let mut labels = Vec::new();
+                if let Some(repo) = extract_repo_from_url(&remote_info.remote_url) {
+                    labels.push(("io.devaipod.repo".to_string(), repo));
+                }
+                labels
+            }
             WorkspaceSource::PullRequest(pr_info) => pr_info.to_labels(),
         }
     }
@@ -51,6 +60,9 @@ impl WorkspaceSource {
             WorkspaceSource::LocalRepo(git_info) => {
                 format!("commit {}", &git_info.commit_sha[..8.min(git_info.commit_sha.len())])
             }
+            WorkspaceSource::RemoteRepo(remote_info) => {
+                format!("branch {}", remote_info.default_branch)
+            }
             WorkspaceSource::PullRequest(pr_info) => {
                 format!("PR #{}", pr_info.pr_ref.number)
             }
@@ -60,13 +72,14 @@ impl WorkspaceSource {
     /// Get the project name for workspace folder derivation
     ///
     /// For local repos, this comes from the path.
-    /// For PRs, this is the repository name.
+    /// For remote repos and PRs, this is the repository name.
     pub fn project_name(&self, fallback_path: &std::path::Path) -> String {
         match self {
             WorkspaceSource::LocalRepo(_) => fallback_path
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".to_string()),
+            WorkspaceSource::RemoteRepo(remote_info) => remote_info.repo_name.clone(),
             WorkspaceSource::PullRequest(pr_info) => pr_info.pr_ref.repo.clone(),
         }
     }
@@ -300,6 +313,14 @@ impl DevaipodPod {
                     let git_dir = git_info.local_path.join(".git");
                     let bind = format!("{}:/mnt/host-git:ro", git_dir.display());
                     (script, vec![bind])
+                }
+                WorkspaceSource::RemoteRepo(remote_info) => {
+                    let script = crate::git::clone_remote_script(
+                        remote_info,
+                        &workspace_folder,
+                        target_user.as_deref(),
+                    );
+                    (script, vec![])
                 }
                 WorkspaceSource::PullRequest(pr_info) => {
                     let script = crate::git::clone_pr_script(pr_info, &workspace_folder);

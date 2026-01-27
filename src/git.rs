@@ -26,6 +26,17 @@ pub struct GitRepoInfo {
     pub dirty_files: Vec<String>,
 }
 
+/// Information about a remote git repository (URL only, no local clone)
+#[derive(Debug, Clone)]
+pub struct RemoteRepoInfo {
+    /// Remote URL to clone from
+    pub remote_url: String,
+    /// Default branch name (e.g., "main", "master")
+    pub default_branch: String,
+    /// Repository name (extracted from URL)
+    pub repo_name: String,
+}
+
 /// Detect git repository information from a local path
 ///
 /// Returns information about the git repository at the given path,
@@ -311,6 +322,66 @@ echo "PR #{number} cloned successfully at commit {short_commit}"
     )
 }
 
+/// Generate a shell script to clone from a remote git URL
+///
+/// The script will:
+/// 1. Clone the repository's default branch
+/// 2. Chown to the target user if specified
+pub fn clone_remote_script(
+    remote_info: &RemoteRepoInfo,
+    workspace_folder: &str,
+    target_user: Option<&str>,
+) -> String {
+    format!(
+        r#"
+set -e
+echo "Cloning repository from {url}..."
+mkdir -p "$(dirname "{workspace}")"
+
+# Clone the repository
+git clone --depth 1 --branch "{branch}" "{url}" "{workspace}" 2>&1
+
+cd "{workspace}"
+{chown_cmd}
+echo "Repository cloned successfully"
+"#,
+        url = remote_info.remote_url,
+        workspace = workspace_folder,
+        branch = remote_info.default_branch,
+        chown_cmd = target_user
+            .map(|u| format!(
+                "# Set ownership to target user\nchown -R {u}:{u} \"{workspace_folder}\""
+            ))
+            .unwrap_or_default(),
+    )
+}
+
+/// Extract repository name from a git URL
+///
+/// Handles both HTTPS and SSH formats:
+/// - https://github.com/owner/repo.git -> repo
+/// - git@github.com:owner/repo.git -> repo
+pub fn extract_repo_name(url: &str) -> Option<String> {
+    // Handle SSH format: git@github.com:owner/repo.git
+    if url.starts_with("git@") {
+        let path = url.rsplit(':').next()?;
+        let repo = path.rsplit('/').next()?;
+        return Some(repo.trim_end_matches(".git").to_string());
+    }
+
+    // Handle HTTPS format: https://github.com/owner/repo.git
+    if let Ok(parsed) = url::Url::parse(url) {
+        let path = parsed
+            .path()
+            .trim_start_matches('/')
+            .trim_end_matches(".git");
+        let repo = path.rsplit('/').next()?;
+        return Some(repo.to_string());
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +587,50 @@ mod tests {
 
         assert!(script.contains("git clone"));
         assert!(!script.contains("chown"));
+    }
+
+    #[test]
+    fn test_extract_repo_name_https() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/repo.git"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/repo"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name("https://gitlab.com/group/subgroup/project.git"),
+            Some("project".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_ssh() {
+        assert_eq!(
+            extract_repo_name("git@github.com:owner/repo.git"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name("git@gitlab.com:group/project.git"),
+            Some("project".to_string())
+        );
+    }
+
+    #[test]
+    fn test_clone_remote_script() {
+        let info = RemoteRepoInfo {
+            remote_url: "https://github.com/owner/repo.git".to_string(),
+            default_branch: "main".to_string(),
+            repo_name: "repo".to_string(),
+        };
+
+        let script = clone_remote_script(&info, "/workspaces/repo", Some("devenv"));
+
+        assert!(script.contains("git clone"));
+        assert!(script.contains("https://github.com/owner/repo.git"));
+        assert!(script.contains("/workspaces/repo"));
+        assert!(script.contains("--branch \"main\""));
+        assert!(script.contains("chown -R devenv:devenv"));
     }
 }
