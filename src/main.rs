@@ -709,29 +709,31 @@ async fn cmd_up_pr(
     tracing::info!("PR: {}", pr_info.title);
     tracing::info!("Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
 
-    // For PRs, we need to clone the upstream repo to get devcontainer.json
-    // Create a temp directory to clone into
+    // For PRs, we clone from the PR head to get the devcontainer.json from the PR
+    // (not from upstream main, which may not have the devcontainer.json yet)
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_path = temp_dir.path();
 
-    tracing::info!("Cloning upstream repository to read devcontainer.json...");
+    tracing::info!("Cloning PR head to read devcontainer.json...");
 
-    // Clone upstream repo (shallow, just to get devcontainer.json)
+    // Clone from the PR's head repository and checkout the specific commit
     let clone_output = tokio::process::Command::new("git")
         .args([
             "clone",
             "--depth",
             "1",
-            &pr_ref.upstream_url(),
+            "--branch",
+            &pr_info.head_ref,
+            &pr_info.head_clone_url,
             temp_path.to_str().unwrap(),
         ])
         .output()
         .await
-        .context("Failed to clone upstream repository")?;
+        .context("Failed to clone PR head repository")?;
 
     if !clone_output.status.success() {
         let stderr = String::from_utf8_lossy(&clone_output.stderr);
-        bail!("Failed to clone upstream repository: {}", stderr);
+        bail!("Failed to clone PR head repository: {}", stderr);
     }
 
     // Find and load devcontainer.json from the cloned repo
