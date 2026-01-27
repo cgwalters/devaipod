@@ -1,0 +1,367 @@
+//! Git repository detection and operations
+//!
+//! This module provides utilities for detecting git repository state and
+//! cloning repositories into containers.
+
+use std::path::Path;
+use std::process::Command;
+
+use color_eyre::eyre::{bail, Context, Result};
+
+/// Information about a git repository's state
+#[derive(Debug, Clone)]
+pub struct GitRepoInfo {
+    /// Remote URL (None if no remote configured)
+    pub remote_url: Option<String>,
+    /// Current commit SHA (full 40-character hash)
+    pub commit_sha: String,
+    /// Current branch name (None if detached HEAD)
+    pub branch: Option<String>,
+    /// Whether the working tree has uncommitted changes
+    pub is_dirty: bool,
+    /// List of uncommitted file paths (for warning messages)
+    pub dirty_files: Vec<String>,
+}
+
+/// Detect git repository information from a local path
+///
+/// Returns information about the git repository at the given path,
+/// including remote URL, current commit, branch, and dirty state.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The path is not a git repository
+/// - Git commands fail to execute
+pub fn detect_git_info(project_path: &Path) -> Result<GitRepoInfo> {
+    // Check if it's a git repo
+    let git_dir = project_path.join(".git");
+    if !git_dir.exists() {
+        bail!(
+            "Not a git repository: {}\n\
+             devaipod requires a git repository to clone into containers.\n\
+             Initialize with: git init && git remote add origin <url>",
+            project_path.display()
+        );
+    }
+
+    // Get remote URL (try 'origin' first, then any remote)
+    let remote_url =
+        get_remote_url(project_path, "origin").or_else(|| get_first_remote_url(project_path));
+
+    // Get current commit SHA
+    let commit_output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_path)
+        .output()
+        .context("Failed to run git rev-parse HEAD")?;
+
+    if !commit_output.status.success() {
+        bail!("Failed to get current commit. Is this a git repository with at least one commit?");
+    }
+
+    let commit_sha = String::from_utf8_lossy(&commit_output.stdout)
+        .trim()
+        .to_string();
+
+    // Get current branch (returns None for detached HEAD)
+    let branch = get_current_branch(project_path);
+
+    // Check for uncommitted changes
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project_path)
+        .output()
+        .context("Failed to check git status")?;
+
+    let status_str = String::from_utf8_lossy(&status_output.stdout);
+    let dirty_files: Vec<String> = status_str
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            // Status format: "XY filename" where XY is 2 chars
+            if l.len() > 3 {
+                l[3..].to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+
+    let is_dirty = !dirty_files.is_empty();
+
+    Ok(GitRepoInfo {
+        remote_url,
+        commit_sha,
+        branch,
+        is_dirty,
+        dirty_files,
+    })
+}
+
+/// Get the URL for a specific remote
+fn get_remote_url(project_path: &Path, remote_name: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", remote_name])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+    None
+}
+
+/// Get the URL for the first available remote
+fn get_first_remote_url(project_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["remote"])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let remotes = String::from_utf8_lossy(&output.stdout);
+        if let Some(first_remote) = remotes.lines().next() {
+            return get_remote_url(project_path, first_remote);
+        }
+    }
+    None
+}
+
+/// Get the current branch name
+fn get_current_branch(project_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !branch.is_empty() {
+            return Some(branch);
+        }
+    }
+    None
+}
+
+/// Generate a shell script to clone and checkout a repository
+///
+/// The script will:
+/// 1. Clone the repository to the workspace folder
+/// 2. Checkout the specific commit
+/// 3. Optionally checkout a branch if tracking
+pub fn clone_script(git_info: &GitRepoInfo, workspace_folder: &str) -> Result<String> {
+    let remote_url = git_info.remote_url.as_ref().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No git remote configured.\n\
+             devaipod requires a git remote to clone into containers.\n\
+             Configure with: git remote add origin <url>"
+        )
+    })?;
+
+    // Use depth 1 for faster cloning, then fetch the specific commit if needed
+    // /workspaces is mounted as tmpfs so it's writable
+    let script = format!(
+        r#"
+set -e
+echo "Cloning repository..."
+mkdir -p "$(dirname "{workspace}")"
+
+# Clone with depth 1 for speed (we'll fetch the specific commit if needed)
+git clone --depth 1 "{url}" "{workspace}" 2>&1
+
+cd "{workspace}"
+
+# Fetch the specific commit if it's not in the shallow clone
+if ! git cat-file -e "{commit}" 2>/dev/null; then
+    echo "Fetching specific commit..."
+    git fetch --depth 1 origin "{commit}"
+fi
+
+# Checkout the exact commit
+git checkout "{commit}" 2>&1
+
+echo "Repository cloned successfully at commit {short_commit}"
+"#,
+        url = remote_url,
+        workspace = workspace_folder,
+        commit = git_info.commit_sha,
+        short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
+    );
+
+    Ok(script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_detect_git_info_not_a_repo() {
+        let temp = TempDir::new().unwrap();
+        let result = detect_git_info(temp.path());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Not a git repository"));
+    }
+
+    #[test]
+    fn test_detect_git_info_empty_repo() {
+        let temp = TempDir::new().unwrap();
+
+        // Initialize git repo
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        // Configure git user for this repo
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        // No commits yet - should fail
+        let result = detect_git_info(temp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detect_git_info_with_commit() {
+        let temp = TempDir::new().unwrap();
+
+        // Initialize and make a commit
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        fs::write(temp.path().join("test.txt"), "hello").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        let info = detect_git_info(temp.path()).unwrap();
+
+        assert!(info.remote_url.is_none()); // No remote configured
+        assert_eq!(info.commit_sha.len(), 40); // Full SHA
+        assert!(!info.is_dirty);
+        assert!(info.dirty_files.is_empty());
+    }
+
+    #[test]
+    fn test_detect_git_info_dirty() {
+        let temp = TempDir::new().unwrap();
+
+        // Initialize and make a commit
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        fs::write(temp.path().join("test.txt"), "hello").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        // Make a dirty change
+        fs::write(temp.path().join("dirty.txt"), "uncommitted").unwrap();
+
+        let info = detect_git_info(temp.path()).unwrap();
+
+        assert!(info.is_dirty);
+        assert!(!info.dirty_files.is_empty());
+    }
+
+    #[test]
+    fn test_clone_script_no_remote() {
+        let info = GitRepoInfo {
+            remote_url: None,
+            commit_sha: "abc123".to_string(),
+            branch: None,
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let result = clone_script(&info, "/workspaces/test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No git remote"));
+    }
+
+    #[test]
+    fn test_clone_script_with_remote() {
+        let info = GitRepoInfo {
+            remote_url: Some("https://github.com/test/repo.git".to_string()),
+            commit_sha: "abc123def456".to_string(),
+            branch: Some("main".to_string()),
+            is_dirty: false,
+            dirty_files: vec![],
+        };
+
+        let script = clone_script(&info, "/workspaces/test").unwrap();
+
+        assert!(script.contains("git clone"));
+        assert!(script.contains("https://github.com/test/repo.git"));
+        assert!(script.contains("/workspaces/test"));
+        assert!(script.contains("abc123def456"));
+    }
+}

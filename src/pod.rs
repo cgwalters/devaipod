@@ -22,21 +22,27 @@ const DEV_PASSTHROUGH_PATHS: &[&str] = &["/dev/fuse", "/dev/net/tun", "/dev/kvm"
 
 use crate::config::{Config, DotfilesConfig};
 use crate::devcontainer::DevcontainerConfig;
-use crate::podman::{ContainerConfig, MountConfig, PodmanService};
+use crate::podman::{ContainerConfig, PodmanService};
 
 /// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
+
+/// Default PATH for containers when we need to synthesize one.
+/// This covers the standard locations where utilities are typically found.
+const DEFAULT_CONTAINER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Attempt to resolve environment variable values containing devcontainer variable syntax.
 ///
 /// Devcontainer supports variable substitution like `${containerEnv:PATH}` which cannot be
 /// fully resolved outside of VS Code. This function attempts partial resolution:
 ///
-/// - For patterns like `${containerEnv:VAR}:/additional/path`, extracts the static suffix
+/// - For PATH patterns like `${containerEnv:PATH}:/additional/path`, prepends a default PATH
+///   to the static suffix to ensure essential directories are included
+/// - For other patterns like `${containerEnv:VAR}:/some/path`, extracts the static suffix
 /// - Returns `None` if the value cannot be meaningfully resolved
 ///
 /// Returns `Some(resolved_value)` if resolved, or `None` if the variable should be skipped.
-fn resolve_env_value(value: &str) -> Option<String> {
+fn resolve_env_value(value: &str, var_name: &str) -> Option<String> {
     if !value.contains("${") {
         return Some(value.to_string());
     }
@@ -47,6 +53,13 @@ fn resolve_env_value(value: &str) -> Option<String> {
         let suffix = &value[idx + 2..];
         // Only use suffix if it's non-empty and doesn't contain more variable references
         if !suffix.is_empty() && !suffix.contains("${") {
+            // Special handling for PATH: prepend a sensible default PATH to ensure
+            // essential utilities (mkdir, chmod, grep, etc.) are available.
+            // Without this, containers may fail to start because the PATH only
+            // contains the extension (e.g., /usr/local/cargo/bin) without /usr/bin.
+            if var_name == "PATH" {
+                return Some(format!("{}:{}", DEFAULT_CONTAINER_PATH, suffix));
+            }
             return Some(suffix.to_string());
         }
     }
@@ -108,8 +121,9 @@ impl DevaipodPod {
     ///
     /// This will:
     /// 1. Build or pull the image from devcontainer config
-    /// 2. Create the pod
-    /// 3. Create workspace, agent, and optionally gator/proxy containers
+    /// 2. Create and initialize the workspace volume (clone git repo)
+    /// 3. Create the pod
+    /// 4. Create workspace, agent, and optionally gator/proxy containers
     ///
     /// Note: Dotfiles installation happens after the pod starts via `install_dotfiles()`.
     pub async fn create(
@@ -120,6 +134,7 @@ impl DevaipodPod {
         enable_gator: bool,
         enable_network_isolation: bool,
         global_config: &Config,
+        git_info: &crate::git::GitRepoInfo,
     ) -> Result<Self> {
         // Resolve bind_home configurations
         let container_home = Self::resolve_container_home(devcontainer_config);
@@ -171,6 +186,45 @@ impl DevaipodPod {
             .await
             .context("Failed to ensure container image")?;
 
+        // Create workspace volume and clone repo into it
+        let volume_name = format!("{}-workspace", pod_name);
+        let volume_already_exists = podman.volume_exists(&volume_name).await?;
+        
+        if !volume_already_exists {
+            tracing::info!("Creating workspace volume and cloning repository...");
+            podman
+                .create_volume(&volume_name)
+                .await
+                .context("Failed to create workspace volume")?;
+
+            // Clone the repository into the volume using an init container
+            let clone_script = crate::git::clone_script(git_info, &workspace_folder)?;
+            let exit_code = podman
+                .run_init_container(
+                    &image,
+                    &volume_name,
+                    "/workspaces",
+                    &["/bin/sh", "-c", &clone_script],
+                )
+                .await
+                .context("Failed to run init container for git clone")?;
+
+            if exit_code != 0 {
+                // Clean up the volume on failure
+                let _ = podman.remove_volume(&volume_name, true).await;
+                color_eyre::eyre::bail!(
+                    "Failed to clone repository into workspace volume (exit code {})",
+                    exit_code
+                );
+            }
+            tracing::info!(
+                "Repository cloned at commit {}",
+                &git_info.commit_sha[..git_info.commit_sha.len().min(8)]
+            );
+        } else {
+            tracing::info!("Using existing workspace volume '{}'", volume_name);
+        }
+
         // Create the pod
         podman
             .create_pod(pod_name)
@@ -190,6 +244,7 @@ impl DevaipodPod {
             config,
             &workspace_bind_home,
             &container_home,
+            &volume_name,
         );
         podman
             .create_container(&workspace_container, &image, pod_name, workspace_config)
@@ -240,6 +295,7 @@ impl DevaipodPod {
             &container_home,
             Some(devcontainer_config),
             enable_network_isolation,
+            &volume_name,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -639,12 +695,13 @@ echo "Dotfiles installed successfully"
 
     /// Create container config for the workspace container
     fn workspace_container_config(
-        project_path: &Path,
+        _project_path: &Path,
         workspace_folder: &str,
         user: Option<&str>,
         config: &DevcontainerConfig,
         _bind_home: &BindHomeConfig,
         _container_home: &str,
+        volume_name: &str,
     ) -> ContainerConfig {
         let mut env = config.container_env.clone();
         // Merge remote_env (these typically take precedence)
@@ -659,7 +716,7 @@ echo "Dotfiles installed successfully"
                 return true; // Keep as-is
             }
             // Try to resolve the value
-            if let Some(_resolved) = resolve_env_value(value) {
+            if resolve_env_value(value, key).is_some() {
                 // Note: we can't update the value in-place here, so we'll do a second pass
                 true
             } else {
@@ -669,9 +726,9 @@ echo "Dotfiles installed successfully"
         });
 
         // Second pass: resolve values that contain variable references
-        for value in env.values_mut() {
+        for (key, value) in env.iter_mut() {
             if value.contains("${") {
-                if let Some(resolved) = resolve_env_value(value) {
+                if let Some(resolved) = resolve_env_value(value, key) {
                     *value = resolved;
                 }
             }
@@ -691,12 +748,9 @@ echo "Dotfiles installed successfully"
             format!("http://localhost:{}", OPENCODE_PORT),
         );
 
-        // Build mounts: project mount only (bind_home files are copied after container starts)
-        let mounts = vec![MountConfig {
-            source: project_path.to_string_lossy().to_string(),
-            target: workspace_folder.to_string(),
-            readonly: false,
-        }];
+        // No bind mounts - we clone the repo into the container instead
+        // This avoids UID mapping issues with rootless podman
+        let mounts = vec![];
 
         // Auto-detect development devices to pass through
         let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
@@ -727,7 +781,9 @@ echo "Dotfiles installed successfully"
         ContainerConfig {
             mounts,
             env,
-            workdir: Some(workspace_folder.to_string()),
+            // Don't set workdir initially - workspace folder doesn't exist until we clone
+            // The clone step will create it, and lifecycle commands run in that directory
+            workdir: None,
             user: user.map(|u| u.to_string()),
             // Keep the container running, create opencode shim in user's bin, print agent connection info
             command: Some(vec![
@@ -765,6 +821,8 @@ exec sleep infinity
             devices,
             security_opts: config.security_opt.clone(),
             privileged,
+            // Mount the workspace volume (initialized with cloned repo)
+            volume_mounts: vec![(volume_name.to_string(), "/workspaces".to_string())],
             ..Default::default()
         }
     }
@@ -782,12 +840,13 @@ exec sleep infinity
     /// If `use_proxy` is true, HTTP_PROXY/HTTPS_PROXY env vars are set to route
     /// traffic through the network isolation proxy.
     fn agent_container_config(
-        project_path: &Path,
+        _project_path: &Path,
         workspace_folder: &str,
         bind_home: &BindHomeConfig,
         _container_home: &str,
         devcontainer_config: Option<&DevcontainerConfig>,
         use_proxy: bool,
+        volume_name: &str,
     ) -> ContainerConfig {
         // Use /tmp as agent home - it's always writable and isolated per container.
         // In the future we could mount a named volume for persistent agent state.
@@ -854,15 +913,9 @@ exec sleep infinity
             }
         }
 
-        // Build mounts: project mount only (bind_home files are copied after container starts)
-        let mounts = vec![
-            // Project mount - agent can read/write code
-            MountConfig {
-                source: project_path.to_string_lossy().to_string(),
-                target: workspace_folder.to_string(),
-                readonly: false,
-            },
-        ];
+        // No bind mounts - we clone the repo into the container instead
+        // This avoids UID mapping issues with rootless podman
+        let mounts = vec![];
 
         // If gcloud ADC is in bind_home, set GOOGLE_APPLICATION_CREDENTIALS to point to it
         // Files are copied to the agent's home directory after container starts
@@ -882,12 +935,15 @@ exec sleep infinity
         ContainerConfig {
             mounts,
             env,
-            workdir: Some(workspace_folder.to_string()),
+            // Don't set workdir initially - workspace folder doesn't exist until we clone
+            // opencode serve will use the workspace folder after clone
+            workdir: None,
             // Run as a non-root user if possible (agent user)
             user: None, // Let the image decide, or we could set "1000" for a generic user
             command: Some(vec![
                 // Create home dir structure first (including dirs that might be needed for bind mounts),
                 // then run opencode. We use mkdir -p to ensure all XDG dirs exist.
+                // Note: opencode serve doesn't need the workspace folder to exist at startup.
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 format!(
@@ -900,6 +956,8 @@ exec sleep infinity
             drop_all_caps: true,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
+            // Mount the workspace volume (initialized with cloned repo)
+            volume_mounts: vec![(volume_name.to_string(), "/workspaces".to_string())],
             ..Default::default()
         }
     }
@@ -960,6 +1018,7 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let volume_name = "test-volume";
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -967,17 +1026,16 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            volume_name,
         );
 
-        assert_eq!(container_config.mounts.len(), 1);
-        assert_eq!(container_config.mounts[0].source, "/home/user/myproject");
-        assert_eq!(container_config.mounts[0].target, "/workspaces/myproject");
-        assert!(!container_config.mounts[0].readonly);
+        // Volume mount for workspace
+        assert_eq!(container_config.volume_mounts.len(), 1);
+        assert_eq!(container_config.volume_mounts[0].0, "test-volume");
+        assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
         assert_eq!(container_config.user, Some("vscode".to_string()));
-        assert_eq!(
-            container_config.workdir,
-            Some("/workspaces/myproject".to_string())
-        );
+        // workdir is None initially - workspace folder created by clone step
+        assert!(container_config.workdir.is_none());
         // Verify command is a shell script that creates shim, prints agent info, and sleeps
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
@@ -1004,11 +1062,11 @@ mod tests {
             container_home,
             None,
             false,
+            "test-volume",
         );
 
-        // Verify mounts
-        assert_eq!(container_config.mounts.len(), 1);
-        assert_eq!(container_config.mounts[0].target, "/workspaces/myproject");
+        // Volume mount for workspace
+        assert_eq!(container_config.volume_mounts.len(), 1);
 
         // Verify command wraps opencode in a shell to create home dir
         let cmd = container_config.command.as_ref().unwrap();
@@ -1051,19 +1109,15 @@ mod tests {
             container_home,
             None,
             false,
+            "test-volume",
         );
 
-        // Agent should only have the project mount, not bind_home mounts
+        // No bind mounts - we clone the repo into the container instead
         // bind_home files are copied using podman cp after container starts
-        assert_eq!(
-            container_config.mounts.len(),
-            1,
-            "Agent should only have project mount, got {} mounts",
+        assert!(
+            container_config.mounts.is_empty(),
+            "Agent should have no mounts (we clone instead), got {} mounts",
             container_config.mounts.len()
-        );
-        assert_eq!(
-            container_config.mounts[0].target, workspace_folder,
-            "First mount should be the project mount"
         );
     }
 
@@ -1137,6 +1191,7 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            "test-volume",
         );
 
         // All devices in the config should actually exist on the host
@@ -1180,6 +1235,7 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            "test-volume",
         );
 
         assert_eq!(container_config.env.get("FOO"), Some(&"bar".to_string()));
@@ -1195,38 +1251,44 @@ mod tests {
     fn test_resolve_env_value_no_variable() {
         // Simple values without variables pass through unchanged
         assert_eq!(
-            super::resolve_env_value("/usr/bin:/usr/local/bin"),
+            super::resolve_env_value("/usr/bin:/usr/local/bin", "PATH"),
             Some("/usr/bin:/usr/local/bin".to_string())
         );
         assert_eq!(
-            super::resolve_env_value("simple_value"),
+            super::resolve_env_value("simple_value", "OTHER"),
             Some("simple_value".to_string())
         );
     }
 
     #[test]
     fn test_resolve_env_value_extracts_suffix() {
-        // Pattern like ${containerEnv:PATH}:/additional/path should extract the suffix
+        // Pattern like ${containerEnv:PATH}:/additional/path should prepend default PATH
+        // when the variable is PATH, to ensure essential utilities are available
         assert_eq!(
-            super::resolve_env_value("${containerEnv:PATH}:/usr/local/cargo/bin"),
-            Some("/usr/local/cargo/bin".to_string())
+            super::resolve_env_value("${containerEnv:PATH}:/usr/local/cargo/bin", "PATH"),
+            Some(format!("{}:/usr/local/cargo/bin", super::DEFAULT_CONTAINER_PATH))
         );
         // Multiple path components in suffix
         assert_eq!(
-            super::resolve_env_value("${containerEnv:PATH}:/foo:/bar:/baz"),
-            Some("/foo:/bar:/baz".to_string())
+            super::resolve_env_value("${containerEnv:PATH}:/foo:/bar:/baz", "PATH"),
+            Some(format!("{}:/foo:/bar:/baz", super::DEFAULT_CONTAINER_PATH))
+        );
+        // For non-PATH variables, just extract the suffix
+        assert_eq!(
+            super::resolve_env_value("${containerEnv:OTHER}:/some/path", "OTHER"),
+            Some("/some/path".to_string())
         );
     }
 
     #[test]
     fn test_resolve_env_value_unresolvable() {
         // Pure variable reference with no static suffix
-        assert_eq!(super::resolve_env_value("${containerEnv:PATH}"), None);
+        assert_eq!(super::resolve_env_value("${containerEnv:PATH}", "PATH"), None);
         // Variable reference with empty suffix
-        assert_eq!(super::resolve_env_value("${containerEnv:PATH}:"), None);
+        assert_eq!(super::resolve_env_value("${containerEnv:PATH}:", "PATH"), None);
         // Suffix that also contains variable references
         assert_eq!(
-            super::resolve_env_value("${containerEnv:PATH}:${localEnv:HOME}"),
+            super::resolve_env_value("${containerEnv:PATH}:${localEnv:HOME}", "PATH"),
             None
         );
     }
@@ -1256,12 +1318,13 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            "test-volume",
         );
 
-        // PATH should be resolved to just the suffix
+        // PATH should include default PATH plus the suffix from devcontainer.json
         assert_eq!(
             container_config.env.get("PATH"),
-            Some(&"/usr/local/cargo/bin".to_string())
+            Some(&format!("{}:/usr/local/cargo/bin", DEFAULT_CONTAINER_PATH))
         );
         // Simple var should pass through unchanged
         assert_eq!(
@@ -1295,6 +1358,7 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            "test-volume",
         );
 
         // UNRESOLVABLE should be skipped
@@ -1326,6 +1390,7 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            "test-volume",
         );
 
         assert_eq!(container_config.cap_add, vec!["SYS_PTRACE".to_string()]);
@@ -1364,6 +1429,7 @@ mod tests {
             container_home,
             None,
             true, // use_proxy
+            "test-volume",
         );
 
         // Should have proxy env vars set
@@ -1391,6 +1457,7 @@ mod tests {
             container_home,
             None,
             false, // no proxy
+            "test-volume",
         );
 
         // Should NOT have proxy env vars set
@@ -1416,6 +1483,7 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            "test-volume",
         );
 
         // Privileged should be true from runArgs
@@ -1443,6 +1511,7 @@ mod tests {
             &config,
             &bind_home,
             container_home,
+            "test-volume",
         );
 
         // Device should be in the devices list
@@ -1472,6 +1541,7 @@ mod tests {
             &config1,
             &bind_home,
             container_home,
+            "test-volume",
         );
         assert!(
             container_config1.privileged,
@@ -1490,6 +1560,7 @@ mod tests {
             &config2,
             &bind_home,
             container_home,
+            "test-volume",
         );
         assert!(
             container_config2.privileged,

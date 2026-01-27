@@ -507,6 +507,123 @@ impl PodmanService {
         Ok(())
     }
 
+    /// Create a named volume if it doesn't exist
+    pub async fn create_volume(&self, name: &str) -> Result<()> {
+        let output = self
+            .podman_command()
+            .args(["volume", "create", name])
+            .output()
+            .await
+            .context("Failed to create volume")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Ignore "already exists" errors
+            if !stderr.contains("already exists") {
+                bail!("Failed to create volume {}: {}", name, stderr);
+            }
+        }
+
+        tracing::debug!("Created volume: {}", name);
+        Ok(())
+    }
+
+    /// Check if a volume exists
+    pub async fn volume_exists(&self, name: &str) -> Result<bool> {
+        let output = self
+            .podman_command()
+            .args(["volume", "exists", name])
+            .output()
+            .await
+            .context("Failed to check volume")?;
+
+        Ok(output.status.success())
+    }
+
+    /// Remove a volume
+    #[allow(dead_code)] // Part of public API
+    pub async fn remove_volume(&self, name: &str, force: bool) -> Result<()> {
+        let mut args = vec!["volume", "rm"];
+        if force {
+            args.push("-f");
+        }
+        args.push(name);
+
+        let output = self
+            .podman_command()
+            .args(&args)
+            .output()
+            .await
+            .context("Failed to remove volume")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("no such volume") {
+                bail!("Failed to remove volume {}: {}", name, stderr);
+            }
+        }
+
+        tracing::debug!("Removed volume: {}", name);
+        Ok(())
+    }
+
+    /// Run a one-shot container to initialize a volume (e.g., clone a repo)
+    ///
+    /// This creates a temporary container, runs a command, and removes it.
+    /// Useful for initializing volumes before the main containers start.
+    pub async fn run_init_container(
+        &self,
+        image: &str,
+        volume_name: &str,
+        mount_path: &str,
+        command: &[&str],
+    ) -> Result<i32> {
+        let container_name = format!("{}-init", volume_name);
+
+        // Remove any existing init container
+        let _ = self
+            .podman_command()
+            .args(["rm", "-f", &container_name])
+            .output()
+            .await;
+
+        // Run the init container
+        let mut args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--name".to_string(),
+            container_name.clone(),
+            "-v".to_string(),
+            format!("{}:{}", volume_name, mount_path),
+        ];
+
+        args.push(image.to_string());
+        args.extend(command.iter().map(|s| s.to_string()));
+
+        let output = self
+            .podman_command()
+            .args(&args)
+            .output()
+            .await
+            .context("Failed to run init container")?;
+
+        // Print output for debugging
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.is_empty() {
+            for line in stdout.lines() {
+                tracing::debug!("init: {}", line);
+            }
+        }
+        if !stderr.is_empty() && !output.status.success() {
+            for line in stderr.lines() {
+                tracing::warn!("init: {}", line);
+            }
+        }
+
+        Ok(output.status.code().unwrap_or(1))
+    }
+
     /// Create a container in a pod
     pub async fn create_container(
         &self,
@@ -590,6 +707,18 @@ impl PodmanService {
         // Privileged mode (for nested containers/VMs)
         if config.privileged {
             args.push("--privileged".to_string());
+        }
+
+        // Tmpfs mounts
+        for tmpfs_path in &config.tmpfs_mounts {
+            args.push("--tmpfs".to_string());
+            args.push(tmpfs_path.clone());
+        }
+
+        // Named volume mounts
+        for (volume_name, mount_path) in &config.volume_mounts {
+            args.push("-v".to_string());
+            args.push(format!("{}:{}", volume_name, mount_path));
         }
 
         // Image
@@ -868,6 +997,10 @@ pub struct ContainerConfig {
     pub groups: Vec<String>,
     /// Run container in privileged mode (for nested containers/VMs)
     pub privileged: bool,
+    /// Tmpfs mounts (paths that will be mounted as tmpfs)
+    pub tmpfs_mounts: Vec<String>,
+    /// Named volume mounts (volume_name -> mount_path)
+    pub volume_mounts: Vec<(String, String)>,
 }
 
 /// Mount configuration

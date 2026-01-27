@@ -14,6 +14,7 @@ mod compose;
 mod config;
 mod devcontainer;
 mod devpod;
+mod git;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
 mod pod;
@@ -385,6 +386,37 @@ async fn cmd_up(
         }
     };
 
+    // Detect git repository info for cloning into containers
+    let git_info = git::detect_git_info(project_path)
+        .context("Failed to detect git repository info")?;
+
+    // Require a remote URL for cloning
+    if git_info.remote_url.is_none() {
+        bail!(
+            "No git remote configured for {}.\n\
+             devaipod clones the repository into containers and requires a git remote.\n\
+             Configure with: git remote add origin <url>",
+            project_path.display()
+        );
+    }
+
+    // Warn about dirty working tree
+    if git_info.is_dirty {
+        eprintln!(
+            "\n⚠️  Warning: Uncommitted changes detected ({} file(s)):",
+            git_info.dirty_files.len()
+        );
+        for file in git_info.dirty_files.iter().take(5) {
+            eprintln!("     {}", file);
+        }
+        if git_info.dirty_files.len() > 5 {
+            eprintln!("     ... and {} more", git_info.dirty_files.len() - 5);
+        }
+        eprintln!();
+        eprintln!("   The AI agent will work on commit {} and won't see uncommitted changes.", &git_info.commit_sha[..8]);
+        eprintln!("   Consider committing or stashing your changes first.\n");
+    }
+
     // Find and load devcontainer.json
     let devcontainer_json_path = devcontainer::find_devcontainer_json(project_path)?;
     let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
@@ -471,6 +503,7 @@ async fn cmd_up(
         enable_gator,
         enable_network_isolation,
         config,
+        &git_info,
     )
     .await
     .context("Failed to create devaipod pod")?;
