@@ -16,6 +16,7 @@ mod devcontainer;
 mod devpod;
 mod pod;
 mod podman;
+mod proxy;
 mod secrets;
 mod service_gator;
 
@@ -385,6 +386,8 @@ async fn cmd_up(
 
     // Check if gator should be enabled
     let enable_gator = config.service_gator.is_enabled();
+    // Check if network isolation should be enabled
+    let enable_network_isolation = config.network_isolation.enabled;
 
     // Create the pod with all containers
     tracing::info!("Creating pod '{}'...", pod_name);
@@ -394,6 +397,7 @@ async fn cmd_up(
         &devcontainer_config,
         &pod_name,
         enable_gator,
+        enable_network_isolation,
         config,
     )
     .await
