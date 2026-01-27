@@ -33,6 +33,10 @@ struct HostCli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Enable verbose output (debug logging)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: HostCommand,
 }
@@ -144,6 +148,20 @@ enum HostCommand {
         #[arg(long)]
         force: bool,
     },
+    /// View container logs
+    Logs {
+        /// Workspace/pod name
+        workspace: String,
+        /// Which container to show logs for (workspace, agent, gator, proxy)
+        #[arg(short, long, default_value = "agent")]
+        container: String,
+        /// Follow log output
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to show from the end
+        #[arg(short = 'n', long)]
+        tail: Option<u32>,
+    },
 }
 
 // =============================================================================
@@ -200,26 +218,37 @@ enum ContainerCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+
+    // Detect context BEFORE parsing args - this determines which CLI we use
+    if is_inside_devcontainer() {
+        // Container mode - use default log level
+        init_tracing(false);
+        let cli = ContainerCli::parse();
+        run_container(cli)
+    } else {
+        // Host mode - parse CLI first to check for --verbose flag
+        let cli = HostCli::parse();
+        init_tracing(cli.verbose);
+        run_host(cli).await
+    }
+}
+
+/// Initialize tracing with the appropriate log level
+fn init_tracing(verbose: bool) {
     let format = tracing_subscriber::fmt::format()
         .without_time()
         .with_target(false)
         .compact();
+
+    let default_level = if verbose { "debug" } else { "info" };
+
     tracing_subscriber::fmt()
         .event_format(format)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
-
-    // Detect context BEFORE parsing args - this determines which CLI we use
-    if is_inside_devcontainer() {
-        let cli = ContainerCli::parse();
-        run_container(cli)
-    } else {
-        let cli = HostCli::parse();
-        run_host(cli).await
-    }
 }
 
 async fn run_host(cli: HostCli) -> Result<()> {
@@ -271,6 +300,12 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::List { json } => cmd_list(json),
         HostCommand::Stop { workspace } => cmd_stop(&workspace),
         HostCommand::Delete { workspace, force } => cmd_delete(&workspace, force),
+        HostCommand::Logs {
+            workspace,
+            container,
+            follow,
+            tail,
+        } => cmd_logs(&workspace, &container, follow, tail),
     }
 }
 
@@ -342,6 +377,9 @@ async fn cmd_up(
             .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
             .collect::<String>()
     );
+
+    // Check for API keys and warn if none are configured (helps first-run experience)
+    check_api_keys_configured();
 
     if dry_run {
         tracing::info!("Dry run: would create pod '{}'", pod_name);
@@ -607,6 +645,26 @@ fn extract_github_issue_context(task: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Check if any API keys are configured for the AI agent and warn if not
+///
+/// This helps users on first run understand that they need to configure
+/// API keys for the agent to function properly.
+fn check_api_keys_configured() {
+    let agent_env_vars = config::collect_agent_env_vars();
+    let has_common_keys = std::env::var("ANTHROPIC_API_KEY").is_ok()
+        || std::env::var("OPENAI_API_KEY").is_ok();
+
+    if agent_env_vars.is_empty() && !has_common_keys {
+        eprintln!();
+        eprintln!("Warning: No API keys detected for the AI agent.");
+        eprintln!("   Set environment variables to pass keys to the agent:");
+        eprintln!("     export DEVAIPOD_AGENT_ANTHROPIC_API_KEY='your-key'");
+        eprintln!("   Or use common key names directly:");
+        eprintln!("     export ANTHROPIC_API_KEY='your-key'");
+        eprintln!();
+    }
 }
 
 /// Get the real home directory, defaulting to /home/user if not set
@@ -1148,6 +1206,38 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
     // Clean up SSH config file if it exists
     if let Err(e) = remove_ssh_config(pod_name) {
         tracing::warn!("Failed to remove SSH config: {}", e);
+    }
+
+    Ok(())
+}
+
+/// View container logs
+fn cmd_logs(pod_name: &str, container: &str, follow: bool, tail: Option<u32>) -> Result<()> {
+    let container_name = format!("{}-{}", pod_name, container);
+
+    let mut cmd = podman_command();
+    cmd.arg("logs");
+
+    if follow {
+        cmd.arg("-f");
+    }
+
+    // Convert tail to string outside of the conditional to ensure it lives long enough
+    let tail_str;
+    if let Some(n) = tail {
+        tail_str = n.to_string();
+        cmd.args(["--tail", &tail_str]);
+    }
+
+    cmd.arg(&container_name);
+
+    let status = cmd.status().context("Failed to get container logs")?;
+
+    if !status.success() {
+        bail!(
+            "Container '{}' not found or not running. Use 'devaipod list' to see pods.",
+            container_name
+        );
     }
 
     Ok(())
@@ -2032,6 +2122,7 @@ mod tests {
         assert!(subcommands.contains(&"list"), "Missing 'list' command");
         assert!(subcommands.contains(&"stop"), "Missing 'stop' command");
         assert!(subcommands.contains(&"delete"), "Missing 'delete' command");
+        assert!(subcommands.contains(&"logs"), "Missing 'logs' command");
 
         // Should NOT have container-only commands
         assert!(
