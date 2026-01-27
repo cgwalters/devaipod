@@ -24,6 +24,40 @@ mod proxy;
 mod secrets;
 mod service_gator;
 
+/// Prefix for all devaipod pod names
+const POD_NAME_PREFIX: &str = "devaipod-";
+
+/// Normalize a workspace name to a full pod name by adding the prefix if missing
+fn normalize_pod_name(name: &str) -> String {
+    if name.starts_with(POD_NAME_PREFIX) {
+        name.to_string()
+    } else {
+        format!("{}{}", POD_NAME_PREFIX, name)
+    }
+}
+
+/// Strip the prefix from a pod name for display
+fn strip_pod_prefix(name: &str) -> &str {
+    name.strip_prefix(POD_NAME_PREFIX).unwrap_or(name)
+}
+
+/// Sanitize a name for use in pod names (alphanumeric and hyphens only)
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect()
+}
+
+/// Create a pod name from a project name
+fn make_pod_name(project_name: &str) -> String {
+    format!("{}{}", POD_NAME_PREFIX, sanitize_name(project_name))
+}
+
+/// Create a pod name for a PR
+fn make_pr_pod_name(repo: &str, pr_number: u64) -> String {
+    format!("{}{}-pr{}", POD_NAME_PREFIX, sanitize_name(repo), pr_number)
+}
+
 // =============================================================================
 // Host CLI - commands that run on the host machine (outside devcontainer)
 // =============================================================================
@@ -131,12 +165,12 @@ enum HostCommand {
     },
     /// Attach to running AI agent (tmux session)
     Attach {
-        /// Workspace name
+        /// Workspace name (devaipod- prefix optional)
         workspace: String,
     },
     /// SSH into a workspace
     Ssh {
-        /// Workspace name
+        /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// Stdio mode: pipe stdin/stdout for ProxyCommand use (VSCode/Zed remote dev)
         #[arg(long)]
@@ -151,9 +185,9 @@ enum HostCommand {
     /// This enables VSCode/Zed Remote SSH to connect via ProxyCommand.
     ///
     /// Example:
-    ///   devaipod ssh-config my-pod >> ~/.ssh/config
+    ///   devaipod ssh-config my-repo >> ~/.ssh/config
     SshConfig {
-        /// Workspace name (pod name without devaipod- prefix)
+        /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// User to connect as (default: current user)
         #[arg(long)]
@@ -167,12 +201,12 @@ enum HostCommand {
     },
     /// Stop a workspace
     Stop {
-        /// Workspace name
+        /// Workspace name (devaipod- prefix optional)
         workspace: String,
     },
     /// Delete a workspace
     Delete {
-        /// Workspace name
+        /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// Force deletion (stop running containers first)
         #[arg(short, long)]
@@ -180,7 +214,7 @@ enum HostCommand {
     },
     /// View container logs
     Logs {
-        /// Workspace/pod name
+        /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// Which container to show logs for (workspace, agent, gator, proxy)
         #[arg(short, long, default_value = "agent")]
@@ -196,7 +230,7 @@ enum HostCommand {
     ///
     /// Displays pod status, container states, agent health, and exposed ports.
     Status {
-        /// Workspace/pod name
+        /// Workspace name (devaipod- prefix optional)
         workspace: String,
         /// Output in JSON format
         #[arg(long)]
@@ -357,23 +391,29 @@ async fn run_host(cli: HostCli) -> Result<()> {
             agent.as_deref(),
             &repos,
         ),
-        HostCommand::Attach { workspace } => cmd_attach(&workspace),
+        HostCommand::Attach { workspace } => cmd_attach(&normalize_pod_name(&workspace)),
         HostCommand::Ssh {
             workspace,
             stdio,
             command,
-        } => cmd_ssh(&workspace, stdio, &command),
-        HostCommand::SshConfig { workspace, user } => cmd_ssh_config(&workspace, user.as_deref()),
+        } => cmd_ssh(&normalize_pod_name(&workspace), stdio, &command),
+        HostCommand::SshConfig { workspace, user } => {
+            cmd_ssh_config(&normalize_pod_name(&workspace), user.as_deref())
+        }
         HostCommand::List { json } => cmd_list(json),
-        HostCommand::Stop { workspace } => cmd_stop(&workspace),
-        HostCommand::Delete { workspace, force } => cmd_delete(&workspace, force),
+        HostCommand::Stop { workspace } => cmd_stop(&normalize_pod_name(&workspace)),
+        HostCommand::Delete { workspace, force } => {
+            cmd_delete(&normalize_pod_name(&workspace), force)
+        }
         HostCommand::Logs {
             workspace,
             container,
             follow,
             tail,
-        } => cmd_logs(&workspace, &container, follow, tail),
-        HostCommand::Status { workspace, json } => cmd_status(&workspace, json),
+        } => cmd_logs(&normalize_pod_name(&workspace), &container, follow, tail),
+        HostCommand::Status { workspace, json } => {
+            cmd_status(&normalize_pod_name(&workspace), json)
+        }
         HostCommand::Completions { shell } => cmd_completions(shell),
     }
 }
@@ -489,17 +529,7 @@ async fn cmd_up(
         .unwrap_or_else(|| "project".to_string());
 
     // Use a sanitized pod name (replace problematic characters)
-    let pod_name = format!(
-        "devaipod-{}",
-        project_name
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            })
-            .collect::<String>()
-    );
+    let pod_name = make_pod_name(&project_name);
 
     // Check for API keys and warn if none are configured (helps first-run experience)
     check_api_keys_configured();
@@ -723,13 +753,7 @@ async fn cmd_up_pr(
     let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
 
     // Derive pod name from repo and PR number
-    let pod_name = format!(
-        "devaipod-{}-pr{}",
-        pr_ref.repo.chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
-            .collect::<String>(),
-        pr_ref.number
-    );
+    let pod_name = make_pr_pod_name(&pr_ref.repo, pr_ref.number);
 
     if dry_run {
         tracing::info!("Dry run mode - would create pod '{}'", pod_name);
@@ -922,13 +946,7 @@ async fn cmd_up_remote(
     let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
 
     // Derive pod name from repo name
-    let pod_name = format!(
-        "devaipod-{}",
-        repo_name
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
-            .collect::<String>()
-    );
+    let pod_name = make_pod_name(&repo_name);
 
     // For remote URLs, auto-enable service-gator with readonly + draft PR access
     // to the target repository (unless user provided explicit scopes)
@@ -1652,8 +1670,11 @@ fn get_ssh_config_dir() -> Result<PathBuf> {
 }
 
 /// Get the SSH config file path for a workspace
-fn get_ssh_config_path(workspace: &str) -> Result<PathBuf> {
-    Ok(get_ssh_config_dir()?.join(format!("devaipod-{}", workspace)))
+///
+/// The config file is named after the short workspace name (without prefix)
+fn get_ssh_config_path(pod_name: &str) -> Result<PathBuf> {
+    let short_name = strip_pod_prefix(pod_name);
+    Ok(get_ssh_config_dir()?.join(format!("{}{}", POD_NAME_PREFIX, short_name)))
 }
 
 /// Check if ~/.ssh/config has Include directive for config.d
@@ -1751,8 +1772,9 @@ Host {pod}.devaipod
 
 /// List devaipod pods using podman pod ps
 fn cmd_list(json_output: bool) -> Result<()> {
+    let filter = format!("name={}*", POD_NAME_PREFIX);
     let output = podman_command()
-        .args(["pod", "ps", "--filter", "name=devaipod-*", "--format=json"])
+        .args(["pod", "ps", "--filter", &filter, "--format=json"])
         .output()
         .context("Failed to run podman pod ps")?;
 
@@ -1807,7 +1829,8 @@ fn cmd_list(json_output: bool) -> Result<()> {
 
     let mut pod_infos: Vec<PodInfo> = Vec::new();
     for pod in &pods {
-        let name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+        let full_name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("-");
+        let name = strip_pod_prefix(full_name).to_string();
         let status = pod.get("Status").and_then(|v| v.as_str()).unwrap_or("-").to_string();
         let containers = pod
             .get("Containers")
@@ -1816,8 +1839,8 @@ fn cmd_list(json_output: bool) -> Result<()> {
             .unwrap_or(0);
         let created = pod.get("Created").and_then(|v| v.as_str()).unwrap_or("-").to_string();
 
-        // Get labels from pod inspect
-        let (repo, pr, task) = if let Some(labels) = get_pod_labels(&name) {
+        // Get labels from pod inspect (use full name for podman commands)
+        let (repo, pr, task) = if let Some(labels) = get_pod_labels(full_name) {
             let repo = labels
                 .get("io.devaipod.repo")
                 .and_then(|v| v.as_str())
