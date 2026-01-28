@@ -251,8 +251,8 @@ impl DevaipodPod {
         image_override: Option<&str>,
         gator_image_override: Option<&str>,
     ) -> Result<Self> {
-        // Resolve bind_home configurations
-        let container_home = Self::resolve_container_home(devcontainer_config);
+        // Note: container_home is resolved after we determine the image, since
+        // we need to query the image for the user if devcontainer doesn't specify one
 
         // Build workspace bind_home: global bind_home + workspace-specific
         let mut workspace_paths = global_config.bind_home.clone();
@@ -303,6 +303,17 @@ impl DevaipodPod {
                 .context("Failed to ensure container image")?
         };
 
+        // Determine effective user: prefer devcontainer config, fall back to image config
+        // This is used for chown in clone, container_home resolution, and running commands
+        let effective_user = if let Some(user) = devcontainer_config.effective_user() {
+            Some(user.to_string())
+        } else {
+            podman.get_image_user(&image).await.unwrap_or(None)
+        };
+
+        // Resolve container home based on effective user
+        let container_home = Self::resolve_container_home_for_user(effective_user.as_deref());
+
         // Create workspace volume and clone repo into it
         let volume_name = format!("{}-workspace", pod_name);
         let volume_already_exists = podman.volume_exists(&volume_name).await?;
@@ -320,20 +331,12 @@ impl DevaipodPod {
             // Clone the repository into the volume using an init container
             // For local repos, we mount the .git directory and clone from there
             // This allows working with unpushed commits
-            //
-            // Determine the target user for chown: prefer devcontainer config, fall back to image
-            let target_user = if let Some(user) = devcontainer_config.effective_user() {
-                Some(user.to_string())
-            } else {
-                // Get user from image config
-                podman.get_image_user(&image).await.unwrap_or(None)
-            };
             let (clone_script, extra_binds) = match source {
                 WorkspaceSource::LocalRepo(git_info) => {
                     let script = crate::git::clone_from_local_script(
                         git_info,
                         &workspace_folder,
-                        target_user.as_deref(),
+                        effective_user.as_deref(),
                     );
                     // Mount the local .git directory read-only
                     let git_dir = git_info.local_path.join(".git");
@@ -344,7 +347,7 @@ impl DevaipodPod {
                     let script = crate::git::clone_remote_script(
                         remote_info,
                         &workspace_folder,
-                        target_user.as_deref(),
+                        effective_user.as_deref(),
                     );
                     (script, vec![])
                 }
@@ -395,7 +398,7 @@ impl DevaipodPod {
         let workspace_config = Self::workspace_container_config(
             project_path,
             &workspace_folder,
-            config.effective_user(),
+            effective_user.as_deref(),
             config,
             &workspace_bind_home,
             &container_home,
@@ -463,6 +466,7 @@ impl DevaipodPod {
             &container_home,
             Some(devcontainer_config),
             enable_network_isolation,
+            enable_gator,
             &volume_name,
             &agent_home_volume,
             global_config,
@@ -893,75 +897,9 @@ echo "Dotfiles installed successfully"
         Ok(())
     }
 
-    /// Configure opencode in the agent container to use service-gator MCP
-    ///
-    /// This writes the opencode configuration file inside the agent container
-    /// to include service-gator as an MCP server. The config is written via
-    /// podman exec since the agent's config dir is inside the container.
-    pub async fn configure_agent_opencode(
-        &self,
-        podman: &PodmanService,
-        sg_config: &crate::config::ServiceGatorConfig,
-    ) -> Result<()> {
-        if !sg_config.is_enabled() {
-            tracing::debug!("service-gator not enabled, skipping opencode MCP config");
-            return Ok(());
-        }
-
-        // The agent's HOME is a persistent volume, and opencode config goes in ~/.config/opencode/
-        // service-gator runs in the gator container and is accessible at localhost:GATOR_PORT
-        let mcp_url = format!("http://localhost:{}/mcp", GATOR_PORT);
-
-        // Create the config JSON
-        let config_json = serde_json::json!({
-            "$schema": "https://opencode.ai/config.json",
-            "mcp": {
-                "service-gator": {
-                    "type": "remote",
-                    "url": mcp_url,
-                    "enabled": true
-                }
-            }
-        });
-
-        let config_content = serde_json::to_string_pretty(&config_json)
-            .context("Failed to serialize opencode config")?;
-
-        // Write the config file inside the agent container
-        let script = format!(
-            r#"
-mkdir -p {agent_home}/.config/opencode
-cat > {agent_home}/.config/opencode/opencode.json << 'OPENCODE_CONFIG'
-{{}}
-OPENCODE_CONFIG
-echo "Configured opencode with service-gator MCP at {mcp_url}"
-"#,
-            agent_home = AGENT_HOME_PATH,
-            mcp_url = mcp_url
-        );
-        let script = script.replace("{}", &config_content);
-
-        let exit_code = podman
-            .exec(
-                &self.agent_container,
-                &["/bin/sh", "-c", &script],
-                None,
-                None,
-            )
-            .await
-            .context("Failed to configure opencode in agent container")?;
-
-        if exit_code != 0 {
-            tracing::warn!(
-                "Failed to configure opencode in agent (exit code {})",
-                exit_code
-            );
-        } else {
-            tracing::debug!("Configured agent opencode with service-gator MCP");
-        }
-
-        Ok(())
-    }
+    // Note: service-gator MCP config is now set via OPENCODE_CONFIG_CONTENT env var
+    // at container creation time in agent_container_config(), so we don't need
+    // a separate configure_agent_opencode() method.
 
     /// Write task instructions to the agent's opencode config directory
     ///
@@ -1247,6 +1185,11 @@ DEVAIPOD_TASK_EOF
         // Check if privileged mode is requested (either directly or via runArgs)
         let privileged = config.privileged || config.has_privileged_run_arg();
 
+        // Get secrets to mount with type=env - workspace also gets trusted secrets
+        // (like GH_TOKEN) for authenticated git operations, gh CLI, etc.
+        // Note: agent container does NOT get these secrets for security.
+        let secrets = global_config.trusted_env.secret_mounts();
+
         ContainerConfig {
             mounts,
             env,
@@ -1287,6 +1230,7 @@ while true; do sleep 86400 & wait $!; done
             privileged,
             // Mount the workspace volume (initialized with cloned repo)
             volume_mounts: vec![(volume_name.to_string(), "/workspaces".to_string())],
+            secrets,
             ..Default::default()
         }
     }
@@ -1303,6 +1247,9 @@ while true; do sleep 86400 & wait $!; done
     ///
     /// If `use_proxy` is true, HTTP_PROXY/HTTPS_PROXY env vars are set to route
     /// traffic through the network isolation proxy.
+    ///
+    /// If `enable_gator` is true, OPENCODE_CONFIG_CONTENT is set with MCP config
+    /// to connect opencode to the service-gator container.
     fn agent_container_config(
         _project_path: &Path,
         workspace_folder: &str,
@@ -1310,6 +1257,7 @@ while true; do sleep 86400 & wait $!; done
         _container_home: &str,
         devcontainer_config: Option<&DevcontainerConfig>,
         use_proxy: bool,
+        enable_gator: bool,
         workspace_volume: &str,
         agent_home_volume: &str,
         global_config: &crate::config::Config,
@@ -1401,6 +1349,25 @@ while true; do sleep 86400 & wait $!; done
             }
         }
 
+        // If service-gator is enabled, set OPENCODE_CONFIG_CONTENT with MCP config
+        // This is merged with the user's existing opencode config (highest precedence)
+        if enable_gator {
+            let mcp_url = format!("http://localhost:{}/mcp", GATOR_PORT);
+            let gator_config = serde_json::json!({
+                "mcp": {
+                    "service-gator": {
+                        "type": "remote",
+                        "url": mcp_url,
+                        "enabled": true
+                    }
+                }
+            });
+            env.insert(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                gator_config.to_string(),
+            );
+        }
+
         ContainerConfig {
             mounts,
             env,
@@ -1485,21 +1452,18 @@ while true; do sleep 86400 & wait $!; done
         }
     }
 
-    /// Resolve the container home directory based on devcontainer config
+    /// Resolve the container home directory based on the effective user
     ///
     /// Most devcontainer images use a non-root user like "vscode" or "devenv"
-    /// with a home directory at /home/<user>. This function attempts to determine
-    /// the correct home directory for bind mounts.
-    fn resolve_container_home(config: &DevcontainerConfig) -> String {
-        if let Some(user) = config.effective_user() {
-            if user == "root" {
-                "/root".to_string()
-            } else {
-                format!("/home/{}", user)
-            }
-        } else {
-            // Default to vscode user which is common in devcontainer images
-            "/home/vscode".to_string()
+    /// with a home directory at /home/<user>. This function determines
+    /// the correct home directory for bind mounts based on the user.
+    fn resolve_container_home_for_user(user: Option<&str>) -> String {
+        match user {
+            Some("root") => "/root".to_string(),
+            Some(user) => format!("/home/{}", user),
+            // If no user specified, default to /home/user as a reasonable guess
+            // (this shouldn't happen in practice since we query the image)
+            None => "/home/user".to_string(),
         }
     }
 }
@@ -1566,7 +1530,8 @@ mod tests {
             &bind_home,
             container_home,
             None,
-            false,
+            false, // use_proxy
+            false, // enable_gator
             "test-volume",
             "test-agent-home",
             &global_config,
@@ -1618,7 +1583,8 @@ mod tests {
             &bind_home,
             container_home,
             None,
-            false,
+            false, // use_proxy
+            false, // enable_gator
             "test-volume",
             "test-agent-home",
             &global_config,
@@ -1844,6 +1810,73 @@ mod tests {
     }
 
     #[test]
+    fn test_workspace_container_config_with_secrets() {
+        // Workspace container should get trusted secrets for authenticated git, gh CLI, etc.
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.secrets = vec![
+            "GH_TOKEN=gh_token".to_string(),
+            "GITLAB_TOKEN=gitlab_token".to_string(),
+        ];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            container_home,
+            "test-volume",
+            &global_config,
+        );
+
+        // Verify secrets are included for workspace container
+        assert_eq!(container_config.secrets.len(), 2);
+        assert!(container_config
+            .secrets
+            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
+        assert!(container_config
+            .secrets
+            .contains(&("GITLAB_TOKEN".to_string(), "gitlab_token".to_string())));
+    }
+
+    #[test]
+    fn test_agent_container_does_not_get_secrets() {
+        // Agent container should NOT get trusted secrets (security: secrets stay out of agent)
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.secrets = vec!["GH_TOKEN=gh_token".to_string()];
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false, // use_proxy
+            false, // enable_gator
+            "test-volume",
+            "test-agent-home",
+            &global_config,
+        );
+
+        // Agent should have no secrets
+        assert!(
+            container_config.secrets.is_empty(),
+            "Agent should not receive trusted secrets for security"
+        );
+    }
+
+    #[test]
     fn test_resolve_env_value_no_variable() {
         // Simple values without variables pass through unchanged
         assert_eq!(
@@ -2040,7 +2073,8 @@ mod tests {
             &bind_home,
             container_home,
             None,
-            true, // use_proxy
+            true,  // use_proxy
+            false, // enable_gator
             "test-volume",
             "test-agent-home",
             &global_config,
@@ -2072,6 +2106,7 @@ mod tests {
             container_home,
             None,
             false, // no proxy
+            false, // enable_gator
             "test-volume",
             "test-agent-home",
             &global_config,

@@ -648,13 +648,8 @@ async fn cmd_up(
         .await
         .context("Failed to copy bind_home files")?;
 
-    // Configure opencode in agent container to use service-gator MCP
-    if enable_gator {
-        devaipod_pod
-            .configure_agent_opencode(&podman, &service_gator_config)
-            .await
-            .context("Failed to configure agent opencode")?;
-    }
+    // Note: service-gator MCP config is now set via OPENCODE_CONFIG_CONTENT env var
+    // at container creation time, so no need to configure it here.
 
     // Install dotfiles BEFORE lifecycle commands so bashrc, gitconfig, etc. are available
     if let Some(ref dotfiles) = config.dotfiles {
@@ -1119,13 +1114,8 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         .await
         .context("Failed to copy bind_home files")?;
 
-    // Configure opencode in agent container to use service-gator MCP
-    if enable_gator {
-        devaipod_pod
-            .configure_agent_opencode(&podman, &service_gator_config)
-            .await
-            .context("Failed to configure agent opencode")?;
-    }
+    // Note: service-gator MCP config is set via OPENCODE_CONFIG_CONTENT env var
+    // at container creation time.
 
     // Install dotfiles
     if let Some(ref dotfiles) = config.dotfiles {
