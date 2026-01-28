@@ -225,6 +225,9 @@ impl DevaipodPod {
     ///
     /// The `service_gator_config` parameter should be the merged config from file + CLI.
     /// If None, uses the config from `global_config.service_gator`.
+    ///
+    /// The `image_override` parameter allows specifying a pre-built image to use instead
+    /// of building from devcontainer.json. This is useful for testing locally-built images.
     pub async fn create(
         podman: &PodmanService,
         project_path: &Path,
@@ -236,6 +239,7 @@ impl DevaipodPod {
         source: &WorkspaceSource,
         extra_labels: &[(String, String)],
         service_gator_config: Option<&crate::config::ServiceGatorConfig>,
+        image_override: Option<&str>,
     ) -> Result<Self> {
         // Resolve bind_home configurations
         let container_home = Self::resolve_container_home(devcontainer_config);
@@ -271,18 +275,23 @@ impl DevaipodPod {
         let devcontainer_json = crate::devcontainer::find_devcontainer_json(project_path)?;
         let devcontainer_dir = devcontainer_json.parent().unwrap_or(project_path);
 
-        // Determine image source and ensure image is available
-        let image_source = config.image_source(devcontainer_dir)?;
-        let image_tag = format!("devaipod-{}", pod_name);
-        let image = podman
-            .ensure_image(
-                &image_source,
-                &image_tag,
-                config.has_features(),
-                Some(project_path),
-            )
-            .await
-            .context("Failed to ensure container image")?;
+        // Determine image - use override if provided, otherwise build/pull from devcontainer.json
+        let image = if let Some(override_image) = image_override {
+            tracing::info!("Using image override: {}", override_image);
+            override_image.to_string()
+        } else {
+            let image_source = config.image_source(devcontainer_dir)?;
+            let image_tag = format!("devaipod-{}", pod_name);
+            podman
+                .ensure_image(
+                    &image_source,
+                    &image_tag,
+                    config.has_features(),
+                    Some(project_path),
+                )
+                .await
+                .context("Failed to ensure container image")?
+        };
 
         // Create workspace volume and clone repo into it
         let volume_name = format!("{}-workspace", pod_name);

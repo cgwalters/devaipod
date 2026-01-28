@@ -97,6 +97,12 @@ struct UpOptions {
     /// SSH into workspace after starting
     #[arg(short = 'S', long)]
     ssh: bool,
+    /// Use a specific container image instead of building from devcontainer.json
+    ///
+    /// This is useful for testing locally-built devcontainer images.
+    /// The image must already exist locally or be pullable.
+    #[arg(long, value_name = "IMAGE")]
+    image: Option<String>,
     /// Configure service-gator scopes for AI agent access to external services.
     ///
     /// Format: service:scope where service is github, gitlab, jira, etc.
@@ -464,6 +470,7 @@ async fn cmd_up(
     let no_prompt = opts.no_prompt;
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
+    let image = opts.image.as_deref();
     let service_gator_scopes = &opts.service_gator_scopes;
 
     let source_path = std::path::Path::new(source).canonicalize().ok();
@@ -602,6 +609,7 @@ async fn cmd_up(
         &source,
         &extra_labels,
         Some(&service_gator_config),
+        image,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -706,6 +714,7 @@ async fn cmd_up_pr(
     let no_prompt = opts.no_prompt;
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
+    let image = opts.image.as_deref();
 
     tracing::info!(
         "Setting up PR #{} ({}/{})...",
@@ -819,6 +828,7 @@ async fn cmd_up_pr(
         &source,
         &extra_labels,
         None, // Use config.service_gator for PR workflows
+        image,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -911,6 +921,7 @@ async fn cmd_up_remote(
     let no_prompt = opts.no_prompt;
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
+    let image = opts.image.as_deref();
     let service_gator_scopes = &opts.service_gator_scopes;
 
     tracing::info!("Setting up {}...", remote_url);
@@ -1080,6 +1091,7 @@ async fn cmd_up_remote(
         &source,
         &extra_labels,
         Some(&service_gator_config),
+        image,
     )
     .await
     .context("Failed to create devaipod pod")?;
