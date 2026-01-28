@@ -628,12 +628,6 @@ async fn cmd_up(
         .await
         .context("Failed to start pod")?;
 
-    // Wait for the agent to be ready before proceeding
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 60, 500)
-        .await
-        .context("Agent container failed to start")?;
-
     // Copy bind_home files into containers (using podman cp instead of bind mounts
     // to avoid permission issues with rootless podman)
     tracing::debug!("Copying bind_home files...");
@@ -831,12 +825,6 @@ async fn cmd_up_pr(
         .start(&podman)
         .await
         .context("Failed to start pod")?;
-
-    // Wait for the agent to be ready
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 120, 500)
-        .await
-        .context("Agent container failed to start")?;
 
     // Copy bind_home files
     tracing::debug!("Copying bind_home files...");
@@ -1094,12 +1082,6 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         .start(&podman)
         .await
         .context("Failed to start pod")?;
-
-    // Wait for the agent to be ready
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 120, 500)
-        .await
-        .context("Agent container failed to start")?;
 
     // Copy bind_home files
     tracing::debug!("Copying bind_home files...");
@@ -1885,12 +1867,6 @@ async fn cmd_rebuild(
         .await
         .context("Failed to start pod")?;
 
-    // Wait for the agent to be ready
-    devaipod_pod
-        .wait_for_agent_ready(&podman, 120, 500)
-        .await
-        .context("Agent container failed to start")?;
-
     // Copy bind_home files
     tracing::debug!("Copying bind_home files...");
     devaipod_pod
@@ -1999,6 +1975,13 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
 
     let pod_json: serde_json::Value =
         serde_json::from_slice(&pod_output.stdout).context("Failed to parse pod inspect output")?;
+
+    // podman pod inspect returns an array, extract the first element
+    let pod_json = pod_json
+        .as_array()
+        .and_then(|arr| arr.first())
+        .cloned()
+        .unwrap_or(pod_json);
 
     // Get container list using podman container ls
     let containers_output = podman_command()
@@ -2119,13 +2102,14 @@ fn cmd_status(pod_name: &str, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-/// Check if the agent health endpoint is responding
+/// Check if the agent is listening on its port
 fn check_agent_health(pod_name: &str) -> Option<bool> {
     let workspace_container = format!("{}-workspace", pod_name);
-    let health_url = format!("http://localhost:{}/global/health", pod::OPENCODE_PORT);
 
-    // Try to curl the health endpoint from inside the workspace container
-    let check_cmd = format!("curl -sf '{}' >/dev/null 2>&1", health_url);
+    // Use nc to check if the port is accepting connections.
+    // This is more reliable than HTTP health checks since opencode's
+    // endpoints may return errors during/after initialization.
+    let check_cmd = format!("nc -z localhost {} 2>/dev/null", pod::OPENCODE_PORT);
     let result = podman_command()
         .args(["exec", &workspace_container, "/bin/sh", "-c", &check_cmd])
         .status();

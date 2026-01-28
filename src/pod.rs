@@ -536,61 +536,6 @@ impl DevaipodPod {
         Ok(())
     }
 
-    /// Wait for the agent container to be ready
-    ///
-    /// Polls the agent's health endpoint until it responds or timeout is reached.
-    /// The agent exposes a health endpoint at http://localhost:OPENCODE_PORT/global/health
-    pub async fn wait_for_agent_ready(
-        &self,
-        podman: &PodmanService,
-        timeout_secs: u64,
-        poll_interval_ms: u64,
-    ) -> Result<()> {
-        use std::time::{Duration, Instant};
-
-        let health_url = format!("http://localhost:{}/global/health", OPENCODE_PORT);
-        let timeout = Duration::from_secs(timeout_secs);
-        let poll_interval = Duration::from_millis(poll_interval_ms);
-        let start = Instant::now();
-
-        tracing::debug!("Waiting for agent to be ready...");
-
-        loop {
-            // Check if we've exceeded timeout
-            if start.elapsed() > timeout {
-                return Err(color_eyre::eyre::eyre!(
-                    "Agent did not become ready within {} seconds. \
-                     Try checking logs with: podman logs {}",
-                    timeout_secs,
-                    self.agent_container
-                ));
-            }
-
-            // Try to curl the health endpoint from inside the workspace container
-            // (since containers share the pod's network namespace)
-            let check_cmd = format!("curl -sf '{}' >/dev/null 2>&1", health_url);
-            let result = podman
-                .exec(
-                    &self.workspace_container,
-                    &["/bin/sh", "-c", &check_cmd],
-                    None,
-                    None,
-                )
-                .await;
-
-            match result {
-                Ok(0) => {
-                    tracing::debug!("Agent ready after {:.1}s", start.elapsed().as_secs_f64());
-                    return Ok(());
-                }
-                Ok(_) | Err(_) => {
-                    // Not ready yet, wait and retry
-                    tokio::time::sleep(poll_interval).await;
-                }
-            }
-        }
-    }
-
     /// Install dotfiles in the workspace container
     ///
     /// This should be called after the pod starts but BEFORE lifecycle commands,
