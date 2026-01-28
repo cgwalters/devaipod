@@ -119,6 +119,9 @@ use crate::podman::{ContainerConfig, PodmanService};
 /// Port for the opencode server in the agent container
 pub const OPENCODE_PORT: u16 = 4096;
 
+/// Path for the agent's home directory (mounted from a persistent volume)
+const AGENT_HOME_PATH: &str = "/home/agent";
+
 /// Default PATH for containers when we need to synthesize one.
 /// This covers the standard locations where utilities are typically found.
 const DEFAULT_CONTAINER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -418,6 +421,18 @@ impl DevaipodPod {
             None
         };
 
+        // Create agent home volume for persistent agent state (credentials, config, etc.)
+        let agent_home_volume = format!("{}-agent-home", pod_name);
+        if !podman.volume_exists(&agent_home_volume).await? {
+            podman
+                .create_volume(&agent_home_volume)
+                .await
+                .context("Failed to create agent home volume")?;
+            tracing::debug!("Created agent home volume '{}'", agent_home_volume);
+        } else {
+            tracing::debug!("Using existing agent home volume '{}'", agent_home_volume);
+        }
+
         // Create agent container with restricted security
         let agent_config = Self::agent_container_config(
             project_path,
@@ -427,6 +442,7 @@ impl DevaipodPod {
             Some(devcontainer_config),
             enable_network_isolation,
             &volume_name,
+            &agent_home_volume,
             global_config,
         );
         podman
@@ -579,7 +595,7 @@ impl DevaipodPod {
             dotfiles,
             &self.agent_container,
             None,
-            Some("/tmp/agent-home"), // agent uses explicit HOME
+            Some(AGENT_HOME_PATH), // agent uses explicit HOME
         )
         .await
     }
@@ -736,7 +752,7 @@ echo "Dotfiles installed successfully"
     /// mounts avoids permission issues with rootless podman and user namespaces.
     ///
     /// For the workspace container, files are copied to the user's home directory.
-    /// For the agent container, files are copied to the agent's HOME (/tmp/agent-home).
+    /// For the agent container, files are copied to the agent's HOME (persistent volume).
     pub async fn copy_bind_home_files(
         &self,
         podman: &PodmanService,
@@ -783,12 +799,10 @@ echo "Dotfiles installed successfully"
             }
         }
 
-        // Copy files to agent container (to agent's HOME which is /tmp/agent-home)
-        // This directory is created by the agent startup script and is writable
-        const AGENT_HOME: &str = "/tmp/agent-home";
+        // Copy files to agent container (to agent's HOME which is a persistent volume)
         for relative_path in &agent_bind_home.paths {
             let source = host_home.join(relative_path);
-            let target = format!("{}/{}", AGENT_HOME, relative_path);
+            let target = format!("{}/{}", AGENT_HOME_PATH, relative_path);
 
             if !source.exists() {
                 tracing::warn!(
@@ -834,7 +848,7 @@ echo "Dotfiles installed successfully"
             return Ok(());
         }
 
-        // The agent's HOME is /tmp/agent-home, and opencode config goes in ~/.config/opencode/
+        // The agent's HOME is a persistent volume, and opencode config goes in ~/.config/opencode/
         // service-gator runs in the gator container and is accessible at localhost:GATOR_PORT
         let mcp_url = format!("http://localhost:{}/mcp", GATOR_PORT);
 
@@ -856,14 +870,16 @@ echo "Dotfiles installed successfully"
         // Write the config file inside the agent container
         let script = format!(
             r#"
-mkdir -p /tmp/agent-home/.config/opencode
-cat > /tmp/agent-home/.config/opencode/opencode.json << 'OPENCODE_CONFIG'
-{}
+mkdir -p {agent_home}/.config/opencode
+cat > {agent_home}/.config/opencode/opencode.json << 'OPENCODE_CONFIG'
+{{}}
 OPENCODE_CONFIG
-echo "Configured opencode with service-gator MCP at {}"
+echo "Configured opencode with service-gator MCP at {mcp_url}"
 "#,
-            config_content, mcp_url
+            agent_home = AGENT_HOME_PATH,
+            mcp_url = mcp_url
         );
+        let script = script.replace("{}", &config_content);
 
         let exit_code = podman
             .exec(&self.agent_container, &["/bin/sh", "-c", &script], None, None)
@@ -1145,31 +1161,23 @@ echo "Nested podman configured successfully"
             // Set workdir to the workspace folder - where the cloned repo lives
             workdir: Some(workspace_folder.to_string()),
             user: user.map(|u| u.to_string()),
-            // Keep the container running, create opencode shim in user's bin, print agent connection info
+            // Keep the container running, create opencode shim in /usr/local/bin, print agent connection info
             command: Some(vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 format!(
                     r#"
-# Create opencode-agent shim that attaches to the agent container's server
-mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/opencode-agent" << 'EOF'
+# Create opencode-connect shim that attaches to the agent container's server
+# Install to /usr/local/bin so it's in PATH by default
+sudo tee /usr/local/bin/opencode-connect > /dev/null << 'EOF'
 #!/bin/sh
 # Shim to connect to devaipod agent container
 exec opencode attach http://localhost:{port} "$@"
 EOF
-chmod +x "$HOME/.local/bin/opencode-agent"
-
-# Also create a short 'oc' alias
-ln -sf "$HOME/.local/bin/opencode-agent" "$HOME/.local/bin/oc"
-
-# Add to PATH if not already there
-if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
-    export PATH="$HOME/.local/bin:$PATH"
-fi
+sudo chmod +x /usr/local/bin/opencode-connect
 
 echo "devaipod: opencode agent at http://localhost:{port}"
-echo "devaipod: use 'opencode-agent' or 'oc' to connect (in ~/.local/bin)"
+echo "devaipod: use 'opencode-connect' to attach to the agent"
 
 # Handle SIGTERM gracefully for clean shutdown
 trap 'exit 0' TERM INT
@@ -1210,12 +1218,12 @@ while true; do sleep 86400 & wait $!; done
         _container_home: &str,
         devcontainer_config: Option<&DevcontainerConfig>,
         use_proxy: bool,
-        volume_name: &str,
+        workspace_volume: &str,
+        agent_home_volume: &str,
         global_config: &crate::config::Config,
     ) -> ContainerConfig {
-        // Use /tmp as agent home - it's always writable and isolated per container.
-        // In the future we could mount a named volume for persistent agent state.
-        let agent_home = "/tmp/agent-home".to_string();
+        // Agent home is mounted from a persistent volume so state survives restarts
+        let agent_home = AGENT_HOME_PATH.to_string();
 
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), agent_home.clone());
@@ -1324,8 +1332,11 @@ while true; do sleep 86400 & wait $!; done
             drop_all_caps: true,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
-            // Mount the workspace volume (initialized with cloned repo)
-            volume_mounts: vec![(volume_name.to_string(), "/workspaces".to_string())],
+            // Mount the workspace volume and agent home volume
+            volume_mounts: vec![
+                (workspace_volume.to_string(), "/workspaces".to_string()),
+                (agent_home_volume.to_string(), AGENT_HOME_PATH.to_string()),
+            ],
             ..Default::default()
         }
     }
@@ -1427,7 +1438,7 @@ mod tests {
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
         assert_eq!(cmd[1], "-c");
-        assert!(cmd[2].contains("opencode-agent")); // Creates shim
+        assert!(cmd[2].contains("opencode-connect")); // Creates shim
         assert!(cmd[2].contains("opencode attach")); // Shim uses attach
         assert!(cmd[2].contains(&format!("http://localhost:{}", OPENCODE_PORT)));
         assert!(cmd[2].contains("trap")); // Has SIGTERM trap for graceful shutdown
@@ -1452,11 +1463,14 @@ mod tests {
             None,
             false,
             "test-volume",
+            "test-agent-home",
             &global_config,
         );
 
-        // Volume mount for workspace
-        assert_eq!(container_config.volume_mounts.len(), 1);
+        // Volume mounts for workspace and agent home
+        assert_eq!(container_config.volume_mounts.len(), 2);
+        assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
+        assert_eq!(container_config.volume_mounts[1].1, AGENT_HOME_PATH);
 
         // Verify command wraps opencode in a shell to create home dir
         let cmd = container_config.command.as_ref().unwrap();
@@ -1473,10 +1487,10 @@ mod tests {
             vec!["NET_BIND_SERVICE".to_string()]
         );
 
-        // Verify agent has isolated home in /tmp
+        // Verify agent has persistent home directory
         assert_eq!(
             container_config.env.get("HOME"),
-            Some(&"/tmp/agent-home".to_string())
+            Some(&AGENT_HOME_PATH.to_string())
         );
     }
 
@@ -1501,6 +1515,7 @@ mod tests {
             None,
             false,
             "test-volume",
+            "test-agent-home",
             &global_config,
         );
 
@@ -1856,6 +1871,7 @@ mod tests {
             None,
             true, // use_proxy
             "test-volume",
+            "test-agent-home",
             &global_config,
         );
 
@@ -1886,6 +1902,7 @@ mod tests {
             None,
             false, // no proxy
             "test-volume",
+            "test-agent-home",
             &global_config,
         );
 
