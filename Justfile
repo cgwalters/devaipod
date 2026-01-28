@@ -20,10 +20,13 @@ check:
 test:
     cargo test
 
+# Default test image (must have git installed)
+default_test_image := "ghcr.io/bootc-dev/devenv-debian:latest"
+
 # Run integration tests (requires podman)
-test-integration:
+test-integration image=default_test_image:
     cargo build
-    DEVAIPOD_PATH=./target/debug/devaipod cargo test -p integration-tests
+    DEVAIPOD_PATH=./target/debug/devaipod DEVAIPOD_TEST_IMAGE={{image}} cargo test -p integration-tests
 
 # Run all tests (unit + integration)
 test-all: test test-integration

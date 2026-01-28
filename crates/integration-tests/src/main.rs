@@ -199,13 +199,18 @@ impl TestRepo {
         cmd!(sh, "git -C {repo} config user.email test@example.com").run()?;
         cmd!(sh, "git -C {repo} config user.name 'Test User'").run()?;
 
-        // Create devcontainer.json
+        // Create devcontainer.json - use test image from env (must have git)
         let devcontainer_dir = repo_path.join(".devcontainer");
         std::fs::create_dir_all(&devcontainer_dir)?;
-        let devcontainer_json = r#"{
+        let test_image = std::env::var("DEVAIPOD_TEST_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/bootc-dev/devenv-debian:latest".to_string());
+        let devcontainer_json = format!(
+            r#"{{
     "name": "integration-test",
-    "image": "docker.io/library/alpine:latest"
-}"#;
+    "image": "{}"
+}}"#,
+            test_image
+        );
         std::fs::write(
             devcontainer_dir.join("devcontainer.json"),
             devcontainer_json,
@@ -263,9 +268,13 @@ impl TestRepo {
     }
 }
 
-/// Generate a unique test pod name
+/// The prefix devaipod adds to all pod names
+const POD_NAME_PREFIX: &str = "devaipod-";
+
+/// Generate a unique test pod name with the devaipod prefix
 ///
 /// Uses timestamp + random bits to ensure uniqueness across parallel test runs.
+/// Returns the full pod name as it will be created by devaipod (with prefix).
 pub(crate) fn unique_test_name(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -273,7 +282,14 @@ pub(crate) fn unique_test_name(prefix: &str) -> String {
         .unwrap_or_default();
     // Use lower bits of timestamp + nanos for uniqueness
     let val = (now.as_secs() & 0xFFFF) ^ ((now.subsec_nanos() as u64) & 0xFFFF);
-    format!("{}-{:x}", prefix, val)
+    format!("{}{}-{:x}", POD_NAME_PREFIX, prefix, val)
+}
+
+/// Get the short name (without prefix) for passing to --name
+///
+/// devaipod's --name flag will add the prefix automatically
+pub(crate) fn short_name(full_name: &str) -> &str {
+    full_name.strip_prefix(POD_NAME_PREFIX).unwrap_or(full_name)
 }
 
 /// Pod cleanup helper - removes pods on drop

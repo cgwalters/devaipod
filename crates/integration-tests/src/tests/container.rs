@@ -7,8 +7,8 @@ use color_eyre::Result;
 use xshell::cmd;
 
 use crate::{
-    podman_integration_test, run_devaipod, run_devaipod_in, shell, unique_test_name, PodGuard,
-    TestRepo,
+    podman_integration_test, run_devaipod, run_devaipod_in, shell, short_name, unique_test_name,
+    PodGuard, TestRepo,
 };
 
 fn test_pod_creation_and_deletion() -> Result<()> {
@@ -18,8 +18,11 @@ fn test_pod_creation_and_deletion() -> Result<()> {
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
 
-    // Create pod with explicit name
-    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--name", &pod_name])?;
+    // Create pod with explicit name (pass short name, devaipod adds prefix)
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
     if !output.success() {
         bail!("devaipod up failed: {}", output.combined());
     }
@@ -87,8 +90,11 @@ fn test_workspace_container_has_repo() -> Result<()> {
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
 
-    // Create pod
-    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--name", &pod_name])?;
+    // Create pod (pass short name, devaipod adds prefix)
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
     if !output.success() {
         bail!("devaipod up failed: {}", output.combined());
     }
@@ -123,8 +129,11 @@ fn test_stop_and_start_pod() -> Result<()> {
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
 
-    // Create pod
-    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--name", &pod_name])?;
+    // Create pod (pass short name, devaipod adds prefix)
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
     if !output.success() {
         bail!("devaipod up failed: {}", output.combined());
     }
@@ -166,15 +175,18 @@ fn test_image_override_creates_pod() -> Result<()> {
     pods.add(&pod_name);
 
     // Create pod with image override - use an image that has git
+    // (pass short name, devaipod adds prefix)
+    let test_image = std::env::var("DEVAIPOD_TEST_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/bootc-dev/devenv-debian:latest".to_string());
     let output = run_devaipod_in(
         &repo.repo_path,
         &[
             "up",
             ".",
             "--name",
-            &pod_name,
+            short_name(&pod_name),
             "--image",
-            "quay.io/fedora/fedora:latest",
+            &test_image,
         ],
     )?;
     if !output.success() {
@@ -217,8 +229,11 @@ fn test_logs_command() -> Result<()> {
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
 
-    // Create pod
-    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--name", &pod_name])?;
+    // Create pod (pass short name, devaipod adds prefix)
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
     if !output.success() {
         bail!("devaipod up failed: {}", output.combined());
     }
@@ -242,8 +257,11 @@ fn test_ssh_runs_command() -> Result<()> {
     let mut pods = PodGuard::new();
     pods.add(&pod_name);
 
-    // Create pod
-    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--name", &pod_name])?;
+    // Create pod (pass short name, devaipod adds prefix)
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
     if !output.success() {
         bail!("devaipod up failed: {}", output.combined());
     }
