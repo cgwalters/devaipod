@@ -17,6 +17,7 @@ mod forge;
 mod git;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
+mod init;
 mod pod;
 mod podman;
 mod proxy;
@@ -303,6 +304,21 @@ enum HostCommand {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Initialize devaipod configuration
+    ///
+    /// Interactive setup wizard for first-time users. Configures:
+    /// - Dotfiles/homegit repository
+    /// - Forge tokens (GitHub, GitLab, Forgejo) via podman secrets
+    /// - OpenCode configuration recommendations
+    ///
+    /// Examples:
+    ///   devaipod init
+    ///   devaipod init --config ~/.config/devaipod-test.toml
+    Init {
+        /// Path to write config file (default: ~/.config/devaipod.toml)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 // =============================================================================
@@ -373,7 +389,30 @@ fn init_tracing(verbose: bool, quiet: bool) {
         .init();
 }
 
+/// Commands that don't require a config file to exist
+fn command_requires_config(cmd: &HostCommand) -> bool {
+    !matches!(cmd, HostCommand::Init { .. } | HostCommand::Completions { .. })
+}
+
 async fn run_host(cli: HostCli) -> Result<()> {
+    // Check if config file is required and exists
+    if command_requires_config(&cli.command) {
+        let config_path = cli
+            .config
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(config::config_path);
+        if !config_path.exists() {
+            eprintln!("No configuration file found at {}", config_path.display());
+            eprintln!();
+            eprintln!("devaipod requires a configuration file to run.");
+            eprintln!("Run 'devaipod init' to create one interactively.");
+            eprintln!();
+            eprintln!("For more information, see: https://github.com/cgwalters/devaipod#configuration");
+            std::process::exit(1);
+        }
+    }
+
     let config = config::load_config(cli.config.as_deref())?;
 
     match cli.command {
@@ -435,6 +474,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             cmd_status(&normalize_pod_name(&workspace), json)
         }
         HostCommand::Completions { shell } => cmd_completions(shell),
+        HostCommand::Init { config } => init::cmd_init(config.as_deref()),
     }
 }
 
