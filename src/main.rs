@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use clap::{CommandFactory, Parser};
+use clap::{Args, CommandFactory, Parser};
 use color_eyre::eyre::{bail, Context, Result};
 
 mod compose;
@@ -82,6 +82,35 @@ struct HostCli {
     command: HostCommand,
 }
 
+/// Common options for workspace creation commands
+#[derive(Debug, Args)]
+struct UpOptions {
+    /// Task description for the AI agent (also stored as workspace description)
+    #[arg(value_name = "TASK")]
+    task: Option<String>,
+    /// Store task description but don't send it to the agent as a prompt
+    #[arg(short = 'n', long)]
+    no_prompt: bool,
+    /// Generate configuration files but don't start containers
+    #[arg(long)]
+    dry_run: bool,
+    /// SSH into workspace after starting
+    #[arg(short = 'S', long)]
+    ssh: bool,
+    /// Configure service-gator scopes for AI agent access to external services.
+    ///
+    /// Format: service:scope where service is github, gitlab, jira, etc.
+    /// Can be specified multiple times.
+    ///
+    /// Examples:
+    ///   --service-gator=github:readonly-all       # Read-only access to all GitHub repos
+    ///   --service-gator=github:myorg/myrepo       # Read access to specific repo
+    ///   --service-gator=github:myorg/*            # Read access to all repos in org
+    ///   --service-gator=github:myorg/repo:write   # Write access to specific repo
+    #[arg(long = "service-gator", value_name = "SCOPE")]
+    service_gator_scopes: Vec<String>,
+}
+
 #[derive(Debug, Parser)]
 enum HostCommand {
     /// Create/start a workspace with AI agent
@@ -97,45 +126,23 @@ enum HostCommand {
     Up {
         /// Source: local path, git URL, or PR URL
         source: String,
-        /// Task description for the AI agent (also stored as workspace description)
-        #[arg(value_name = "TASK")]
-        task: Option<String>,
         /// AI agent to run: goose, claude, opencode (default: from config or goose)
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Don't start AI agent automatically
         #[arg(long)]
         no_agent: bool,
-        /// Store task description but don't send it to the agent as a prompt
-        #[arg(short = 'n', long)]
-        no_prompt: bool,
         /// DevPod provider to use (default: docker)
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
         /// DevPod IDE to open (default: none)
         #[arg(long, value_name = "IDE")]
         ide: Option<String>,
-        /// Generate configuration files but don't start containers
-        #[arg(long)]
-        dry_run: bool,
         /// Enable agent sidecar container (experimental)
         #[arg(long)]
         agent_sidecar: bool,
-        /// SSH into workspace after starting
-        #[arg(short = 'S', long)]
-        ssh: bool,
-        /// Configure service-gator scopes for AI agent access to external services.
-        ///
-        /// Format: service:scope where service is github, gitlab, jira, etc.
-        /// Can be specified multiple times.
-        ///
-        /// Examples:
-        ///   --service-gator=github:readonly-all       # Read-only access to all GitHub repos
-        ///   --service-gator=github:myorg/myrepo       # Read access to specific repo
-        ///   --service-gator=github:myorg/*            # Read access to all repos in org
-        ///   --service-gator=github:myorg/repo:write   # Write access to specific repo
-        #[arg(long = "service-gator", value_name = "SCOPE")]
-        service_gator_scopes: Vec<String>,
+        #[command(flatten)]
+        opts: UpOptions,
     },
     /// Run an AI agent with a task
     ///
@@ -350,30 +357,22 @@ async fn run_host(cli: HostCli) -> Result<()> {
     match cli.command {
         HostCommand::Up {
             source,
-            task,
             agent,
             no_agent,
-            no_prompt,
             provider,
             ide,
-            dry_run,
             agent_sidecar,
-            ssh,
-            service_gator_scopes,
+            opts,
         } => {
             cmd_up(
                 &config,
                 &source,
-                task.as_deref(),
-                no_prompt,
                 agent.as_deref(),
                 no_agent,
                 provider.as_deref(),
                 ide.as_deref(),
-                dry_run,
                 agent_sidecar,
-                ssh,
-                &service_gator_scopes,
+                opts,
             )
             .await
         }
@@ -440,20 +439,16 @@ fn run_container(cli: ContainerCli) -> Result<()> {
 async fn cmd_up(
     config: &config::Config,
     source: &str,
-    task: Option<&str>,
-    no_prompt: bool,
     _agent: Option<&str>,
     _no_agent: bool,
     _provider: Option<&str>,
     _ide: Option<&str>,
-    dry_run: bool,
     _agent_sidecar: bool,
-    ssh: bool,
-    service_gator_scopes: &[String],
+    opts: UpOptions,
 ) -> Result<()> {
     // Check if source is a PR/MR URL
     if let Some(pr_ref) = forge::parse_pr_url(source) {
-        return cmd_up_pr(config, pr_ref, task, no_prompt, dry_run, ssh).await;
+        return cmd_up_pr(config, pr_ref, &opts).await;
     }
 
     // Resolve local paths - if it looks like a URL, treat it as remote
@@ -462,17 +457,14 @@ async fn cmd_up(
         || source.starts_with("git@");
 
     if is_remote_url {
-        return cmd_up_remote(
-            config,
-            source,
-            task,
-            no_prompt,
-            dry_run,
-            ssh,
-            service_gator_scopes,
-        )
-        .await;
+        return cmd_up_remote(config, source, &opts).await;
     }
+
+    let task = opts.task.as_deref();
+    let no_prompt = opts.no_prompt;
+    let dry_run = opts.dry_run;
+    let ssh = opts.ssh;
+    let service_gator_scopes = &opts.service_gator_scopes;
 
     let source_path = std::path::Path::new(source).canonicalize().ok();
 
@@ -708,11 +700,13 @@ async fn cmd_up(
 async fn cmd_up_pr(
     config: &config::Config,
     pr_ref: forge::PullRequestRef,
-    task: Option<&str>,
-    no_prompt: bool,
-    dry_run: bool,
-    ssh: bool,
+    opts: &UpOptions,
 ) -> Result<()> {
+    let task = opts.task.as_deref();
+    let no_prompt = opts.no_prompt;
+    let dry_run = opts.dry_run;
+    let ssh = opts.ssh;
+
     tracing::info!(
         "Setting up PR #{} ({}/{})...",
         pr_ref.number,
@@ -911,12 +905,14 @@ async fn cmd_up_pr(
 async fn cmd_up_remote(
     config: &config::Config,
     remote_url: &str,
-    task: Option<&str>,
-    no_prompt: bool,
-    dry_run: bool,
-    ssh: bool,
-    service_gator_scopes: &[String],
+    opts: &UpOptions,
 ) -> Result<()> {
+    let task = opts.task.as_deref();
+    let no_prompt = opts.no_prompt;
+    let dry_run = opts.dry_run;
+    let ssh = opts.ssh;
+    let service_gator_scopes = &opts.service_gator_scopes;
+
     tracing::info!("Setting up {}...", remote_url);
 
     // Extract repo name from URL for naming
