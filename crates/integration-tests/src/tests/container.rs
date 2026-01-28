@@ -230,3 +230,56 @@ fn test_logs_command() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_logs_command);
+
+fn test_ssh_runs_command() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = "test-repo";
+
+    let mut pods = PodGuard::new();
+    pods.add(pod_name);
+
+    // Create pod
+    let output = run_devaipod_in(&repo.repo_path, &["up", "."])?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    // Give containers a moment to start
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Run a command via ssh
+    let ssh_output = run_devaipod_in(&repo.repo_path, &["ssh", pod_name, "--", "echo", "hello"])?;
+    ssh_output.assert_success("devaipod ssh echo");
+    assert!(
+        ssh_output.stdout.contains("hello"),
+        "ssh should run command and return output: {}",
+        ssh_output.combined()
+    );
+
+    // Verify we can see the workspace
+    let ls_output = run_devaipod_in(
+        &repo.repo_path,
+        &["ssh", pod_name, "--", "ls", "/workspaces"],
+    )?;
+    ls_output.assert_success("devaipod ssh ls");
+    assert!(
+        ls_output.stdout.contains("test-repo"),
+        "Should see workspace directory: {}",
+        ls_output.stdout
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_ssh_runs_command);
+
+fn test_ssh_nonexistent_pod_fails() -> Result<()> {
+    // SSH to a pod that doesn't exist should fail gracefully
+    let output = run_devaipod_in(
+        std::path::Path::new("."),
+        &["ssh", "nonexistent-pod-12345", "--", "echo", "hi"],
+    )?;
+    assert!(!output.success(), "ssh to nonexistent pod should fail");
+
+    Ok(())
+}
+podman_integration_test!(test_ssh_nonexistent_pod_fails);
