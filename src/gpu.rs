@@ -42,7 +42,7 @@ impl GpuInfo {
         }
 
         // Check for NVIDIA CDI support
-        info.has_nvidia_cdi = Path::new("/var/run/cdi/nvidia.yaml").exists()
+        info.has_nvidia_cdi = Path::new("/run/cdi/nvidia.yaml").exists()
             || Path::new("/etc/cdi/nvidia.yaml").exists();
 
         // Detect AMD GPUs via DRI render nodes

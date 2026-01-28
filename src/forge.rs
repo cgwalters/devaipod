@@ -103,18 +103,9 @@ impl PullRequestInfo {
                 "io.devaipod.forge".to_string(),
                 self.pr_ref.forge_type.to_string(),
             ),
-            (
-                "io.devaipod.repo".to_string(),
-                self.pr_ref.host_repo(),
-            ),
-            (
-                "io.devaipod.pr".to_string(),
-                self.pr_ref.number.to_string(),
-            ),
-            (
-                "io.devaipod.commit".to_string(),
-                self.head_sha.clone(),
-            ),
+            ("io.devaipod.repo".to_string(), self.pr_ref.host_repo()),
+            ("io.devaipod.pr".to_string(), self.pr_ref.number.to_string()),
+            ("io.devaipod.commit".to_string(), self.head_sha.clone()),
         ]
     }
 }
@@ -153,10 +144,7 @@ pub fn parse_pr_url(url: &str) -> Option<PullRequestRef> {
     }
 
     // GitLab: /owner/repo/-/merge_requests/123
-    if path_segments.len() >= 5
-        && path_segments[2] == "-"
-        && path_segments[3] == "merge_requests"
-    {
+    if path_segments.len() >= 5 && path_segments[2] == "-" && path_segments[3] == "merge_requests" {
         let number: u64 = path_segments[4].parse().ok()?;
         return Some(PullRequestRef {
             forge_type: ForgeType::GitLab,
@@ -292,7 +280,10 @@ async fn fetch_github_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
         request = request.header("Authorization", format!("Bearer {}", token));
     }
 
-    let response = request.send().await.context("Failed to fetch PR from GitHub API")?;
+    let response = request
+        .send()
+        .await
+        .context("Failed to fetch PR from GitHub API")?;
 
     if !response.status().is_success() {
         bail!(
@@ -302,7 +293,10 @@ async fn fetch_github_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
         );
     }
 
-    let json: serde_json::Value = response.json().await.context("Failed to parse GitHub API response")?;
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to parse GitHub API response")?;
 
     let title = json
         .get("title")
@@ -310,7 +304,9 @@ async fn fetch_github_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
         .unwrap_or("Untitled")
         .to_string();
 
-    let head = json.get("head").ok_or_else(|| color_eyre::eyre::eyre!("Missing 'head' in PR response"))?;
+    let head = json
+        .get("head")
+        .ok_or_else(|| color_eyre::eyre::eyre!("Missing 'head' in PR response"))?;
 
     let head_clone_url = head
         .get("repo")
@@ -358,16 +354,17 @@ async fn fetch_gitlab_mr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
     };
 
     let client = reqwest::Client::new();
-    let mut request = client
-        .get(&api_url)
-        .header("User-Agent", "devaipod");
+    let mut request = client.get(&api_url).header("User-Agent", "devaipod");
 
     // Use GITLAB_TOKEN if available
     if let Ok(token) = std::env::var("GITLAB_TOKEN") {
         request = request.header("PRIVATE-TOKEN", token);
     }
 
-    let response = request.send().await.context("Failed to fetch MR from GitLab API")?;
+    let response = request
+        .send()
+        .await
+        .context("Failed to fetch MR from GitLab API")?;
 
     if !response.status().is_success() {
         bail!(
@@ -377,7 +374,10 @@ async fn fetch_gitlab_mr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
         );
     }
 
-    let json: serde_json::Value = response.json().await.context("Failed to parse GitLab API response")?;
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to parse GitLab API response")?;
 
     let title = json
         .get("title")
@@ -407,7 +407,10 @@ async fn fetch_gitlab_mr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
     let source_project_url = if pr_ref.host == "gitlab.com" {
         format!("https://gitlab.com/api/v4/projects/{}", source_project_id)
     } else {
-        format!("https://{}/api/v4/projects/{}", pr_ref.host, source_project_id)
+        format!(
+            "https://{}/api/v4/projects/{}",
+            pr_ref.host, source_project_id
+        )
     };
 
     let source_response = client
@@ -441,16 +444,17 @@ async fn fetch_forgejo_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
     );
 
     let client = reqwest::Client::new();
-    let mut request = client
-        .get(&api_url)
-        .header("User-Agent", "devaipod");
+    let mut request = client.get(&api_url).header("User-Agent", "devaipod");
 
     // Use FORGEJO_TOKEN or GITEA_TOKEN if available
     if let Ok(token) = std::env::var("FORGEJO_TOKEN").or_else(|_| std::env::var("GITEA_TOKEN")) {
         request = request.header("Authorization", format!("token {}", token));
     }
 
-    let response = request.send().await.context("Failed to fetch PR from Forgejo/Gitea API")?;
+    let response = request
+        .send()
+        .await
+        .context("Failed to fetch PR from Forgejo/Gitea API")?;
 
     if !response.status().is_success() {
         bail!(
@@ -460,7 +464,10 @@ async fn fetch_forgejo_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
         );
     }
 
-    let json: serde_json::Value = response.json().await.context("Failed to parse Forgejo/Gitea API response")?;
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to parse Forgejo/Gitea API response")?;
 
     let title = json
         .get("title")
@@ -468,7 +475,9 @@ async fn fetch_forgejo_pr(pr_ref: &PullRequestRef) -> Result<PullRequestInfo> {
         .unwrap_or("Untitled")
         .to_string();
 
-    let head = json.get("head").ok_or_else(|| color_eyre::eyre::eyre!("Missing 'head' in PR response"))?;
+    let head = json
+        .get("head")
+        .ok_or_else(|| color_eyre::eyre::eyre!("Missing 'head' in PR response"))?;
 
     let head_clone_url = head
         .get("repo")
@@ -554,7 +563,10 @@ mod tests {
             repo: "composefs-rs".to_string(),
             number: 200,
         };
-        assert_eq!(pr.upstream_url(), "https://github.com/containers/composefs-rs.git");
+        assert_eq!(
+            pr.upstream_url(),
+            "https://github.com/containers/composefs-rs.git"
+        );
     }
 
     #[test]

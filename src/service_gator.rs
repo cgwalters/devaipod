@@ -2,7 +2,7 @@
 //!
 //! This module handles starting and configuring the service-gator MCP server
 //! which provides scope-restricted access to external services (GitHub, JIRA)
-//! for AI agents running in the bwrap sandbox.
+//! for AI agents running in containers.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -13,14 +13,14 @@ use crate::config::{
     generate_service_gator_toml, GhRepoPermission, ServiceGatorConfig, SERVICE_GATOR_DEFAULT_PORT,
 };
 
-/// Path to the service-gator config file (inside the container, outside the sandbox)
-const SERVICE_GATOR_CONFIG_PATH: &str = "/var/run/devaipod/service-gator.toml";
+/// Path to the service-gator config file (inside the container)
+const SERVICE_GATOR_CONFIG_PATH: &str = "/run/devaipod/service-gator.toml";
 
 /// Path to the service-gator socket/state directory
-const SERVICE_GATOR_RUN_DIR: &str = "/var/run/devaipod";
+const SERVICE_GATOR_RUN_DIR: &str = "/run/devaipod";
 
 /// Path to the service-gator PID file
-const SERVICE_GATOR_PID_FILE: &str = "/var/run/devaipod/service-gator.pid";
+const SERVICE_GATOR_PID_FILE: &str = "/run/devaipod/service-gator.pid";
 
 /// Write the service-gator configuration file
 pub fn write_config(config: &ServiceGatorConfig) -> Result<PathBuf> {
@@ -165,7 +165,7 @@ pub fn generate_opencode_mcp_config(config: &ServiceGatorConfig) -> String {
     .to_string()
 }
 
-/// Path where we write the opencode config inside the agent's sandbox home
+/// Path where we write the opencode config inside the agent's home
 pub fn opencode_config_path(agent_home: &str) -> PathBuf {
     Path::new(agent_home)
         .join(".config")

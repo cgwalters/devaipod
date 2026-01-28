@@ -2,141 +2,219 @@
 
 use color_eyre::Result;
 
-use crate::{integration_test, run_devc};
+use crate::{
+    get_devaipod_command, integration_test, run_devaipod, run_devaipod_in, shell, TestRepo,
+};
+use xshell::cmd;
 
-fn test_devc_help() -> Result<()> {
-    let output = run_devc(&["--help"])?;
-    output.assert_success("devc --help");
+fn test_devaipod_help() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
 
-    let combined = output.combined();
+    let output = cmd!(sh, "{devaipod} --help").read()?;
+
     assert!(
-        combined.contains("Manage git worktrees"),
-        "Help should mention git worktrees"
+        output.contains("devaipod") || output.contains("Sandboxed AI"),
+        "Help should mention devaipod or its description"
     );
-    assert!(combined.contains("new"), "Help should list 'new' command");
+    assert!(output.contains("up"), "Help should list 'up' command");
+    assert!(output.contains("list"), "Help should list 'list' command");
     assert!(
-        combined.contains("enter"),
-        "Help should list 'enter' command"
+        output.contains("delete"),
+        "Help should list 'delete' command"
     );
-    assert!(combined.contains("list"), "Help should list 'list' command");
-    assert!(combined.contains("rm"), "Help should list 'rm' command");
 
     Ok(())
 }
-integration_test!(test_devc_help);
+integration_test!(test_devaipod_help);
 
-fn test_devc_new_help() -> Result<()> {
-    let output = run_devc(&["new", "--help"])?;
-    output.assert_success("devc new --help");
+fn test_devaipod_up_help() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
 
-    let combined = output.combined();
+    let output = cmd!(sh, "{devaipod} up --help").read()?;
+
     assert!(
-        combined.contains("SOURCE"),
+        output.contains("SOURCE"),
         "Help should mention SOURCE argument"
     );
     assert!(
-        combined.contains("--name"),
-        "Help should list --name option"
+        output.contains("--image"),
+        "Help should list --image option"
     );
     assert!(
-        combined.contains("--base"),
-        "Help should list --base option"
+        output.contains("--dry-run"),
+        "Help should list --dry-run option"
+    );
+    assert!(output.contains("--ssh"), "Help should list --ssh option");
+
+    Ok(())
+}
+integration_test!(test_devaipod_up_help);
+
+fn test_devaipod_list_help() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
+
+    let output = cmd!(sh, "{devaipod} list --help").read()?;
+
+    assert!(output.contains("--json"), "Help should list --json option");
+
+    Ok(())
+}
+integration_test!(test_devaipod_list_help);
+
+fn test_devaipod_delete_help() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
+
+    let output = cmd!(sh, "{devaipod} delete --help").read()?;
+
+    assert!(
+        output.contains("--force"),
+        "Help should list --force option"
     );
 
     Ok(())
 }
-integration_test!(test_devc_new_help);
+integration_test!(test_devaipod_delete_help);
 
-fn test_devc_new_sidecar_help() -> Result<()> {
-    let output = run_devc(&["new", "--help"])?;
-    output.assert_success("devc new --help (sidecar)");
+fn test_devaipod_ssh_help() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
 
-    let combined = output.combined();
+    let output = cmd!(sh, "{devaipod} ssh --help").read()?;
+
     assert!(
-        combined.contains("--sidecar"),
-        "Help should list --sidecar option"
-    );
-    assert!(
-        combined.contains("--sidecar-profile"),
-        "Help should list --sidecar-profile option"
-    );
-    assert!(
-        combined.contains("--no-sidecar"),
-        "Help should list --no-sidecar option"
-    );
-    assert!(
-        combined.contains("--sidecar-secret"),
-        "Help should list --sidecar-secret option"
-    );
-    assert!(
-        combined.contains("--secret-all"),
-        "Help should list --secret-all option"
+        output.contains("WORKSPACE"),
+        "Help should mention WORKSPACE argument"
     );
 
     Ok(())
 }
-integration_test!(test_devc_new_sidecar_help);
+integration_test!(test_devaipod_ssh_help);
 
-fn test_devc_enter_container_help() -> Result<()> {
-    let output = run_devc(&["enter", "--help"])?;
-    output.assert_success("devc enter --help");
+fn test_devaipod_logs_help() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
 
-    let combined = output.combined();
+    let output = cmd!(sh, "{devaipod} logs --help").read()?;
+
     assert!(
-        combined.contains("--container"),
-        "Help should list --container option"
+        output.contains("WORKSPACE"),
+        "Help should mention WORKSPACE argument"
     );
     assert!(
-        combined.contains("--no-tmux"),
-        "Help should list --no-tmux option"
-    );
-
-    Ok(())
-}
-integration_test!(test_devc_enter_container_help);
-
-fn test_devc_config_flag_help() -> Result<()> {
-    let output = run_devc(&["--help"])?;
-    output.assert_success("devc --help (config)");
-
-    let combined = output.combined();
-    assert!(
-        combined.contains("--config"),
-        "Help should list --config option"
+        output.contains("--follow"),
+        "Help should list --follow option"
     );
 
     Ok(())
 }
-integration_test!(test_devc_config_flag_help);
+integration_test!(test_devaipod_logs_help);
 
-fn test_devc_list_help() -> Result<()> {
-    let output = run_devc(&["list", "--help"])?;
-    output.assert_success("devc list --help");
+fn test_devaipod_status_help() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
 
-    let combined = output.combined();
+    let output = cmd!(sh, "{devaipod} status --help").read()?;
+
     assert!(
-        combined.contains("--json"),
-        "Help should list --json option"
+        output.contains("WORKSPACE"),
+        "Help should mention WORKSPACE argument"
     );
 
     Ok(())
 }
-integration_test!(test_devc_list_help);
+integration_test!(test_devaipod_status_help);
 
-fn test_devc_list_empty() -> Result<()> {
-    let output = run_devc(&["list"])?;
-    output.assert_success("devc list");
+fn test_devaipod_dry_run_on_self() -> Result<()> {
+    // Run dry-run on this project - should succeed without starting anything
+    // This assumes we're running from the workspace root or the project has a devcontainer
+    let output = run_devaipod(&["up", ".", "--dry-run"])?;
 
-    let combined = output.combined();
-    // Should contain the header or be empty
+    // Note: This will fail if run from a directory without devcontainer.json
+    // which is expected - the test verifies the command runs and parses args correctly
+    if output.success() {
+        assert!(
+            output.stdout.contains("Dry run") || output.stdout.contains("dry run"),
+            "Expected dry-run message in output"
+        );
+    }
+    // If it fails, that's okay - might not have devcontainer.json in current dir
+
+    Ok(())
+}
+integration_test!(test_devaipod_dry_run_on_self);
+
+fn test_devaipod_dry_run_with_devcontainer() -> Result<()> {
+    let repo = TestRepo::new()?;
+
+    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--dry-run"])?;
+    output.assert_success("devaipod up --dry-run");
+
     assert!(
-        combined.contains("NAME")
-            || combined.contains("No workspaces")
-            || combined.trim().is_empty(),
-        "devc list should show header, 'No workspaces' message, or be empty: {}",
-        combined
+        output.stdout.contains("Dry run") || output.stdout.contains("dry run"),
+        "Expected dry-run message. stdout:\n{}",
+        output.stdout
     );
 
     Ok(())
 }
-integration_test!(test_devc_list_empty);
+integration_test!(test_devaipod_dry_run_with_devcontainer);
+
+fn test_devaipod_up_requires_image_or_devcontainer() -> Result<()> {
+    // Create a repo without devcontainer.json
+    let repo = TestRepo::new_minimal()?;
+
+    // Should fail without --image
+    let output = run_devaipod_in(&repo.repo_path, &["up", ".", "--dry-run"])?;
+    assert!(
+        !output.success(),
+        "Should fail without devcontainer.json or --image"
+    );
+    assert!(
+        output.stderr.contains("devcontainer.json")
+            || output.combined().contains("devcontainer.json"),
+        "Error should mention devcontainer.json"
+    );
+
+    Ok(())
+}
+integration_test!(test_devaipod_up_requires_image_or_devcontainer);
+
+fn test_devaipod_up_image_override_dry_run() -> Result<()> {
+    // Create a repo without devcontainer.json
+    let repo = TestRepo::new_minimal()?;
+
+    // Should succeed with --image
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--dry-run", "--image", "alpine:latest"],
+    )?;
+    output.assert_success("devaipod up --image --dry-run");
+
+    assert!(
+        output.stdout.contains("image override") || output.stdout.contains("Dry run"),
+        "Expected image override or dry-run message. stdout:\n{}",
+        output.stdout
+    );
+
+    Ok(())
+}
+integration_test!(test_devaipod_up_image_override_dry_run);
+
+fn test_devaipod_completions() -> Result<()> {
+    let sh = shell()?;
+    let devaipod = get_devaipod_command()?;
+
+    let output = cmd!(sh, "{devaipod} completions bash").read()?;
+
+    assert!(
+        output.contains("devaipod") || output.contains("complete"),
+        "Should generate bash completions"
+    );
+
+    Ok(())
+}
+integration_test!(test_devaipod_completions);

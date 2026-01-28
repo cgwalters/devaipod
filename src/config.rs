@@ -44,7 +44,7 @@ pub struct Config {
     pub env: EnvConfig,
     /// Trusted environment variable configuration (workspace + gator only, NOT agent)
     /// Use this for credentials like GH_TOKEN that should be available to
-    /// trusted containers but not the sandboxed AI agent.
+    /// trusted containers but not the AI agent container.
     #[serde(default, rename = "trusted")]
     pub trusted_env: TrustedEnvConfig,
     /// Dotfiles configuration
@@ -145,7 +145,7 @@ impl EnvConfig {
 /// Trusted environment variable configuration
 ///
 /// These environment variables are forwarded to trusted containers only
-/// (workspace and gator), NOT to the sandboxed AI agent. This is where
+/// (workspace and gator), NOT to the AI agent container. This is where
 /// you configure credentials like GH_TOKEN that service-gator needs
 /// but that should not be exposed directly to the AI agent.
 ///
@@ -196,8 +196,8 @@ pub struct AgentConfig {
     pub default_agent: Option<String>,
 }
 
-/// Prefix for environment variables that should be forwarded into the sandbox.
-/// Variables like `DEVAIPOD_AGENT_FOO=bar` become `FOO=bar` inside the sandbox.
+/// Prefix for environment variables that should be forwarded to the agent container.
+/// Variables like `DEVAIPOD_AGENT_FOO=bar` become `FOO=bar` inside the agent container.
 pub const AGENT_ENV_PREFIX: &str = "DEVAIPOD_AGENT_";
 
 /// Default agent to use when none is specified in config or CLI.
@@ -343,7 +343,7 @@ impl GpuPassthroughConfig {
 ///
 /// Example: `DEVAIPOD_AGENT_ANTHROPIC_API_KEY=xxx` → `("ANTHROPIC_API_KEY", "xxx")`
 ///
-/// This makes it explicit which env vars the sandboxed agent can see.
+/// This makes it explicit which env vars the agent container can see.
 /// No hardcoded allowlist - the caller controls what gets forwarded.
 pub fn collect_agent_env_vars() -> Vec<(String, String)> {
     std::env::vars()
@@ -481,7 +481,7 @@ pub const SERVICE_GATOR_DEFAULT_PORT: u16 = 8765;
 /// Service-gator MCP server configuration
 ///
 /// Service-gator provides scope-restricted access to external services
-/// (GitHub, JIRA, GitLab) for AI agents. It runs outside the bwrap sandbox
+/// (GitHub, JIRA, GitLab) for AI agents. It runs in a separate container
 /// and enforces fine-grained permissions on API operations.
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct ServiceGatorConfig {

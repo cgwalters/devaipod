@@ -1,41 +1,94 @@
-//! Integration tests for devc
+//! Integration tests for devaipod
+//!
+//! Run with: cargo test -p integration-tests
+//! Or: DEVAIPOD_PATH=./target/debug/devaipod cargo test -p integration-tests
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{eyre, Context, Result};
 use libtest_mimic::{Arguments, Trial};
+use xshell::{cmd, Shell};
 
 // Re-export from lib for test registration
 pub(crate) use integration_tests::{integration_test, podman_integration_test, INTEGRATION_TESTS};
 
 mod tests;
 
-/// Get the path to the devc binary
+/// Create a new xshell Shell for running commands
+pub(crate) fn shell() -> Result<Shell> {
+    Shell::new().map_err(|e| eyre!("Failed to create shell: {}", e))
+}
+
+/// Get the workspace root directory by finding the Cargo.lock file
+fn find_workspace_root() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join("Cargo.lock").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Get the path to the devaipod binary
 ///
-/// Checks DEVC_PATH env var first, then looks for the binary in target directories.
-pub(crate) fn get_devc_command() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("DEVC_PATH") {
-        return Ok(PathBuf::from(path));
+/// Checks DEVAIPOD_PATH env var first, then looks for the binary in target directories.
+/// Always returns an absolute path to ensure it works from any working directory.
+pub(crate) fn get_devaipod_command() -> Result<String> {
+    if let Ok(path) = std::env::var("DEVAIPOD_PATH") {
+        // Convert to absolute path if relative
+        let path = std::path::PathBuf::from(&path);
+        if path.is_relative() {
+            // Resolve relative to workspace root (where Cargo.lock is)
+            if let Some(workspace_root) = find_workspace_root() {
+                let abs_path = workspace_root.join(&path);
+                if abs_path.exists() {
+                    return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+                }
+            }
+            // Try current directory as fallback
+            let cwd = std::env::current_dir()?;
+            let abs_path = cwd.join(&path);
+            if abs_path.exists() {
+                return Ok(abs_path.canonicalize()?.to_string_lossy().to_string());
+            }
+            return Err(eyre!("Cannot find devaipod binary at {}", path.display()));
+        }
+        return Ok(path.to_string_lossy().to_string());
     }
 
-    // Look for the binary in target directories
-    let candidates = ["target/debug/devc", "target/release/devc"];
+    // Look for the binary in target directories relative to workspace root
+    let workspace_root = find_workspace_root();
+    let candidates = ["target/debug/devaipod", "target/release/devaipod"];
     for candidate in candidates {
-        let path = PathBuf::from(candidate);
+        let path = if let Some(ref root) = workspace_root {
+            root.join(candidate)
+        } else {
+            std::path::PathBuf::from(candidate)
+        };
         if path.exists() {
-            return Ok(path.canonicalize()?);
+            return Err(eyre!(
+                "Detected {} - set DEVAIPOD_PATH={} to run using this binary",
+                path.display(),
+                candidate
+            ));
         }
     }
 
     // Fall back to hoping it's in PATH
-    Ok(PathBuf::from("devc"))
+    Ok("devaipod".to_string())
 }
 
 /// Check if podman is available
 pub(crate) fn podman_available() -> bool {
-    Command::new("podman")
-        .args(["--version"])
+    let Ok(sh) = Shell::new() else {
+        return false;
+    };
+    cmd!(sh, "podman --version")
+        .ignore_status()
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -82,193 +135,119 @@ impl CapturedOutput {
     }
 }
 
-/// Run the devc command, capturing output
-pub(crate) fn run_devc(args: &[&str]) -> Result<CapturedOutput> {
-    let devc = get_devc_command()?;
-    let output = Command::new(&devc)
+/// Run the devaipod command, capturing output
+///
+/// This uses std::process::Command for consistent CapturedOutput handling.
+pub(crate) fn run_devaipod(args: &[&str]) -> Result<CapturedOutput> {
+    let devaipod = get_devaipod_command()?;
+    let output = Command::new(&devaipod)
         .args(args)
         .output()
-        .with_context(|| format!("Failed to run devc {:?}", args))?;
+        .with_context(|| format!("Failed to run devaipod {:?}", args))?;
     Ok(CapturedOutput::new(output))
 }
 
-/// Run the devc command in a specific directory
-pub(crate) fn run_devc_in(dir: &Path, args: &[&str]) -> Result<CapturedOutput> {
-    let devc = get_devc_command()?;
-    let output = Command::new(&devc)
+/// Run the devaipod command in a specific directory
+pub(crate) fn run_devaipod_in(dir: &std::path::Path, args: &[&str]) -> Result<CapturedOutput> {
+    let devaipod = get_devaipod_command()?;
+    let output = Command::new(&devaipod)
         .current_dir(dir)
         .args(args)
         .output()
-        .with_context(|| format!("Failed to run devc {:?} in {:?}", args, dir))?;
+        .with_context(|| format!("Failed to run devaipod {:?} in {:?}", args, dir))?;
     Ok(CapturedOutput::new(output))
-}
-
-/// Run a generic command, capturing output
-pub(crate) fn run_command(program: &str, args: &[&str]) -> Result<CapturedOutput> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("Failed to run {} {:?}", program, args))?;
-    Ok(CapturedOutput::new(output))
-}
-
-/// Run a command and assert it succeeded, returning stdout
-pub(crate) fn run_command_success(program: &str, args: &[&str]) -> Result<String> {
-    let output = run_command(program, args)?;
-    if !output.success() {
-        bail!(
-            "{} {:?} failed:\nstdout: {}\nstderr: {}",
-            program,
-            args,
-            output.stdout,
-            output.stderr
-        );
-    }
-    Ok(output.stdout)
 }
 
 /// Create a temporary git repository for testing
 pub(crate) struct TestRepo {
     /// Keep the temp dir alive for the lifetime of the test
     #[allow(dead_code)]
-    base_dir: tempfile::TempDir,
+    pub temp_dir: tempfile::TempDir,
     pub repo_path: PathBuf,
-    pub worktrees_dir: PathBuf,
 }
 
 impl TestRepo {
+    /// Create a new test repository with a devcontainer.json
     pub fn new() -> Result<Self> {
-        let base_dir = tempfile::TempDir::new()?;
-        let repo_path = base_dir.path().join("test-repo");
+        let temp_dir = tempfile::TempDir::new()?;
+        let repo_path = temp_dir.path().join("test-repo");
         std::fs::create_dir_all(&repo_path)?;
 
+        let sh = shell()?;
+        let repo = repo_path.to_str().unwrap();
+
         // Initialize git repo
-        run_command_success("git", &["-C", repo_path.to_str().unwrap(), "init"])?;
-        run_command_success(
-            "git",
-            &[
-                "-C",
-                repo_path.to_str().unwrap(),
-                "config",
-                "user.email",
-                "test@example.com",
-            ],
-        )?;
-        run_command_success(
-            "git",
-            &[
-                "-C",
-                repo_path.to_str().unwrap(),
-                "config",
-                "user.name",
-                "Test User",
-            ],
-        )?;
+        cmd!(sh, "git -C {repo} init").run()?;
+        cmd!(sh, "git -C {repo} config user.email test@example.com").run()?;
+        cmd!(sh, "git -C {repo} config user.name 'Test User'").run()?;
 
-        // Create devfile
-        let devfile = r#"schemaVersion: "2.2.0"
-metadata:
-  name: integration-test
-  version: 1.0.0
-  description: Integration test container
-
-components:
-  - name: dev
-    container:
-      image: docker.io/library/alpine:latest
-      command: ['/bin/sh']
-      args: ['-c', 'sleep infinity']
-      mountSources: true
-      env:
-        - name: TEST_VAR
-          value: integration-test-value
-"#;
-        std::fs::write(repo_path.join("devfile.yaml"), devfile)?;
+        // Create devcontainer.json
+        let devcontainer_dir = repo_path.join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir)?;
+        let devcontainer_json = r#"{
+    "name": "integration-test",
+    "image": "docker.io/library/alpine:latest"
+}"#;
+        std::fs::write(
+            devcontainer_dir.join("devcontainer.json"),
+            devcontainer_json,
+        )?;
         std::fs::write(repo_path.join("README.md"), "# Test Repo\n")?;
 
-        // Commit
-        run_command_success("git", &["-C", repo_path.to_str().unwrap(), "add", "."])?;
-        run_command_success(
-            "git",
-            &[
-                "-C",
-                repo_path.to_str().unwrap(),
-                "commit",
-                "-m",
-                "Initial commit",
-            ],
-        )?;
+        // Add remote (required by devaipod)
+        cmd!(
+            sh,
+            "git -C {repo} remote add origin https://github.com/test/test-repo.git"
+        )
+        .run()?;
 
-        let worktrees_dir = base_dir.path().join("test-repo.worktrees");
-        std::fs::create_dir_all(&worktrees_dir)?;
+        // Commit
+        cmd!(sh, "git -C {repo} add .").run()?;
+        cmd!(sh, "git -C {repo} commit -m 'Initial commit'").run()?;
 
         Ok(TestRepo {
-            base_dir,
+            temp_dir,
             repo_path,
-            worktrees_dir,
         })
     }
 
-    /// Create a git worktree
-    pub fn create_worktree(&self, name: &str) -> Result<PathBuf> {
-        let worktree_path = self.worktrees_dir.join(name);
-        let branch_name = format!("branch-{}", name);
+    /// Create a minimal test repo (just git init, no devcontainer)
+    pub fn new_minimal() -> Result<Self> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let repo_path = temp_dir.path().join("minimal-repo");
+        std::fs::create_dir_all(&repo_path)?;
 
-        // Create branch
-        run_command_success(
-            "git",
-            &[
-                "-C",
-                self.repo_path.to_str().unwrap(),
-                "branch",
-                "-f",
-                &branch_name,
-                "HEAD",
-            ],
-        )?;
+        let sh = shell()?;
+        let repo = repo_path.to_str().unwrap();
 
-        // Create worktree
-        run_command_success(
-            "git",
-            &[
-                "-C",
-                self.repo_path.to_str().unwrap(),
-                "worktree",
-                "add",
-                worktree_path.to_str().unwrap(),
-                &branch_name,
-            ],
-        )?;
+        // Initialize git repo
+        cmd!(sh, "git -C {repo} init").run()?;
+        cmd!(sh, "git -C {repo} config user.email test@example.com").run()?;
+        cmd!(sh, "git -C {repo} config user.name 'Test User'").run()?;
 
-        Ok(worktree_path)
+        std::fs::write(repo_path.join("README.md"), "# Minimal Repo\n")?;
+
+        // Add remote
+        cmd!(
+            sh,
+            "git -C {repo} remote add origin https://github.com/test/minimal-repo.git"
+        )
+        .run()?;
+
+        // Commit
+        cmd!(sh, "git -C {repo} add .").run()?;
+        cmd!(sh, "git -C {repo} commit -m 'Initial commit'").run()?;
+
+        Ok(TestRepo {
+            temp_dir,
+            repo_path,
+        })
     }
 }
 
-/// Container cleanup helper
-pub(crate) struct ContainerGuard {
-    names: Vec<String>,
-}
-
-impl ContainerGuard {
-    pub fn new() -> Self {
-        ContainerGuard { names: Vec::new() }
-    }
-
-    pub fn add(&mut self, name: &str) {
-        self.names.push(name.to_string());
-    }
-}
-
-impl Drop for ContainerGuard {
-    fn drop(&mut self) {
-        for name in &self.names {
-            // Best effort cleanup
-            let _ = Command::new("podman").args(["rm", "-f", name]).output();
-        }
-    }
-}
-
-/// Pod cleanup helper
+/// Pod cleanup helper - removes pods on drop
+///
+/// Uses std::process::Command because Shell::new() is fallible in Drop contexts.
 pub(crate) struct PodGuard {
     names: Vec<String>,
 }
@@ -290,44 +269,13 @@ impl Drop for PodGuard {
             let _ = Command::new("podman")
                 .args(["pod", "rm", "-f", name])
                 .output();
-        }
-    }
-}
-
-/// Volume cleanup helper
-pub(crate) struct VolumeGuard {
-    names: Vec<String>,
-}
-
-impl VolumeGuard {
-    pub fn new() -> Self {
-        VolumeGuard { names: Vec::new() }
-    }
-
-    pub fn add(&mut self, name: &str) {
-        self.names.push(name.to_string());
-    }
-}
-
-impl Drop for VolumeGuard {
-    fn drop(&mut self) {
-        for name in &self.names {
-            // First remove any containers using the volume
+            // Also try to remove associated volume
+            let volume_name = format!("{}-workspace", name);
             let _ = Command::new("podman")
-                .args(["rm", "-f", &format!("devfile-{}-dev", name)])
-                .output();
-            // Then remove the volume
-            let _ = Command::new("podman")
-                .args(["volume", "rm", "-f", &format!("devc-{}", name)])
+                .args(["volume", "rm", "-f", &volume_name])
                 .output();
         }
     }
-}
-
-/// Get container name for a worktree
-pub(crate) fn container_name(worktree_path: &Path) -> String {
-    let dir_name = worktree_path.file_name().unwrap().to_str().unwrap();
-    format!("devfile-{}-dev", dir_name)
 }
 
 fn main() {

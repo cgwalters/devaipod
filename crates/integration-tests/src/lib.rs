@@ -1,13 +1,13 @@
 //! Shared library code for integration tests
 //!
 //! This module contains macros and utilities for registering and running
-//! integration tests for devc.
+//! integration tests for devaipod.
 
 // Unfortunately needed here to work with linkme
 #![allow(unsafe_code)]
 
-/// Label used to identify containers created by integration tests
-pub const INTEGRATION_TEST_LABEL: &str = "devc.integration-test=1";
+/// Label used to identify pods/containers created by integration tests
+pub const INTEGRATION_TEST_LABEL: &str = "io.devaipod.integration-test=1";
 
 /// A test function that returns a Result
 pub type TestFn = fn() -> color_eyre::Result<()>;
@@ -55,7 +55,7 @@ pub static INTEGRATION_TESTS: [IntegrationTest];
 ///
 /// ```ignore
 /// fn test_basic_functionality() -> Result<()> {
-///     let output = run_devc(&["--help"])?;
+///     let output = run_devaipod(&["--help"])?;
 ///     output.assert_success("help");
 ///     Ok(())
 /// }
@@ -79,13 +79,13 @@ macro_rules! integration_test {
 /// # Examples
 ///
 /// ```ignore
-/// fn test_container_spawn() -> Result<()> {
+/// fn test_pod_creation() -> Result<()> {
 ///     // This test needs podman
-///     let output = run_devc(&["new", "..."])?;
-///     output.assert_success("new");
+///     let output = run_devaipod(&["up", "..."])?;
+///     output.assert_success("up");
 ///     Ok(())
 /// }
-/// podman_integration_test!(test_container_spawn);
+/// podman_integration_test!(test_pod_creation);
 /// ```
 #[macro_export]
 macro_rules! podman_integration_test {

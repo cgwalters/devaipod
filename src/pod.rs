@@ -58,7 +58,10 @@ impl WorkspaceSource {
     pub fn description(&self) -> String {
         match self {
             WorkspaceSource::LocalRepo(git_info) => {
-                format!("commit {}", &git_info.commit_sha[..8.min(git_info.commit_sha.len())])
+                format!(
+                    "commit {}",
+                    &git_info.commit_sha[..8.min(git_info.commit_sha.len())]
+                )
             }
             WorkspaceSource::RemoteRepo(remote_info) => {
                 format!("branch {}", remote_info.default_branch)
@@ -97,7 +100,10 @@ fn extract_repo_from_url(url: &str) -> Option<String> {
     // Handle HTTPS format: https://github.com/owner/repo.git
     if let Ok(parsed) = url::Url::parse(url) {
         let host = parsed.host_str()?;
-        let path = parsed.path().trim_start_matches('/').trim_end_matches(".git");
+        let path = parsed
+            .path()
+            .trim_start_matches('/')
+            .trim_end_matches(".git");
         return Some(format!("{}/{}", host, path));
     }
 
@@ -298,7 +304,10 @@ impl DevaipodPod {
         let volume_already_exists = podman.volume_exists(&volume_name).await?;
 
         if !volume_already_exists {
-            tracing::debug!("Creating workspace volume and cloning {}...", source.description());
+            tracing::debug!(
+                "Creating workspace volume and cloning {}...",
+                source.description()
+            );
             podman
                 .create_volume(&volume_name)
                 .await
@@ -628,7 +637,11 @@ impl DevaipodPod {
         user: Option<&str>,
         home_override: Option<&str>,
     ) -> Result<()> {
-        tracing::debug!("Installing dotfiles in {} from {}...", container, dotfiles.url);
+        tracing::debug!(
+            "Installing dotfiles in {} from {}...",
+            container,
+            dotfiles.url
+        );
 
         // Optional HOME override (needed for agent container)
         let home_export = home_override
@@ -891,7 +904,12 @@ echo "Configured opencode with service-gator MCP at {mcp_url}"
         let script = script.replace("{}", &config_content);
 
         let exit_code = podman
-            .exec(&self.agent_container, &["/bin/sh", "-c", &script], None, None)
+            .exec(
+                &self.agent_container,
+                &["/bin/sh", "-c", &script],
+                None,
+                None,
+            )
             .await
             .context("Failed to configure opencode in agent container")?;
 
@@ -915,13 +933,15 @@ echo "Configured opencode with service-gator MCP at {mcp_url}"
     ///
     /// This allows the task to persist across agent restarts and be picked up
     /// automatically when opencode starts.
-    pub async fn write_task_instructions(
-        &self,
-        podman: &PodmanService,
-        task: &str,
-    ) -> Result<()> {
-        let task_file_path = format!("{agent_home}/.config/opencode/devaipod-task.md", agent_home = AGENT_HOME_PATH);
-        let config_path = format!("{agent_home}/.config/opencode/opencode.json", agent_home = AGENT_HOME_PATH);
+    pub async fn write_task_instructions(&self, podman: &PodmanService, task: &str) -> Result<()> {
+        let task_file_path = format!(
+            "{agent_home}/.config/opencode/devaipod-task.md",
+            agent_home = AGENT_HOME_PATH
+        );
+        let config_path = format!(
+            "{agent_home}/.config/opencode/opencode.json",
+            agent_home = AGENT_HOME_PATH
+        );
 
         // Format the task as a markdown file with clear instructions
         let task_content = format!(
@@ -958,7 +978,12 @@ DEVAIPOD_TASK_EOF
         );
 
         let exit_code = podman
-            .exec(&self.agent_container, &["/bin/sh", "-c", &write_task_script], None, None)
+            .exec(
+                &self.agent_container,
+                &["/bin/sh", "-c", &write_task_script],
+                None,
+                None,
+            )
             .await
             .context("Failed to write task file to agent container")?;
 
@@ -1010,7 +1035,12 @@ DEVAIPOD_TASK_EOF
         );
 
         let exit_code = podman
-            .exec(&self.agent_container, &["/bin/sh", "-c", &write_config_script], None, None)
+            .exec(
+                &self.agent_container,
+                &["/bin/sh", "-c", &write_config_script],
+                None,
+                None,
+            )
             .await
             .context("Failed to write opencode config")?;
 
@@ -1029,10 +1059,12 @@ DEVAIPOD_TASK_EOF
             "$schema": "https://opencode.ai/config.json",
             "instructions": [task_file_path]
         }))
-        .unwrap_or_else(|_| format!(
-            r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
-            task_file_path
-        ))
+        .unwrap_or_else(|_| {
+            format!(
+                r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
+                task_file_path
+            )
+        })
     }
 
     /// Configure nested podman support in the workspace container
@@ -1570,7 +1602,10 @@ mod tests {
         assert_eq!(container_config.volume_mounts[0].1, "/workspaces");
         assert_eq!(container_config.user, Some("vscode".to_string()));
         // workdir is set to the workspace folder
-        assert_eq!(container_config.workdir, Some("/workspaces/myproject".to_string()));
+        assert_eq!(
+            container_config.workdir,
+            Some("/workspaces/myproject".to_string())
+        );
         // Verify command is a shell script that creates shim, prints agent info, and sleeps
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
@@ -1701,7 +1736,8 @@ mod tests {
         );
 
         let global_config = crate::config::Config::default();
-        let container_config = DevaipodPod::gator_container_config(Some(&sg_config), &global_config);
+        let container_config =
+            DevaipodPod::gator_container_config(Some(&sg_config), &global_config);
 
         // Verify command includes scope arguments
         let cmd = container_config.command.as_ref().unwrap();
@@ -1837,7 +1873,10 @@ mod tests {
         // when the variable is PATH, to ensure essential utilities are available
         assert_eq!(
             super::resolve_env_value("${containerEnv:PATH}:/usr/local/cargo/bin", "PATH"),
-            Some(format!("{}:/usr/local/cargo/bin", super::DEFAULT_CONTAINER_PATH))
+            Some(format!(
+                "{}:/usr/local/cargo/bin",
+                super::DEFAULT_CONTAINER_PATH
+            ))
         );
         // Multiple path components in suffix
         assert_eq!(
@@ -1854,9 +1893,15 @@ mod tests {
     #[test]
     fn test_resolve_env_value_unresolvable() {
         // Pure variable reference with no static suffix
-        assert_eq!(super::resolve_env_value("${containerEnv:PATH}", "PATH"), None);
+        assert_eq!(
+            super::resolve_env_value("${containerEnv:PATH}", "PATH"),
+            None
+        );
         // Variable reference with empty suffix
-        assert_eq!(super::resolve_env_value("${containerEnv:PATH}:", "PATH"), None);
+        assert_eq!(
+            super::resolve_env_value("${containerEnv:PATH}:", "PATH"),
+            None
+        );
         // Suffix that also contains variable references
         assert_eq!(
             super::resolve_env_value("${containerEnv:PATH}:${localEnv:HOME}", "PATH"),
