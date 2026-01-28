@@ -27,6 +27,111 @@ use tokio::process::Command;
 
 use crate::devcontainer::ImageSource;
 
+/// Podman system info (subset of fields we care about)
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodmanSystemInfo {
+    pub host: PodmanHostInfo,
+}
+
+/// Host info from podman system info
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodmanHostInfo {
+    /// Whether this is a remote client (e.g., podman machine)
+    pub service_is_remote: bool,
+    /// The remote socket info
+    pub remote_socket: PodmanRemoteSocket,
+}
+
+/// Remote socket info from podman system info
+#[derive(Debug, serde::Deserialize)]
+pub struct PodmanRemoteSocket {
+    /// Socket path (e.g., "unix:///run/podman/podman.sock")
+    pub path: String,
+    /// Whether the socket exists
+    pub exists: bool,
+}
+
+/// Podman machine inspect output (subset of fields we care about)
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PodmanMachineInspect {
+    connection_info: PodmanMachineConnectionInfo,
+}
+
+/// Connection info from podman machine inspect
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PodmanMachineConnectionInfo {
+    podman_socket: PodmanMachineSocket,
+}
+
+/// Socket info from podman machine inspect
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PodmanMachineSocket {
+    path: String,
+}
+
+/// Get podman system info by running `podman info --format json`
+fn get_podman_info() -> Result<PodmanSystemInfo> {
+    let output = std::process::Command::new("podman")
+        .args(["info", "--format", "json"])
+        .output()
+        .context("Failed to run podman info")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("podman info failed: {}", stderr);
+    }
+
+    serde_json::from_slice(&output.stdout).context("Failed to parse podman info JSON")
+}
+
+/// Standard Docker socket path (often symlinked to podman on macOS)
+const DOCKER_SOCKET: &str = "/var/run/docker.sock";
+
+/// Get the local socket path for podman in remote mode
+///
+/// First checks if /var/run/docker.sock exists (commonly symlinked to podman),
+/// then falls back to `podman machine inspect` to get the actual socket path.
+fn get_remote_socket() -> Result<PathBuf> {
+    // Fast path: check if /var/run/docker.sock exists
+    let docker_sock = PathBuf::from(DOCKER_SOCKET);
+    if docker_sock.exists() {
+        tracing::debug!("Using {} for podman connection", DOCKER_SOCKET);
+        return Ok(docker_sock);
+    }
+
+    // Fallback: query podman machine for the socket path
+    tracing::debug!(
+        "{} not found, querying podman machine inspect",
+        DOCKER_SOCKET
+    );
+
+    let output = std::process::Command::new("podman")
+        .args(["machine", "inspect"])
+        .output()
+        .context("Failed to run podman machine inspect")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("podman machine inspect failed: {}", stderr);
+    }
+
+    // Output is an array of machine info
+    let machines: Vec<PodmanMachineInspect> = serde_json::from_slice(&output.stdout)
+        .context("Failed to parse podman machine inspect JSON")?;
+
+    let machine = machines
+        .into_iter()
+        .next()
+        .ok_or_else(|| color_eyre::eyre::eyre!("No podman machine found"))?;
+
+    Ok(PathBuf::from(machine.connection_info.podman_socket.path))
+}
+
 /// Check if the devcontainer CLI is available on the system
 fn devcontainer_cli_available() -> bool {
     std::process::Command::new("devcontainer")
@@ -54,10 +159,13 @@ fn is_toolbox() -> bool {
 }
 
 impl PodmanService {
-    /// Spawn a new podman service with a temporary socket
+    /// Connect to podman, trying existing sockets before spawning a new service
     ///
-    /// The service will be killed when this struct is dropped.
-    /// In toolbox mode, connects to existing host socket instead of spawning.
+    /// Connection strategy:
+    /// 1. Toolbox mode: connect to host socket via flatpak-spawn
+    /// 2. Remote mode (podman machine): use /var/run/docker.sock or podman machine inspect
+    /// 3. Native Linux with existing socket: connect to $XDG_RUNTIME_DIR/podman/podman.sock
+    /// 4. Fallback: spawn our own podman system service
     pub async fn spawn() -> Result<Self> {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
 
@@ -66,7 +174,40 @@ impl PodmanService {
             return Self::connect_toolbox(&runtime_dir).await;
         }
 
-        // Create a unique socket path in runtime dir or /tmp
+        // Get podman info to understand the environment
+        let podman_info = get_podman_info().context("Failed to get podman info")?;
+
+        // If podman is a remote client (e.g., podman machine on macOS/Windows),
+        // connect to existing socket
+        if podman_info.host.service_is_remote {
+            tracing::debug!(
+                "Podman is in remote mode (remote socket: {})",
+                podman_info.host.remote_socket.path
+            );
+            return Self::connect_remote().await;
+        }
+
+        // Native podman (Linux): try to use existing socket if available
+        if podman_info.host.remote_socket.exists {
+            // Socket path may or may not have unix:// prefix depending on podman version
+            let socket_path = podman_info
+                .host
+                .remote_socket
+                .path
+                .strip_prefix("unix://")
+                .unwrap_or(&podman_info.host.remote_socket.path);
+
+            tracing::debug!("Trying existing podman socket at {}", socket_path);
+            match Self::try_connect_socket(socket_path).await {
+                Ok(service) => return Ok(service),
+                Err(e) => {
+                    tracing::debug!("Failed to connect to existing socket: {}", e);
+                    // Fall through to spawn our own
+                }
+            }
+        }
+
+        // Fallback: spawn our own podman system service
         let socket_name = format!("devaipod-{}.sock", std::process::id());
         let socket_path = PathBuf::from(&runtime_dir).join(socket_name);
 
@@ -77,7 +218,7 @@ impl PodmanService {
 
         // Spawn podman system service
         // --time=0 means no idle timeout (we manage lifecycle)
-        let child = Command::new("/usr/bin/podman")
+        let child = Command::new("podman")
             .args([
                 "system",
                 "service",
@@ -123,6 +264,83 @@ impl PodmanService {
         Ok(Self {
             socket_path,
             child_pid: Some(child_pid),
+            client,
+            toolbox_mode: false,
+        })
+    }
+
+    /// Connect to existing podman socket in remote mode
+    ///
+    /// When podman is running as a remote client (e.g., podman machine on macOS),
+    /// we connect to the existing socket instead of spawning a new service.
+    /// First checks /var/run/docker.sock, then falls back to `podman machine inspect`.
+    async fn connect_remote() -> Result<Self> {
+        let socket_path = get_remote_socket().context(
+            "Failed to get podman socket. Is podman machine running? Try: podman machine start",
+        )?;
+
+        tracing::debug!(
+            "Podman remote mode: connecting to socket at {}",
+            socket_path.display()
+        );
+
+        if !socket_path.exists() {
+            bail!(
+                "Podman machine socket {} does not exist. Is podman machine running? Try: podman machine start",
+                socket_path.display()
+            );
+        }
+
+        // Connect bollard
+        let client = Docker::connect_with_unix(
+            &socket_path.to_string_lossy(),
+            120, // timeout
+            bollard::API_DEFAULT_VERSION,
+        )
+        .context("Failed to connect to podman socket")?;
+
+        // Verify connection
+        client.ping().await.context(
+            "Failed to ping podman service. Is podman machine running? Try: podman machine start",
+        )?;
+
+        tracing::debug!("Connected to podman (remote mode)");
+
+        Ok(Self {
+            socket_path,
+            child_pid: None, // We don't own the process
+            client,
+            toolbox_mode: false,
+        })
+    }
+
+    /// Try to connect to an existing podman socket
+    ///
+    /// Returns Ok if the socket exists and we can ping it, Err otherwise.
+    async fn try_connect_socket(socket_path: &str) -> Result<Self> {
+        let socket_path = PathBuf::from(socket_path);
+
+        if !socket_path.exists() {
+            bail!("Socket {} does not exist", socket_path.display());
+        }
+
+        let client = Docker::connect_with_unix(
+            &socket_path.to_string_lossy(),
+            120,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .context("Failed to connect to socket")?;
+
+        client.ping().await.context("Failed to ping socket")?;
+
+        tracing::debug!(
+            "Connected to existing podman socket at {}",
+            socket_path.display()
+        );
+
+        Ok(Self {
+            socket_path,
+            child_pid: None, // We don't own this service
             client,
             toolbox_mode: false,
         })
@@ -178,7 +396,7 @@ impl PodmanService {
             cmd.args(["--host", "/usr/bin/podman"]);
             cmd
         } else {
-            let mut cmd = Command::new("/usr/bin/podman");
+            let mut cmd = Command::new("podman");
             cmd.args(["--url", &format!("unix://{}", self.socket_path.display())]);
             cmd
         }
