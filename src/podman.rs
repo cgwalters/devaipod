@@ -938,6 +938,69 @@ impl PodmanService {
         Ok(exit_code)
     }
 
+    /// Execute a command and return its output
+    ///
+    /// Returns (exit_code, stdout, stderr)
+    pub async fn exec_output(
+        &self,
+        container: &str,
+        cmd: &[&str],
+    ) -> Result<(i64, Vec<u8>, Vec<u8>)> {
+        let exec = self
+            .client
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    cmd: Some(cmd.to_vec()),
+                    user: None,
+                    working_dir: None,
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to create exec")?;
+
+        let result = self
+            .client
+            .start_exec(&exec.id, None)
+            .await
+            .context("Failed to start exec")?;
+
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+
+        match result {
+            StartExecResults::Attached { mut output, .. } => {
+                while let Some(chunk) = output.next().await {
+                    match chunk {
+                        Ok(bollard::container::LogOutput::StdOut { message }) => {
+                            stdout_buf.extend_from_slice(&message);
+                        }
+                        Ok(bollard::container::LogOutput::StdErr { message }) => {
+                            stderr_buf.extend_from_slice(&message);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Exec output error: {}", e);
+                        }
+                    }
+                }
+            }
+            StartExecResults::Detached => {}
+        }
+
+        let inspect = self
+            .client
+            .inspect_exec(&exec.id)
+            .await
+            .context("Failed to inspect exec")?;
+
+        let exit_code = inspect.exit_code.unwrap_or(-1);
+        Ok((exit_code, stdout_buf, stderr_buf))
+    }
+
     /// Get container logs
     #[allow(dead_code)]
     pub async fn logs(&self, container: &str, follow: bool) -> Result<()> {

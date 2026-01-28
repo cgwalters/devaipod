@@ -898,6 +898,134 @@ echo "Configured opencode with service-gator MCP at {mcp_url}"
         Ok(())
     }
 
+    /// Write task instructions to the agent's opencode config directory
+    ///
+    /// This writes the task description to a file that opencode will read as
+    /// instructions. The file is written to ~/.config/opencode/devaipod-task.md
+    /// and the opencode config is updated to include it in the instructions array.
+    ///
+    /// This allows the task to persist across agent restarts and be picked up
+    /// automatically when opencode starts.
+    pub async fn write_task_instructions(
+        &self,
+        podman: &PodmanService,
+        task: &str,
+    ) -> Result<()> {
+        let task_file_path = format!("{agent_home}/.config/opencode/devaipod-task.md", agent_home = AGENT_HOME_PATH);
+        let config_path = format!("{agent_home}/.config/opencode/opencode.json", agent_home = AGENT_HOME_PATH);
+
+        // Format the task as a markdown file with clear instructions
+        let task_content = format!(
+            r#"# Task from devaipod
+
+The user has requested the following task be completed:
+
+---
+
+{task}
+
+---
+
+Please work on this task. When you're done, summarize what you accomplished.
+"#,
+            task = task
+        );
+
+        // Escape the task content for shell heredoc
+        let escaped_task = task_content.replace("'", "'\\''");
+
+        // First, write the task file
+        let write_task_script = format!(
+            r#"
+set -e
+mkdir -p {agent_home}/.config/opencode
+cat > '{task_file_path}' << 'DEVAIPOD_TASK_EOF'
+{escaped_task}
+DEVAIPOD_TASK_EOF
+"#,
+            agent_home = AGENT_HOME_PATH,
+            task_file_path = task_file_path,
+            escaped_task = escaped_task
+        );
+
+        let exit_code = podman
+            .exec(&self.agent_container, &["/bin/sh", "-c", &write_task_script], None, None)
+            .await
+            .context("Failed to write task file to agent container")?;
+
+        if exit_code != 0 {
+            tracing::warn!("Failed to write task file (exit code {})", exit_code);
+            return Ok(());
+        }
+
+        // Now read existing config (if any), parse with jsonc-parser, add instructions, write back
+        let (exit_code, config_bytes, _) = podman
+            .exec_output(&self.agent_container, &["cat", &config_path])
+            .await
+            .context("Failed to read opencode config")?;
+
+        let new_config = if exit_code == 0 && !config_bytes.is_empty() {
+            // Config exists - parse it (supports JSON5/JSONC with trailing commas, comments, etc.)
+            let config_str = String::from_utf8_lossy(&config_bytes);
+            match jsonc_parser::parse_to_serde_value(&config_str, &Default::default()) {
+                Ok(Some(serde_json::Value::Object(mut obj))) => {
+                    // Add task file to instructions array
+                    let instructions = obj
+                        .entry("instructions")
+                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                    if let serde_json::Value::Array(arr) = instructions {
+                        let task_path_value = serde_json::Value::String(task_file_path.clone());
+                        if !arr.contains(&task_path_value) {
+                            arr.push(task_path_value);
+                        }
+                    }
+                    serde_json::to_string_pretty(&serde_json::Value::Object(obj))
+                        .unwrap_or_else(|_| Self::default_config_with_task(&task_file_path))
+                }
+                Ok(_) | Err(_) => {
+                    tracing::warn!("Failed to parse existing opencode config, creating new one");
+                    Self::default_config_with_task(&task_file_path)
+                }
+            }
+        } else {
+            // No config exists - create one
+            Self::default_config_with_task(&task_file_path)
+        };
+
+        // Write the updated config back
+        let escaped_config = new_config.replace("'", "'\\''");
+        let write_config_script = format!(
+            "cat > '{config_path}' << 'OPENCODE_CONFIG_EOF'\n{escaped_config}\nOPENCODE_CONFIG_EOF",
+            config_path = config_path,
+            escaped_config = escaped_config
+        );
+
+        let exit_code = podman
+            .exec(&self.agent_container, &["/bin/sh", "-c", &write_config_script], None, None)
+            .await
+            .context("Failed to write opencode config")?;
+
+        if exit_code != 0 {
+            tracing::warn!("Failed to write opencode config (exit code {})", exit_code);
+        } else {
+            tracing::debug!("Task instructions written to agent config");
+        }
+
+        Ok(())
+    }
+
+    /// Generate a default opencode config with the given task file in instructions
+    fn default_config_with_task(task_file_path: &str) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "instructions": [task_file_path]
+        }))
+        .unwrap_or_else(|_| format!(
+            r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
+            task_file_path
+        ))
+    }
+
     /// Configure nested podman support in the workspace container
     ///
     /// This configures the container environment for running podman inside the container:

@@ -556,7 +556,6 @@ async fn cmd_up(
     {
         if status.is_running() {
             tracing::info!("Pod '{}' already running", pod_name);
-            return Ok(());
         } else {
             // Pod exists but is stopped - start it
             tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
@@ -565,8 +564,15 @@ async fn cmd_up(
                 .await
                 .context("Failed to start existing pod")?;
             tracing::info!("Pod '{}' started", pod_name);
-            return Ok(());
         }
+        // Write task instructions to agent config if provided
+        if let Some(task_desc) = task {
+            if !no_prompt {
+                tracing::info!("Writing task instructions to agent...");
+                write_task_to_existing_pod(&podman, &pod_name, task_desc).await?;
+            }
+        }
+        return Ok(());
     }
 
     // Parse CLI service-gator scopes and merge with file config
@@ -668,6 +674,15 @@ async fn cmd_up(
         .await
         .context("Failed to run lifecycle commands")?;
 
+    // Write task instructions to agent config if provided
+    if let Some(task_desc) = task {
+        tracing::info!("Writing task instructions to agent...");
+        devaipod_pod
+            .write_task_instructions(&podman, task_desc)
+            .await
+            .context("Failed to write task instructions")?;
+    }
+
     // Success! Print connection info
     tracing::info!("Pod '{}' ready", pod_name);
     tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
@@ -675,14 +690,6 @@ async fn cmd_up(
         "  SSH: podman exec -it {} bash",
         devaipod_pod.workspace_container
     );
-
-    // Send task to agent if provided and not --no-prompt
-    if let Some(task_desc) = task {
-        if !no_prompt {
-            tracing::debug!("Sending task to agent...");
-            send_task_to_agent(task_desc).await?;
-        }
-    }
 
     // Drop podman service - this will kill the service process
     // but the pod/containers will continue running since podman doesn't
@@ -770,12 +777,24 @@ async fn cmd_up_pr(
 
     // Check if pod already exists
     if let Some(status) = podman.get_pod_status(&pod_name).await? {
-        tracing::info!(
-            "Pod '{}' already exists (status: {:?}). Use 'devaipod delete {}' to remove it first.",
-            pod_name,
-            status,
-            pod_name
-        );
+        if !status.is_running() {
+            // Pod exists but is stopped - start it
+            tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
+            podman
+                .start_pod(&pod_name)
+                .await
+                .context("Failed to start existing pod")?;
+            tracing::info!("Pod '{}' started", pod_name);
+        } else {
+            tracing::info!("Pod '{}' already running", pod_name);
+        }
+        // Write task instructions to agent config if provided
+        if let Some(task_desc) = task {
+            if !no_prompt {
+                tracing::info!("Writing task instructions to agent...");
+                write_task_to_existing_pod(&podman, &pod_name, task_desc).await?;
+            }
+        }
         return Ok(());
     }
 
@@ -861,6 +880,15 @@ async fn cmd_up_pr(
         .await
         .context("Failed to run lifecycle commands")?;
 
+    // Write task instructions to agent config if provided
+    if let Some(task_desc) = task {
+        tracing::info!("Writing task instructions to agent...");
+        devaipod_pod
+            .write_task_instructions(&podman, task_desc)
+            .await
+            .context("Failed to write task instructions")?;
+    }
+
     // Success!
     tracing::info!("Pod '{}' ready", pod_name);
     tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
@@ -868,14 +896,6 @@ async fn cmd_up_pr(
         "  SSH: podman exec -it {} bash",
         devaipod_pod.workspace_container
     );
-
-    // Send task to agent if provided and not --no-prompt
-    if let Some(task_desc) = task {
-        if !no_prompt {
-            tracing::debug!("Sending task to agent...");
-            send_task_to_agent(task_desc).await?;
-        }
-    }
 
     drop(podman);
 
@@ -1016,7 +1036,6 @@ async fn cmd_up_remote(
     if let Some(status) = podman.get_pod_status(&pod_name).await? {
         if status.is_running() {
             tracing::info!("Pod '{}' already running", pod_name);
-            return Ok(());
         } else {
             tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
             podman
@@ -1024,8 +1043,15 @@ async fn cmd_up_remote(
                 .await
                 .context("Failed to start existing pod")?;
             tracing::info!("Pod '{}' started", pod_name);
-            return Ok(());
         }
+        // Write task instructions to agent config if provided
+        if let Some(task_desc) = task {
+            if !no_prompt {
+                tracing::info!("Writing task instructions to agent...");
+                write_task_to_existing_pod(&podman, &pod_name, task_desc).await?;
+            }
+        }
+        return Ok(());
     }
 
     let enable_gator = service_gator_config.is_enabled();
@@ -1120,17 +1146,18 @@ async fn cmd_up_remote(
         .await
         .context("Failed to run lifecycle commands")?;
 
+    // Write task instructions to agent config if provided
+    if let Some(task_desc) = task {
+        tracing::info!("Writing task instructions to agent...");
+        devaipod_pod
+            .write_task_instructions(&podman, task_desc)
+            .await
+            .context("Failed to write task instructions")?;
+    }
+
     // Success!
     tracing::info!("Pod '{}' ready", pod_name);
     tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
-
-    // Send task to agent if provided and not --no-prompt
-    if let Some(task_desc) = task {
-        if !no_prompt {
-            tracing::debug!("Sending task to agent...");
-            send_task_to_agent(task_desc).await?;
-        }
-    }
 
     drop(podman);
 
@@ -1142,30 +1169,126 @@ async fn cmd_up_remote(
     Ok(())
 }
 
-/// Send a task prompt to the agent via HTTP API
-async fn send_task_to_agent(task: &str) -> Result<()> {
-    let url = format!("http://localhost:{}/session/new", pod::OPENCODE_PORT);
+/// Write task instructions to an existing pod's agent container
+///
+/// This writes the task to a file in the agent's opencode config directory
+/// so it persists across agent restarts.
+async fn write_task_to_existing_pod(podman: &podman::PodmanService, pod_name: &str, task: &str) -> Result<()> {
+    let agent_container = format!("{}-agent", pod_name);
+    let agent_home = "/home/agent";
+    let task_file_path = format!("{}/.config/opencode/devaipod-task.md", agent_home);
+    let config_path = format!("{}/.config/opencode/opencode.json", agent_home);
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "prompt": task
-        }))
-        .send()
+    // Format the task as a markdown file with clear instructions
+    let task_content = format!(
+        r#"# Task from devaipod
+
+The user has requested the following task be completed:
+
+---
+
+{task}
+
+---
+
+Please work on this task. When you're done, summarize what you accomplished.
+"#,
+        task = task
+    );
+
+    // Escape the task content for shell heredoc
+    let escaped_task = task_content.replace("'", "'\\''");
+
+    // First, write the task file
+    let write_task_script = format!(
+        r#"
+set -e
+mkdir -p {agent_home}/.config/opencode
+cat > '{task_file_path}' << 'DEVAIPOD_TASK_EOF'
+{escaped_task}
+DEVAIPOD_TASK_EOF
+"#,
+        agent_home = agent_home,
+        task_file_path = task_file_path,
+        escaped_task = escaped_task
+    );
+
+    let exit_code = podman
+        .exec(&agent_container, &["/bin/sh", "-c", &write_task_script], None, None)
         .await
-        .context("Failed to connect to agent")?;
+        .context("Failed to write task file to agent container")?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        tracing::warn!("Agent returned {}: {}", status, body);
-        // Don't fail - the pod is running, user can send task manually
+    if exit_code != 0 {
+        tracing::warn!("Failed to write task file (exit code {})", exit_code);
+        return Ok(());
+    }
+
+    // Now read existing config (if any), parse with jsonc-parser, add instructions, write back
+    let (exit_code, config_bytes, _) = podman
+        .exec_output(&agent_container, &["cat", &config_path])
+        .await
+        .context("Failed to read opencode config")?;
+
+    let new_config = if exit_code == 0 && !config_bytes.is_empty() {
+        // Config exists - parse it (supports JSON5/JSONC with trailing commas, comments, etc.)
+        let config_str = String::from_utf8_lossy(&config_bytes);
+        match jsonc_parser::parse_to_serde_value(&config_str, &Default::default()) {
+            Ok(Some(serde_json::Value::Object(mut obj))) => {
+                // Add task file to instructions array
+                let instructions = obj
+                    .entry("instructions")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let serde_json::Value::Array(arr) = instructions {
+                    let task_path_value = serde_json::Value::String(task_file_path.clone());
+                    if !arr.contains(&task_path_value) {
+                        arr.push(task_path_value);
+                    }
+                }
+                serde_json::to_string_pretty(&serde_json::Value::Object(obj))
+                    .unwrap_or_else(|_| default_config_with_task(&task_file_path))
+            }
+            Ok(_) | Err(_) => {
+                tracing::warn!("Failed to parse existing opencode config, creating new one");
+                default_config_with_task(&task_file_path)
+            }
+        }
     } else {
-        tracing::debug!("Task sent to agent successfully");
+        // No config exists - create one
+        default_config_with_task(&task_file_path)
+    };
+
+    // Write the updated config back
+    let escaped_config = new_config.replace("'", "'\\''");
+    let write_config_script = format!(
+        "cat > '{config_path}' << 'OPENCODE_CONFIG_EOF'\n{escaped_config}\nOPENCODE_CONFIG_EOF",
+        config_path = config_path,
+        escaped_config = escaped_config
+    );
+
+    let exit_code = podman
+        .exec(&agent_container, &["/bin/sh", "-c", &write_config_script], None, None)
+        .await
+        .context("Failed to write opencode config")?;
+
+    if exit_code != 0 {
+        tracing::warn!("Failed to write opencode config (exit code {})", exit_code);
+    } else {
+        tracing::debug!("Task instructions written to existing pod's agent");
     }
 
     Ok(())
+}
+
+/// Generate a default opencode config with the given task file in instructions
+fn default_config_with_task(task_file_path: &str) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "instructions": [task_file_path]
+    }))
+    .unwrap_or_else(|_| format!(
+        r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
+        task_file_path
+    ))
 }
 
 /// Run an AI agent with a task

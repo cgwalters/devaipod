@@ -391,6 +391,7 @@ dependencies = [
  "color-eyre",
  "futures-util",
  "indexmap 2.12.1",
+ "jsonc-parser",
  "rand",
  "reqwest",
  "rustix",
@@ -1027,6 +1028,15 @@ checksum = "8c942ebf8e95485ca0d52d97da7c5a2c387d0e7f0ba4c35e93bfcaee045955b3"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonc-parser"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb0774546269185d38da823d8583e94448ba0e158e3f50759d9c79aba946ca5"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
