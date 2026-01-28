@@ -345,45 +345,57 @@ impl DevcontainerConfig {
     }
 }
 
-/// Find the devcontainer.json file for a project
+/// Try to find devcontainer.json, returning None if not found
 ///
 /// Searches in standard locations:
 /// 1. `.devcontainer/devcontainer.json`
 /// 2. `.devcontainer.json` (root)
 /// 3. `.devcontainer/<subdir>/devcontainer.json` (first match)
-pub fn find_devcontainer_json(project_path: &Path) -> Result<PathBuf> {
+///
+/// This is useful when an image override is provided and devcontainer.json is optional.
+pub fn try_find_devcontainer_json(project_path: &Path) -> Option<PathBuf> {
     // Standard location
     let standard = project_path.join(".devcontainer/devcontainer.json");
     if standard.exists() {
-        return Ok(standard);
+        return Some(standard);
     }
 
     // Root location
     let root = project_path.join(".devcontainer.json");
     if root.exists() {
-        return Ok(root);
+        return Some(root);
     }
 
     // Check for subdirectories in .devcontainer
     let devcontainer_dir = project_path.join(".devcontainer");
     if devcontainer_dir.is_dir() {
-        for entry in std::fs::read_dir(&devcontainer_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let nested = path.join("devcontainer.json");
-                if nested.exists() {
-                    return Ok(nested);
+        if let Ok(entries) = std::fs::read_dir(&devcontainer_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let nested = path.join("devcontainer.json");
+                    if nested.exists() {
+                        return Some(nested);
+                    }
                 }
             }
         }
     }
 
-    bail!(
-        "No devcontainer.json found in {}. \
-         Expected at .devcontainer/devcontainer.json",
-        project_path.display()
-    )
+    None
+}
+
+/// Find the devcontainer.json file for a project, returning an error if not found
+///
+/// See [`try_find_devcontainer_json`] for the search logic.
+pub fn find_devcontainer_json(project_path: &Path) -> Result<PathBuf> {
+    try_find_devcontainer_json(project_path).ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No devcontainer.json found in {}. \
+             Expected at .devcontainer/devcontainer.json",
+            project_path.display()
+        )
+    })
 }
 
 /// Load and parse a devcontainer.json file

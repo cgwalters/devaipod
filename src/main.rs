@@ -99,7 +99,7 @@ struct UpOptions {
     ssh: bool,
     /// Use a specific container image instead of building from devcontainer.json
     ///
-    /// This is useful for testing locally-built devcontainer images.
+    /// This allows working with git repositories that have no devcontainer.json.
     /// The image must already exist locally or be pullable.
     #[arg(long, value_name = "IMAGE")]
     image: Option<String>,
@@ -517,9 +517,20 @@ async fn cmd_up(
         eprintln!("   Consider committing or stashing your changes first.\n");
     }
 
-    // Find and load devcontainer.json
-    let devcontainer_json_path = devcontainer::find_devcontainer_json(project_path)?;
-    let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
+    // Find and load devcontainer.json (optional when --image is provided)
+    let devcontainer_json_path = devcontainer::try_find_devcontainer_json(project_path);
+    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
+        devcontainer::load(path)?
+    } else if image.is_some() {
+        tracing::info!("No devcontainer.json found, using defaults with image override");
+        devcontainer::DevcontainerConfig::default()
+    } else {
+        bail!(
+            "No devcontainer.json found in {}.\n\
+             Either add a devcontainer.json or use --image to specify a container image.",
+            project_path.display()
+        );
+    };
 
     // Derive project/pod name from path
     let project_name = project_path
@@ -536,7 +547,11 @@ async fn cmd_up(
     if dry_run {
         tracing::info!("Dry run: would create pod '{}'", pod_name);
         tracing::info!("  project: {}", project_path.display());
-        tracing::info!("  devcontainer: {}", devcontainer_json_path.display());
+        if let Some(ref path) = devcontainer_json_path {
+            tracing::info!("  devcontainer: {}", path.display());
+        } else {
+            tracing::info!("  devcontainer: (none, using image override)");
+        }
         tracing::info!("  gator enabled: {}", config.service_gator.is_enabled());
         return Ok(());
     }
@@ -758,9 +773,19 @@ async fn cmd_up_pr(
         bail!("Failed to clone PR head repository: {}", stderr);
     }
 
-    // Find and load devcontainer.json from the cloned repo
-    let devcontainer_json_path = devcontainer::find_devcontainer_json(temp_path)?;
-    let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
+    // Find and load devcontainer.json from the cloned repo (optional when --image is provided)
+    let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
+    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
+        devcontainer::load(path)?
+    } else if image.is_some() {
+        tracing::info!("No devcontainer.json found in PR, using defaults with image override");
+        devcontainer::DevcontainerConfig::default()
+    } else {
+        bail!(
+            "No devcontainer.json found in PR.\n\
+             Either add a devcontainer.json to the PR or use --image to specify a container image."
+        );
+    };
 
     // Derive pod name from repo and PR number
     let pod_name = make_pr_pod_name(&pr_ref.repo, pr_ref.number);
@@ -770,6 +795,9 @@ async fn cmd_up_pr(
         tracing::info!("  PR: {}", pr_info.pr_ref.short_display());
         tracing::info!("  Head: {} @ {}", pr_info.head_ref, &pr_info.head_sha[..8]);
         tracing::info!("  Clone URL: {}", pr_info.head_clone_url);
+        if devcontainer_json_path.is_none() {
+            tracing::info!("  devcontainer: (none, using image override)");
+        }
         return Ok(());
     }
 
@@ -968,9 +996,20 @@ async fn cmd_up_remote(
         "main".to_string() // Fallback
     };
 
-    // Find and load devcontainer.json from the cloned repo
-    let devcontainer_json_path = devcontainer::find_devcontainer_json(temp_path)?;
-    let devcontainer_config = devcontainer::load(&devcontainer_json_path)?;
+    // Find and load devcontainer.json from the cloned repo (optional when --image is provided)
+    let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
+    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
+        devcontainer::load(path)?
+    } else if image.is_some() {
+        tracing::info!("No devcontainer.json found in repository, using defaults with image override");
+        devcontainer::DevcontainerConfig::default()
+    } else {
+        bail!(
+            "No devcontainer.json found in {}.\n\
+             Either add a devcontainer.json to the repository or use --image to specify a container image.",
+            remote_url
+        );
+    };
 
     // Derive pod name from repo name
     let pod_name = make_pod_name(&repo_name);
@@ -1017,6 +1056,9 @@ async fn cmd_up_remote(
         tracing::info!("Dry run mode - would create pod '{}'", pod_name);
         tracing::info!("  Remote URL: {}", remote_url);
         tracing::info!("  Default branch: {}", default_branch);
+        if devcontainer_json_path.is_none() {
+            tracing::info!("  devcontainer: (none, using image override)");
+        }
         if let Some((forge_type, ref owner_repo)) = auto_gator_info {
             if matches!(forge_type, forge::ForgeType::GitHub) {
                 tracing::info!("  Service-gator: {} (read + draft PRs)", owner_repo);

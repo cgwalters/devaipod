@@ -271,15 +271,15 @@ impl DevaipodPod {
         // Get workspace folder
         let workspace_folder = config.workspace_folder_for_project(&project_name);
 
-        // Find devcontainer.json directory for resolving relative paths
-        let devcontainer_json = crate::devcontainer::find_devcontainer_json(project_path)?;
-        let devcontainer_dir = devcontainer_json.parent().unwrap_or(project_path);
-
         // Determine image - use override if provided, otherwise build/pull from devcontainer.json
         let image = if let Some(override_image) = image_override {
             tracing::info!("Using image override: {}", override_image);
             override_image.to_string()
         } else {
+            // Find devcontainer.json directory for resolving relative paths in build config
+            let devcontainer_json = crate::devcontainer::find_devcontainer_json(project_path)?;
+            let devcontainer_dir = devcontainer_json.parent().unwrap_or(project_path);
+
             let image_source = config.image_source(devcontainer_dir)?;
             let image_tag = format!("devaipod-{}", pod_name);
             podman
