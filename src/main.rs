@@ -54,14 +54,41 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
+/// Generate a short unique suffix for pod names
+fn unique_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // Use lower 24 bits of timestamp in seconds + some randomness from nanos
+    // This gives us a short but reasonably unique suffix
+    let val = (now.as_secs() & 0xFFFFFF) ^ ((now.subsec_nanos() as u64) & 0xFFFF);
+    format!("{:x}", val)
+}
+
 /// Create a pod name from a project name
+///
+/// Always generates a unique name to avoid conflicts with existing pods.
 fn make_pod_name(project_name: &str) -> String {
-    format!("{}{}", POD_NAME_PREFIX, sanitize_name(project_name))
+    format!(
+        "{}{}-{}",
+        POD_NAME_PREFIX,
+        sanitize_name(project_name),
+        unique_suffix()
+    )
 }
 
 /// Create a pod name for a PR
+///
+/// Always generates a unique name to avoid conflicts with existing pods.
 fn make_pr_pod_name(repo: &str, pr_number: u64) -> String {
-    format!("{}{}-pr{}", POD_NAME_PREFIX, sanitize_name(repo), pr_number)
+    format!(
+        "{}{}-pr{}-{}",
+        POD_NAME_PREFIX,
+        sanitize_name(repo),
+        pr_number,
+        unique_suffix()
+    )
 }
 
 // =============================================================================
@@ -109,6 +136,12 @@ struct UpOptions {
     /// The image must already exist locally or be pullable.
     #[arg(long, value_name = "IMAGE")]
     image: Option<String>,
+    /// Explicit pod name (default: derived from source with unique suffix)
+    ///
+    /// Use this for predictable pod names, e.g. in CI/CD or testing.
+    /// The devaipod- prefix will be added automatically if not present.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
     /// Configure service-gator scopes for AI agent access to external services.
     ///
     /// Format: service:scope where service is github, gitlab, jira, etc.
@@ -403,6 +436,7 @@ async fn cmd_up(
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
     let image = opts.image.as_deref();
+    let explicit_name = opts.name.as_deref();
     let service_gator_scopes = &opts.service_gator_scopes;
 
     let source_path = std::path::Path::new(source).canonicalize().ok();
@@ -470,8 +504,12 @@ async fn cmd_up(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
 
-    // Use a sanitized pod name (replace problematic characters)
-    let pod_name = make_pod_name(&project_name);
+    // Use explicit name if provided, otherwise generate a unique name
+    let pod_name = if let Some(name) = explicit_name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name(&project_name)
+    };
 
     // Check for API keys and warn if none are configured (helps first-run experience)
     check_api_keys_configured();
@@ -493,33 +531,6 @@ async fn cmd_up(
     let podman = podman::PodmanService::spawn()
         .await
         .context("Failed to start podman service")?;
-
-    // Check if pod already exists
-    if let Some(status) = podman
-        .get_pod_status(&pod_name)
-        .await
-        .context("Failed to check pod status")?
-    {
-        if status.is_running() {
-            tracing::info!("Pod '{}' already running", pod_name);
-        } else {
-            // Pod exists but is stopped - start it
-            tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
-            podman
-                .start_pod(&pod_name)
-                .await
-                .context("Failed to start existing pod")?;
-            tracing::info!("Pod '{}' started", pod_name);
-        }
-        // Write task instructions to agent config if provided
-        if let Some(task_desc) = task {
-            if !no_prompt {
-                tracing::info!("Writing task instructions to agent...");
-                write_task_to_existing_pod(&podman, &pod_name, task_desc).await?;
-            }
-        }
-        return Ok(());
-    }
 
     // Parse CLI service-gator scopes and merge with file config
     let service_gator_config = if !service_gator_scopes.is_empty() {
@@ -662,6 +673,7 @@ async fn cmd_up_pr(
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
     let image = opts.image.as_deref();
+    let explicit_name = opts.name.as_deref();
 
     tracing::info!(
         "Setting up PR #{} ({}/{})...",
@@ -719,8 +731,12 @@ async fn cmd_up_pr(
         );
     };
 
-    // Derive pod name from repo and PR number
-    let pod_name = make_pr_pod_name(&pr_ref.repo, pr_ref.number);
+    // Use explicit name if provided, otherwise generate a unique name
+    let pod_name = if let Some(name) = explicit_name {
+        normalize_pod_name(name)
+    } else {
+        make_pr_pod_name(&pr_ref.repo, pr_ref.number)
+    };
 
     if dry_run {
         tracing::info!("Dry run mode - would create pod '{}'", pod_name);
@@ -737,29 +753,6 @@ async fn cmd_up_pr(
     let podman = podman::PodmanService::spawn()
         .await
         .context("Failed to start podman service")?;
-
-    // Check if pod already exists
-    if let Some(status) = podman.get_pod_status(&pod_name).await? {
-        if !status.is_running() {
-            // Pod exists but is stopped - start it
-            tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
-            podman
-                .start_pod(&pod_name)
-                .await
-                .context("Failed to start existing pod")?;
-            tracing::info!("Pod '{}' started", pod_name);
-        } else {
-            tracing::info!("Pod '{}' already running", pod_name);
-        }
-        // Write task instructions to agent config if provided
-        if let Some(task_desc) = task {
-            if !no_prompt {
-                tracing::info!("Writing task instructions to agent...");
-                write_task_to_existing_pod(&podman, &pod_name, task_desc).await?;
-            }
-        }
-        return Ok(());
-    }
 
     // Check for gator and network isolation settings
     let enable_gator = config.service_gator.is_enabled();
@@ -878,6 +871,7 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
     let image = opts.image.as_deref();
+    let explicit_name = opts.name.as_deref();
     let service_gator_scopes = &opts.service_gator_scopes;
 
     tracing::info!("Setting up {}...", remote_url);
@@ -942,8 +936,12 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         );
     };
 
-    // Derive pod name from repo name
-    let pod_name = make_pod_name(&repo_name);
+    // Use explicit name if provided, otherwise generate a unique name
+    let pod_name = if let Some(name) = explicit_name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name(&repo_name)
+    };
 
     // For remote URLs, auto-enable service-gator with readonly + draft PR access
     // to the target repository (unless user provided explicit scopes)
@@ -1017,28 +1015,6 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     let podman = podman::PodmanService::spawn()
         .await
         .context("Failed to start podman service")?;
-
-    // Check if pod already exists
-    if let Some(status) = podman.get_pod_status(&pod_name).await? {
-        if status.is_running() {
-            tracing::info!("Pod '{}' already running", pod_name);
-        } else {
-            tracing::debug!("Pod '{}' exists but is stopped, starting...", pod_name);
-            podman
-                .start_pod(&pod_name)
-                .await
-                .context("Failed to start existing pod")?;
-            tracing::info!("Pod '{}' started", pod_name);
-        }
-        // Write task instructions to agent config if provided
-        if let Some(task_desc) = task {
-            if !no_prompt {
-                tracing::info!("Writing task instructions to agent...");
-                write_task_to_existing_pod(&podman, &pod_name, task_desc).await?;
-            }
-        }
-        return Ok(());
-    }
 
     let enable_gator = service_gator_config.is_enabled();
     let enable_network_isolation = config.network_isolation.enabled;
@@ -1154,144 +1130,6 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
     }
 
     Ok(())
-}
-
-/// Write task instructions to an existing pod's agent container
-///
-/// This writes the task to a file in the agent's opencode config directory
-/// so it persists across agent restarts.
-async fn write_task_to_existing_pod(
-    podman: &podman::PodmanService,
-    pod_name: &str,
-    task: &str,
-) -> Result<()> {
-    let agent_container = format!("{}-agent", pod_name);
-    let agent_home = "/home/agent";
-    let task_file_path = format!("{}/.config/opencode/devaipod-task.md", agent_home);
-    let config_path = format!("{}/.config/opencode/opencode.json", agent_home);
-
-    // Format the task as a markdown file with clear instructions
-    let task_content = format!(
-        r#"# Task from devaipod
-
-The user has requested the following task be completed:
-
----
-
-{task}
-
----
-
-Please work on this task. When you're done, summarize what you accomplished.
-"#,
-        task = task
-    );
-
-    // Escape the task content for shell heredoc
-    let escaped_task = task_content.replace("'", "'\\''");
-
-    // First, write the task file
-    let write_task_script = format!(
-        r#"
-set -e
-mkdir -p {agent_home}/.config/opencode
-cat > '{task_file_path}' << 'DEVAIPOD_TASK_EOF'
-{escaped_task}
-DEVAIPOD_TASK_EOF
-"#,
-        agent_home = agent_home,
-        task_file_path = task_file_path,
-        escaped_task = escaped_task
-    );
-
-    let exit_code = podman
-        .exec(
-            &agent_container,
-            &["/bin/sh", "-c", &write_task_script],
-            None,
-            None,
-        )
-        .await
-        .context("Failed to write task file to agent container")?;
-
-    if exit_code != 0 {
-        tracing::warn!("Failed to write task file (exit code {})", exit_code);
-        return Ok(());
-    }
-
-    // Now read existing config (if any), parse with jsonc-parser, add instructions, write back
-    let (exit_code, config_bytes, _) = podman
-        .exec_output(&agent_container, &["cat", &config_path])
-        .await
-        .context("Failed to read opencode config")?;
-
-    let new_config = if exit_code == 0 && !config_bytes.is_empty() {
-        // Config exists - parse it (supports JSON5/JSONC with trailing commas, comments, etc.)
-        let config_str = String::from_utf8_lossy(&config_bytes);
-        match jsonc_parser::parse_to_serde_value(&config_str, &Default::default()) {
-            Ok(Some(serde_json::Value::Object(mut obj))) => {
-                // Add task file to instructions array
-                let instructions = obj
-                    .entry("instructions")
-                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                if let serde_json::Value::Array(arr) = instructions {
-                    let task_path_value = serde_json::Value::String(task_file_path.clone());
-                    if !arr.contains(&task_path_value) {
-                        arr.push(task_path_value);
-                    }
-                }
-                serde_json::to_string_pretty(&serde_json::Value::Object(obj))
-                    .unwrap_or_else(|_| default_config_with_task(&task_file_path))
-            }
-            Ok(_) | Err(_) => {
-                tracing::warn!("Failed to parse existing opencode config, creating new one");
-                default_config_with_task(&task_file_path)
-            }
-        }
-    } else {
-        // No config exists - create one
-        default_config_with_task(&task_file_path)
-    };
-
-    // Write the updated config back
-    let escaped_config = new_config.replace("'", "'\\''");
-    let write_config_script = format!(
-        "cat > '{config_path}' << 'OPENCODE_CONFIG_EOF'\n{escaped_config}\nOPENCODE_CONFIG_EOF",
-        config_path = config_path,
-        escaped_config = escaped_config
-    );
-
-    let exit_code = podman
-        .exec(
-            &agent_container,
-            &["/bin/sh", "-c", &write_config_script],
-            None,
-            None,
-        )
-        .await
-        .context("Failed to write opencode config")?;
-
-    if exit_code != 0 {
-        tracing::warn!("Failed to write opencode config (exit code {})", exit_code);
-    } else {
-        tracing::debug!("Task instructions written to existing pod's agent");
-    }
-
-    Ok(())
-}
-
-/// Generate a default opencode config with the given task file in instructions
-fn default_config_with_task(task_file_path: &str) -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "instructions": [task_file_path]
-    }))
-    .unwrap_or_else(|_| {
-        format!(
-            r#"{{"$schema": "https://opencode.ai/config.json", "instructions": ["{}"]}}"#,
-            task_file_path
-        )
-    })
 }
 
 /// Check if any API keys are configured for the AI agent and warn if not

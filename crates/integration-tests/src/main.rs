@@ -133,6 +133,24 @@ impl CapturedOutput {
     pub fn success(&self) -> bool {
         self.output.status.success()
     }
+
+    /// Extract pod name from "Pod 'name' ready" message in output
+    ///
+    /// Returns None if the pattern is not found.
+    pub fn extract_pod_name(&self) -> Option<String> {
+        // Look in both stdout and stderr (tracing goes to stderr)
+        for line in self.combined().lines() {
+            // Match pattern like: INFO Pod 'devaipod-test-repo-abc123' ready
+            if line.contains("ready") {
+                if let Some(rest) = line.split("Pod '").nth(1) {
+                    if let Some(name) = rest.split('\'').next() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Run the devaipod command, capturing output
@@ -243,6 +261,19 @@ impl TestRepo {
             repo_path,
         })
     }
+}
+
+/// Generate a unique test pod name
+///
+/// Uses timestamp + random bits to ensure uniqueness across parallel test runs.
+pub(crate) fn unique_test_name(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // Use lower bits of timestamp + nanos for uniqueness
+    let val = (now.as_secs() & 0xFFFF) ^ ((now.subsec_nanos() as u64) & 0xFFFF);
+    format!("{}-{:x}", prefix, val)
 }
 
 /// Pod cleanup helper - removes pods on drop

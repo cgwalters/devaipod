@@ -20,9 +20,10 @@ check:
 test:
     cargo test
 
-# Run integration tests (requires podman + devpod)
+# Run integration tests (requires podman)
 test-integration:
-    cargo test -- --ignored
+    cargo build
+    DEVAIPOD_PATH=./target/debug/devaipod cargo test -p integration-tests
 
 # Run all tests (unit + integration)
 test-all: test test-integration
