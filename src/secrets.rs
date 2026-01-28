@@ -85,7 +85,9 @@ pub struct DevcontainerSecretDecl {
 }
 
 /// Partial devcontainer.json for secrets parsing
+/// Part of devcontainer secret loading feature, kept for potential future use.
 #[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
 struct DevcontainerSecrets {
     #[serde(default)]
     secrets: HashMap<String, DevcontainerSecretDecl>,
@@ -95,6 +97,8 @@ struct DevcontainerSecrets {
 ///
 /// This reads the `secrets` property from devcontainer.json and fetches
 /// matching secrets from podman secrets store.
+/// Part of devcontainer secret loading feature, kept for potential future use.
+#[allow(dead_code)]
 pub fn load_secrets_from_devcontainer(source_path: &Path) -> Result<Vec<(String, String)>> {
     let devcontainer_path = source_path.join(".devcontainer/devcontainer.json");
 
@@ -156,6 +160,7 @@ pub fn load_secrets_from_devcontainer(source_path: &Path) -> Result<Vec<(String,
 }
 
 /// Fetch a single secret value from podman secrets store
+#[allow(dead_code)]
 fn fetch_podman_secret(secret_name: &str) -> Result<String> {
     let output = std::process::Command::new("podman")
         .args(["secret", "inspect", secret_name, "--showsecret"])

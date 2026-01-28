@@ -36,22 +36,6 @@ fn devcontainer_cli_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Status of a podman pod
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PodStatus {
-    Running,
-    Stopped,
-    Created,
-    Unknown(String),
-}
-
-impl PodStatus {
-    /// Check if the pod is running
-    pub fn is_running(&self) -> bool {
-        matches!(self, PodStatus::Running)
-    }
-}
-
 /// A running podman service that we own
 pub struct PodmanService {
     /// The socket path we're listening on
@@ -435,36 +419,6 @@ impl PodmanService {
             &pod_id[..pod_id.len().min(12)]
         );
         Ok(pod_id)
-    }
-
-    /// Get pod status. Returns None if pod doesn't exist.
-    pub async fn get_pod_status(&self, name: &str) -> Result<Option<PodStatus>> {
-        let output = self
-            .podman_command()
-            .args(["pod", "inspect", "--format", "{{.State}}", name])
-            .output()
-            .await
-            .context("Failed to inspect pod")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // "no pod with name or ID" means the pod doesn't exist
-            if stderr.contains("no pod with name or ID") || stderr.contains("no such pod") {
-                return Ok(None);
-            }
-            bail!("Failed to inspect pod: {}", stderr);
-        }
-
-        let state = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_lowercase();
-        let status = match state.as_str() {
-            "running" => PodStatus::Running,
-            "exited" | "stopped" | "dead" => PodStatus::Stopped,
-            "created" => PodStatus::Created,
-            _ => PodStatus::Unknown(state),
-        };
-        Ok(Some(status))
     }
 
     /// Start a pod

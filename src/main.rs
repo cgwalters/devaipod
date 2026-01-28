@@ -13,7 +13,6 @@ use color_eyre::eyre::{bail, Context, Result};
 mod compose;
 mod config;
 mod devcontainer;
-mod devpod;
 mod forge;
 mod git;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
@@ -432,7 +431,7 @@ async fn cmd_up(
     }
 
     let task = opts.task.as_deref();
-    let no_prompt = opts.no_prompt;
+    let _no_prompt = opts.no_prompt;
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
     let image = opts.image.as_deref();
@@ -669,7 +668,7 @@ async fn cmd_up_pr(
     opts: &UpOptions,
 ) -> Result<()> {
     let task = opts.task.as_deref();
-    let no_prompt = opts.no_prompt;
+    let _no_prompt = opts.no_prompt;
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
     let image = opts.image.as_deref();
@@ -867,7 +866,7 @@ async fn cmd_up_pr(
 /// Start a development environment from a remote git URL
 async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptions) -> Result<()> {
     let task = opts.task.as_deref();
-    let no_prompt = opts.no_prompt;
+    let _no_prompt = opts.no_prompt;
     let dry_run = opts.dry_run;
     let ssh = opts.ssh;
     let image = opts.image.as_deref();
