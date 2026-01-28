@@ -124,7 +124,9 @@ devaipod up . --service-gator=github:readonly-all
 devaipod up . --service-gator=github:myorg/myrepo
 ```
 
-Credentials like `GH_TOKEN` are forwarded only to trusted containers (workspace, gator), never to the agent. See [Service-gator Integration](docs/service-gator.md) for full details.
+Credentials like `GH_TOKEN` are forwarded only to trusted containers (workspace, gator), never to the agent. For better security, use [podman secrets](docs/secrets.md#podman-secrets-recommended) instead of environment variables—secrets are mounted as files and don't appear in `podman inspect` or process listings.
+
+See [Service-gator Integration](docs/service-gator.md) for full details.
 
 ### Network Isolation
 

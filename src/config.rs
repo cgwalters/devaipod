@@ -153,18 +153,67 @@ impl EnvConfig {
 ///
 /// [trusted.env.vars]
 /// SOME_SECRET = "explicit_value"
+///
+/// [trusted]
+/// # Use podman secrets with type=env (secrets become env vars directly)
+/// # Format: "ENV_VAR_NAME=secret_name"
+/// secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
 /// ```
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct TrustedEnvConfig {
     /// Environment settings for trusted containers
     #[serde(default)]
     pub env: EnvConfig,
+    /// Podman secrets to mount with type=env.
+    /// Each entry is "ENV_VAR_NAME=secret_name".
+    /// Example: "GH_TOKEN=gh_token" sets the GH_TOKEN environment variable
+    /// directly from the secret value using podman's --secret type=env feature.
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 impl TrustedEnvConfig {
     /// Collect environment variables for trusted containers.
     pub fn collect(&self) -> HashMap<String, String> {
         self.env.collect()
+    }
+
+    /// Get (env_var_name, secret_name) pairs for podman secret mounting with type=env.
+    ///
+    /// Parses entries in the format "ENV_VAR_NAME=secret_name" and returns
+    /// a vector of tuples where each tuple contains:
+    /// - The environment variable name to set
+    /// - The podman secret name containing the value
+    ///
+    /// For each secret, podman's `--secret secret_name,type=env,target=ENV_VAR_NAME`
+    /// will set the environment variable directly from the secret value.
+    ///
+    /// Invalid entries (missing `=`) are logged and skipped.
+    pub fn secret_mounts(&self) -> Vec<(String, String)> {
+        self.secrets
+            .iter()
+            .filter_map(|entry| {
+                if let Some((env_var, secret_name)) = entry.split_once('=') {
+                    let env_var = env_var.trim();
+                    let secret_name = secret_name.trim();
+                    if !env_var.is_empty() && !secret_name.is_empty() {
+                        Some((env_var.to_string(), secret_name.to_string()))
+                    } else {
+                        tracing::warn!(
+                            "Invalid trusted.secrets entry (empty component): '{}'",
+                            entry
+                        );
+                        None
+                    }
+                } else {
+                    tracing::warn!(
+                        "Invalid trusted.secrets entry (expected ENV_VAR=secret_name): '{}'",
+                        entry
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -1564,5 +1613,114 @@ JIRA_API_TOKEN = "from_config"
         assert_eq!(collected.get("EXPLICIT_VAR"), Some(&"explicit".to_string()));
 
         std::env::remove_var("TEST_TRUSTED_VAR");
+    }
+
+    // =========================================================================
+    // TrustedEnvConfig secrets tests
+    // =========================================================================
+
+    #[test]
+    fn test_trusted_env_secrets_default() {
+        let config = TrustedEnvConfig::default();
+        assert!(config.secrets.is_empty());
+        assert!(config.secret_mounts().is_empty());
+    }
+
+    #[test]
+    fn test_parse_trusted_env_secrets() {
+        // [trusted.secrets] is now an array of "ENV_VAR=secret_name" strings
+        let toml = r#"
+[trusted]
+secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.trusted_env.secrets.len(), 2);
+        assert!(config
+            .trusted_env
+            .secrets
+            .contains(&"GH_TOKEN=gh_token".to_string()));
+        assert!(config
+            .trusted_env
+            .secrets
+            .contains(&"GITLAB_TOKEN=gitlab_token".to_string()));
+    }
+
+    #[test]
+    fn test_trusted_env_secret_mounts() {
+        let mut trusted = TrustedEnvConfig::default();
+        trusted.secrets = vec![
+            "GH_TOKEN=gh_token".to_string(),
+            "GITLAB_TOKEN=gitlab_token".to_string(),
+        ];
+
+        let mounts = trusted.secret_mounts();
+        assert_eq!(mounts.len(), 2);
+
+        // Check that both secrets are present (order preserved from Vec)
+        // Format is (env_var_name, secret_name)
+        let has_gh = mounts
+            .iter()
+            .any(|(env, secret)| env == "GH_TOKEN" && secret == "gh_token");
+        let has_gitlab = mounts
+            .iter()
+            .any(|(env, secret)| env == "GITLAB_TOKEN" && secret == "gitlab_token");
+        assert!(has_gh, "Should have GH_TOKEN secret");
+        assert!(has_gitlab, "Should have GITLAB_TOKEN secret");
+    }
+
+    #[test]
+    fn test_trusted_env_secret_mounts_invalid_entries() {
+        let mut trusted = TrustedEnvConfig::default();
+        trusted.secrets = vec![
+            "GH_TOKEN=gh_token".to_string(),     // valid
+            "INVALID_NO_EQUALS".to_string(),     // invalid: no =
+            "=empty_var".to_string(),            // invalid: empty var name
+            "EMPTY_SECRET=".to_string(),         // invalid: empty secret name
+            "VALID_TWO=some_secret".to_string(), // valid
+        ];
+
+        let mounts = trusted.secret_mounts();
+        // Only the 2 valid entries should be returned
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.iter().any(|(env, _)| env == "GH_TOKEN"));
+        assert!(mounts.iter().any(|(env, _)| env == "VALID_TWO"));
+    }
+
+    #[test]
+    fn test_parse_trusted_env_secrets_combined() {
+        // Test combining env vars and secrets
+        let toml = r#"
+[trusted.env]
+allowlist = ["JIRA_API_TOKEN"]
+
+[trusted.env.vars]
+SOME_VAR = "value"
+
+[trusted]
+secrets = ["GH_TOKEN=gh_token"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        // Env allowlist
+        assert_eq!(config.trusted_env.env.allowlist.len(), 1);
+        assert!(config
+            .trusted_env
+            .env
+            .allowlist
+            .contains(&"JIRA_API_TOKEN".to_string()));
+
+        // Explicit vars
+        assert_eq!(config.trusted_env.env.vars.len(), 1);
+        assert_eq!(
+            config.trusted_env.env.vars.get("SOME_VAR"),
+            Some(&"value".to_string())
+        );
+
+        // Secrets (now a Vec of strings)
+        assert_eq!(config.trusted_env.secrets.len(), 1);
+        assert!(config
+            .trusted_env
+            .secrets
+            .contains(&"GH_TOKEN=gh_token".to_string()));
     }
 }

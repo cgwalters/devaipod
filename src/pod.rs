@@ -234,6 +234,9 @@ impl DevaipodPod {
     ///
     /// The `image_override` parameter allows specifying a pre-built image to use instead
     /// of building from devcontainer.json. This is useful for testing locally-built images.
+    ///
+    /// The `gator_image_override` parameter allows specifying a custom service-gator image
+    /// instead of the default. This is useful for testing locally-built service-gator images.
     pub async fn create(
         podman: &PodmanService,
         project_path: &Path,
@@ -246,6 +249,7 @@ impl DevaipodPod {
         extra_labels: &[(String, String)],
         service_gator_config: Option<&crate::config::ServiceGatorConfig>,
         image_override: Option<&str>,
+        gator_image_override: Option<&str>,
     ) -> Result<Self> {
         // Resolve bind_home configurations
         let container_home = Self::resolve_container_home(devcontainer_config);
@@ -470,17 +474,20 @@ impl DevaipodPod {
 
         // Create gator container if enabled
         let gator_container = if enable_gator {
-            // Pull gator image
+            // Use override image if provided, otherwise use default
+            let gator_image = gator_image_override.unwrap_or(GATOR_IMAGE);
+
+            // Ensure gator image exists (check locally first, then pull if needed)
             podman
-                .pull_image(GATOR_IMAGE)
+                .ensure_gator_image(gator_image)
                 .await
-                .context("Failed to pull service-gator image")?;
+                .context("Failed to ensure service-gator image")?;
 
             // Use provided service_gator_config or fall back to global_config.service_gator
             let sg_config = service_gator_config.unwrap_or(&global_config.service_gator);
             let gator_config = Self::gator_container_config(Some(sg_config), global_config);
             podman
-                .create_container(&gator_container_name, GATOR_IMAGE, pod_name, gator_config)
+                .create_container(&gator_container_name, gator_image, pod_name, gator_config)
                 .await
                 .with_context(|| {
                     format!("Failed to create gator container: {}", gator_container_name)
@@ -749,6 +756,37 @@ echo "Dotfiles installed successfully"
         }
 
         // postCreateCommand
+        if let Some(cmd) = &config.post_create_command {
+            tracing::debug!("Running postCreateCommand...");
+            self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
+                .await
+                .context("postCreateCommand failed")?;
+        }
+
+        // postStartCommand
+        if let Some(cmd) = &config.post_start_command {
+            tracing::debug!("Running postStartCommand...");
+            self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
+                .await
+                .context("postStartCommand failed")?;
+        }
+
+        Ok(())
+    }
+
+    /// Run lifecycle commands for rebuild (skips onCreateCommand)
+    ///
+    /// Executes: postCreateCommand, postStartCommand
+    /// Used when rebuilding a container where the workspace already exists.
+    pub async fn run_rebuild_lifecycle_commands(
+        &self,
+        podman: &PodmanService,
+        config: &DevcontainerConfig,
+    ) -> Result<()> {
+        let user = config.effective_user();
+        let workdir = Some(self.workspace_folder.as_str());
+
+        // postCreateCommand - runs because we created new containers
         if let Some(cmd) = &config.post_create_command {
             tracing::debug!("Running postCreateCommand...");
             self.run_shell_command(podman, &cmd.to_shell_command(), user, workdir)
@@ -1065,121 +1103,6 @@ DEVAIPOD_TASK_EOF
                 task_file_path
             )
         })
-    }
-
-    /// Configure nested podman support in the workspace container
-    ///
-    /// This configures the container environment for running podman inside the container:
-    /// - Adjusts /etc/subuid and /etc/subgid to use UIDs within the container's namespace
-    /// - Creates /etc/containers/containers.conf for cgroupless operation
-    /// - Resets podman storage if the mappings changed
-    ///
-    /// This requires sudo access in the container and only runs if podman is installed.
-    pub async fn configure_nested_podman(&self, podman: &PodmanService) -> Result<()> {
-        // Shell script to configure nested podman
-        // This is designed to be idempotent and safe to run multiple times
-        let script = r#"
-set -e
-
-# Only proceed if podman and sudo are available
-if ! command -v podman >/dev/null 2>&1; then
-    echo "podman not found, skipping nested podman configuration"
-    exit 0
-fi
-if ! command -v sudo >/dev/null 2>&1; then
-    echo "sudo not found, skipping nested podman configuration"
-    exit 0
-fi
-
-# Parse /proc/self/uid_map to find the maximum UID available in this namespace
-# Format: <inside_uid> <outside_uid> <count>
-# We sum inside_uid + count to get the max usable UID
-max_uid=0
-while read -r inside outside count; do
-    end=$((inside + count))
-    if [ "$end" -gt "$max_uid" ]; then
-        max_uid=$end
-    fi
-done < /proc/self/uid_map
-
-my_uid=$(id -u)
-my_user=$(id -un)
-
-# Only configure if we have a constrained UID namespace (< 100000 UIDs)
-# Full namespaces have 65536+ UIDs starting at 100000+
-if [ "$max_uid" -le 1000 ] || [ "$max_uid" -ge 100000 ]; then
-    echo "Full UID namespace available (max=$max_uid), using default podman config"
-    exit 0
-fi
-
-# Calculate subuid range: start after our UID, use remaining range
-subuid_start=$((my_uid + 1))
-subuid_count=$((max_uid - subuid_start))
-
-if [ "$subuid_count" -lt 1000 ]; then
-    echo "Insufficient UID range for nested podman (only $subuid_count UIDs available)"
-    exit 0
-fi
-
-# Check if already configured correctly
-if [ -f /etc/subuid ]; then
-    current=$(grep "^${my_user}:" /etc/subuid 2>/dev/null || true)
-    expected="${my_user}:${subuid_start}:${subuid_count}"
-    if [ "$current" = "$expected" ]; then
-        echo "Nested podman already configured"
-        exit 0
-    fi
-fi
-
-echo "Configuring nested podman for $my_user (subuid $subuid_start:$subuid_count)"
-
-# Configure subuid/subgid
-echo "${my_user}:${subuid_start}:${subuid_count}" | sudo tee /etc/subuid >/dev/null
-echo "${my_user}:${subuid_start}:${subuid_count}" | sudo tee /etc/subgid >/dev/null
-
-# Configure containers.conf for nested operation (cgroupless, host network)
-sudo mkdir -p /etc/containers
-sudo tee /etc/containers/containers.conf >/dev/null << 'CONTAINERS_CONF'
-# Generated by devaipod for nested container support
-[containers]
-cgroups = "disabled"
-netns = "host"
-cgroup_manager = "cgroupfs"
-
-[engine]
-cgroup_manager = "cgroupfs"
-CONTAINERS_CONF
-
-# Reset podman storage if it exists (may have wrong UID mappings)
-storage_dir="$HOME/.local/share/containers/storage"
-if [ -d "$storage_dir" ]; then
-    echo "Resetting podman storage for new UID mappings"
-    rm -rf "$storage_dir"
-fi
-
-echo "Nested podman configured successfully"
-"#;
-
-        tracing::debug!("Configuring nested podman support...");
-
-        let exit_code = podman
-            .exec_quiet(
-                &self.workspace_container,
-                &["/bin/sh", "-c", script],
-                None,
-                None,
-            )
-            .await
-            .context("Failed to run nested podman configuration")?;
-
-        if exit_code != 0 {
-            tracing::debug!(
-                "Nested podman configuration returned exit code {} (may not be available)",
-                exit_code
-            );
-        }
-
-        Ok(())
     }
 
     /// Stop the pod
@@ -1514,6 +1437,12 @@ while true; do sleep 86400 & wait $!; done
     ///
     /// Runs with minimal privileges as an MCP server.
     /// Receives trusted env vars (GH_TOKEN, etc.) and scope configuration.
+    ///
+    /// Supports two methods for passing credentials:
+    /// 1. Environment variables via `[trusted.env]` - forwarded directly
+    /// 2. Podman secrets via `[trusted.secrets]` - set directly as env vars using type=env
+    ///
+    /// Podman secrets are more secure as they avoid credentials in environment variables.
     fn gator_container_config(
         sg_config: Option<&crate::config::ServiceGatorConfig>,
         global_config: &Config,
@@ -1525,9 +1454,12 @@ while true; do sleep 86400 & wait $!; done
         // These are the credentials that service-gator needs to access external services
         env.extend(global_config.trusted_env.collect());
 
-        // Build the command with scope arguments from config
+        // Get secrets to mount with type=env - these become env vars directly
+        // No need for *_FILE pattern; podman sets the env var from the secret value
+        let secrets = global_config.trusted_env.secret_mounts();
+
+        // Build the command args (not including binary name since image has ENTRYPOINT)
         let mut command = vec![
-            "service-gator".to_string(),
             "--mcp-server".to_string(),
             format!("0.0.0.0:{}", GATOR_PORT),
         ];
@@ -1548,6 +1480,7 @@ while true; do sleep 86400 & wait $!; done
             drop_all_caps: true,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
+            secrets,
             ..Default::default()
         }
     }
@@ -1708,10 +1641,9 @@ mod tests {
         // Verify no mounts (gator doesn't need project access)
         assert!(container_config.mounts.is_empty());
 
-        // Verify command includes port
+        // Verify command includes args (binary name not included since image has ENTRYPOINT)
         let cmd = container_config.command.as_ref().unwrap();
-        assert_eq!(cmd[0], "service-gator");
-        assert!(cmd.contains(&"--mcp-server".to_string()));
+        assert_eq!(cmd[0], "--mcp-server");
         assert!(cmd.iter().any(|s| s.contains(&GATOR_PORT.to_string())));
 
         // Verify security restrictions
@@ -1744,6 +1676,63 @@ mod tests {
         assert!(cmd.contains(&"--gh-repo".to_string()));
         // The repo arg should contain myorg/myrepo
         assert!(cmd.iter().any(|s| s.contains("myorg/myrepo")));
+    }
+
+    #[test]
+    fn test_gator_container_config_with_secrets() {
+        let mut global_config = crate::config::Config::default();
+        global_config.trusted_env.secrets = vec![
+            "GH_TOKEN=gh_token".to_string(),
+            "GITLAB_TOKEN=gitlab_token".to_string(),
+        ];
+
+        let container_config = DevaipodPod::gator_container_config(None, &global_config);
+
+        // Verify secrets are listed for mounting as (env_var, secret_name) tuples
+        assert_eq!(container_config.secrets.len(), 2);
+        assert!(container_config
+            .secrets
+            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
+        assert!(container_config
+            .secrets
+            .contains(&("GITLAB_TOKEN".to_string(), "gitlab_token".to_string())));
+
+        // No *_FILE env vars with the new type=env approach
+        assert!(!container_config.env.contains_key("GH_TOKEN_FILE"));
+        assert!(!container_config.env.contains_key("GITLAB_TOKEN_FILE"));
+    }
+
+    #[test]
+    fn test_gator_container_config_with_secrets_and_env() {
+        // Test that both secrets and regular env vars work together
+        let mut global_config = crate::config::Config::default();
+
+        // Add a secret
+        global_config.trusted_env.secrets = vec!["GH_TOKEN=gh_token".to_string()];
+
+        // Add a regular trusted env var
+        global_config
+            .trusted_env
+            .env
+            .vars
+            .insert("JIRA_API_TOKEN".to_string(), "jira_value".to_string());
+
+        let container_config = DevaipodPod::gator_container_config(None, &global_config);
+
+        // Verify secret is listed as (env_var, secret_name) tuple
+        assert_eq!(container_config.secrets.len(), 1);
+        assert!(container_config
+            .secrets
+            .contains(&("GH_TOKEN".to_string(), "gh_token".to_string())));
+
+        // No *_FILE env var with type=env approach
+        assert!(!container_config.env.contains_key("GH_TOKEN_FILE"));
+
+        // Verify regular env var is also present
+        assert_eq!(
+            container_config.env.get("JIRA_API_TOKEN"),
+            Some(&"jira_value".to_string())
+        );
     }
 
     #[test]

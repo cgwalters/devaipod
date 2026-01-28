@@ -219,6 +219,38 @@ impl PodmanService {
         Ok(())
     }
 
+    /// Ensure a gator image is up-to-date, using `--pull=newer` semantics
+    ///
+    /// This is used for service-gator images which may be local builds.
+    /// For remote images, pulls only if a newer version is available.
+    /// For local images (localhost/), skips the pull entirely.
+    pub async fn ensure_gator_image(&self, image: &str) -> Result<()> {
+        // Local images (localhost/) don't need pulling
+        if image.starts_with("localhost/") {
+            if self.client.inspect_image(image).await.is_ok() {
+                tracing::debug!("Local image {} exists", image);
+                return Ok(());
+            }
+            color_eyre::eyre::bail!("Local image {} not found. Build it first.", image);
+        }
+
+        // For remote images, use podman pull --policy=newer via CLI
+        // This pulls only if a newer version is available
+        tracing::debug!("Ensuring image {} is up-to-date (--policy=newer)", image);
+        let output = tokio::process::Command::new("podman")
+            .args(["pull", "--policy=newer", image])
+            .output()
+            .await
+            .context("Failed to run podman pull")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            color_eyre::eyre::bail!("Failed to pull image {}: {}", image, stderr.trim());
+        }
+
+        Ok(())
+    }
+
     /// Build an image from a Dockerfile
     pub async fn build_image(
         &self,
@@ -717,6 +749,12 @@ impl PodmanService {
             args.push(format!("{}:{}", volume_name, mount_path));
         }
 
+        // Podman secrets with type=env (directly set as environment variables)
+        for (env_var, secret_name) in &config.secrets {
+            args.push("--secret".to_string());
+            args.push(format!("{},type=env,target={}", secret_name, env_var));
+        }
+
         // Image
         args.push(image.to_string());
 
@@ -1108,6 +1146,10 @@ pub struct ContainerConfig {
     pub tmpfs_mounts: Vec<String>,
     /// Named volume mounts (volume_name -> mount_path)
     pub volume_mounts: Vec<(String, String)>,
+    /// Podman secrets to expose as environment variables via type=env.
+    /// Each tuple is (env_var_name, secret_name).
+    /// Generates: --secret secret_name,type=env,target=ENV_VAR_NAME
+    pub secrets: Vec<(String, String)>,
 }
 
 /// Mount configuration

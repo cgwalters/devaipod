@@ -6,7 +6,43 @@
 
 devaipod carefully partitions environment variables between containers to keep credentials secure. LLM API keys go to the agent, but trusted credentials (like `GH_TOKEN`) stay in workspace and gator containers only.
 
-## How It Works
+## Podman Secrets (Recommended)
+
+For trusted credentials like `GH_TOKEN`, podman secrets provide better security than environment variables:
+
+- Secrets don't appear in `podman inspect` or process listings
+- Uses podman's native `type=env` feature to set environment variables directly
+- Secrets are managed separately from container config
+
+### Setup
+
+1. Create podman secrets for your credentials:
+   ```bash
+   echo -n "ghp_xxxxxxxxxxxx" | podman secret create gh_token -
+   echo -n "glpat-xxxx" | podman secret create gitlab_token -
+   
+   # Verify
+   podman secret ls
+   ```
+
+2. Configure `~/.config/devaipod.toml`:
+   ```toml
+   [trusted]
+   # Use podman secrets with type=env (secrets become env vars directly)
+   # Format: "ENV_VAR_NAME=secret_name"
+   secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
+   ```
+
+### How It Works
+
+When devaipod starts:
+1. devaipod passes `--secret gh_token,type=env,target=GH_TOKEN` to podman
+2. Podman reads the secret value and sets `GH_TOKEN` directly as an environment variable
+3. Tools like `gh`, `glab`, etc. can use the credentials normally
+
+This approach keeps secrets out of the container environment and process listings while using podman's built-in environment variable injection.
+
+## LLM API Keys (devcontainer.json)
 
 1. **Declare secrets in devcontainer.json:**
    ```json

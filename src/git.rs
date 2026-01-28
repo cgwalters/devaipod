@@ -257,6 +257,9 @@ set -e
 echo "Cloning from local repository..."
 mkdir -p "$(dirname "{workspace}")"
 
+# Mark the host-mounted git directory as safe (different ownership in container)
+git config --global --add safe.directory /mnt/host-git
+
 # Clone from the mounted local .git directory
 # Use --no-hardlinks since we're cloning from a bind mount
 git clone --no-hardlinks /mnt/host-git "{workspace}" 2>&1

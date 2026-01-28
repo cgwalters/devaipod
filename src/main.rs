@@ -153,6 +153,15 @@ struct UpOptions {
     ///   --service-gator=github:myorg/repo:write   # Write access to specific repo
     #[arg(long = "service-gator", value_name = "SCOPE")]
     service_gator_scopes: Vec<String>,
+    /// Use a specific image for the service-gator container.
+    ///
+    /// This allows testing locally-built service-gator images instead of
+    /// pulling from ghcr.io/cgwalters/service-gator:latest.
+    ///
+    /// Example:
+    ///   --service-gator-image localhost/service-gator:dev
+    #[arg(long, value_name = "IMAGE")]
+    service_gator_image: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -232,6 +241,30 @@ enum HostCommand {
         /// Force deletion (stop running containers first)
         #[arg(short, long)]
         force: bool,
+    },
+    /// Rebuild a workspace with a new image
+    ///
+    /// Recreates the containers with a new or updated image while preserving
+    /// the workspace volume (your code and changes). This is useful when:
+    /// - The devcontainer.json has changed
+    /// - You want to use a newer version of the dev image
+    /// - You need to apply configuration changes
+    ///
+    /// By default, runs postStartCommand after rebuild. Use --run-create to also
+    /// run onCreateCommand and postCreateCommand.
+    ///
+    /// Examples:
+    ///   devaipod rebuild my-workspace
+    ///   devaipod rebuild my-workspace --image ghcr.io/org/devenv:latest
+    Rebuild {
+        /// Workspace name (devaipod- prefix optional)
+        workspace: String,
+        /// Use a specific container image instead of rebuilding from devcontainer.json
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+        /// Also run onCreateCommand and postCreateCommand (default: only postStartCommand)
+        #[arg(long)]
+        run_create: bool,
     },
     /// View container logs
     Logs {
@@ -379,6 +412,19 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Delete { workspace, force } => {
             cmd_delete(&normalize_pod_name(&workspace), force)
         }
+        HostCommand::Rebuild {
+            workspace,
+            image,
+            run_create,
+        } => {
+            cmd_rebuild(
+                &config,
+                &normalize_pod_name(&workspace),
+                image.as_deref(),
+                run_create,
+            )
+            .await
+        }
         HostCommand::Logs {
             workspace,
             container,
@@ -437,6 +483,7 @@ async fn cmd_up(
     let image = opts.image.as_deref();
     let explicit_name = opts.name.as_deref();
     let service_gator_scopes = &opts.service_gator_scopes;
+    let service_gator_image = opts.service_gator_image.as_deref();
 
     let source_path = std::path::Path::new(source).canonicalize().ok();
 
@@ -513,25 +560,7 @@ async fn cmd_up(
     // Check for API keys and warn if none are configured (helps first-run experience)
     check_api_keys_configured();
 
-    if dry_run {
-        tracing::info!("Dry run: would create pod '{}'", pod_name);
-        tracing::info!("  project: {}", project_path.display());
-        if let Some(ref path) = devcontainer_json_path {
-            tracing::info!("  devcontainer: {}", path.display());
-        } else {
-            tracing::info!("  devcontainer: (none, using image override)");
-        }
-        tracing::info!("  gator enabled: {}", config.service_gator.is_enabled());
-        return Ok(());
-    }
-
-    // Start podman service
-    tracing::debug!("Starting podman service...");
-    let podman = podman::PodmanService::spawn()
-        .await
-        .context("Failed to start podman service")?;
-
-    // Parse CLI service-gator scopes and merge with file config
+    // Parse CLI service-gator scopes and merge with file config (do this early for dry-run)
     let service_gator_config = if !service_gator_scopes.is_empty() {
         let cli_scopes = service_gator::parse_scopes(service_gator_scopes)
             .context("Failed to parse --service-gator scopes")?;
@@ -542,6 +571,27 @@ async fn cmd_up(
 
     // Check if gator should be enabled (from merged config)
     let enable_gator = service_gator_config.is_enabled();
+
+    if dry_run {
+        tracing::info!("Dry run: would create pod '{}'", pod_name);
+        tracing::info!("  project: {}", project_path.display());
+        if let Some(ref path) = devcontainer_json_path {
+            tracing::info!("  devcontainer: {}", path.display());
+        } else {
+            tracing::info!("  devcontainer: (none, using image override)");
+        }
+        tracing::info!("  gator enabled: {}", enable_gator);
+        if let Some(img) = service_gator_image {
+            tracing::info!("  gator image: {}", img);
+        }
+        return Ok(());
+    }
+
+    // Start podman service
+    tracing::debug!("Starting podman service...");
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
     // Check if network isolation should be enabled
     let enable_network_isolation = config.network_isolation.enabled;
 
@@ -567,6 +617,7 @@ async fn cmd_up(
         &extra_labels,
         Some(&service_gator_config),
         image,
+        service_gator_image,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -604,12 +655,6 @@ async fn cmd_up(
             .await
             .context("Failed to configure agent opencode")?;
     }
-
-    // Configure nested podman support (adjusts subuid/subgid for container's UID namespace)
-    devaipod_pod
-        .configure_nested_podman(&podman)
-        .await
-        .context("Failed to configure nested podman")?;
 
     // Install dotfiles BEFORE lifecycle commands so bashrc, gitconfig, etc. are available
     if let Some(ref dotfiles) = config.dotfiles {
@@ -781,6 +826,7 @@ async fn cmd_up_pr(
         &extra_labels,
         None, // Use config.service_gator for PR workflows
         image,
+        None, // gator_image_override not yet supported for PR workflows
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -809,12 +855,6 @@ async fn cmd_up_pr(
         )
         .await
         .context("Failed to copy bind_home files")?;
-
-    // Configure nested podman
-    devaipod_pod
-        .configure_nested_podman(&podman)
-        .await
-        .context("Failed to configure nested podman")?;
 
     // Install dotfiles
     if let Some(ref dotfiles) = config.dotfiles {
@@ -1032,6 +1072,9 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         extra_labels.push(("io.devaipod.task".to_string(), task_desc.to_string()));
     }
 
+    // Extract service_gator_image from opts
+    let service_gator_image = opts.service_gator_image.as_deref();
+
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -1046,6 +1089,7 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
         &extra_labels,
         Some(&service_gator_config),
         image,
+        service_gator_image,
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -1082,12 +1126,6 @@ async fn cmd_up_remote(config: &config::Config, remote_url: &str, opts: &UpOptio
             .await
             .context("Failed to configure agent opencode")?;
     }
-
-    // Configure nested podman
-    devaipod_pod
-        .configure_nested_podman(&podman)
-        .await
-        .context("Failed to configure nested podman")?;
 
     // Install dotfiles
     if let Some(ref dotfiles) = config.dotfiles {
@@ -1689,6 +1727,231 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
     if let Err(e) = remove_ssh_config(pod_name) {
         tracing::warn!("Failed to remove SSH config: {}", e);
     }
+
+    Ok(())
+}
+
+/// Rebuild a workspace with a new image while preserving the workspace volume
+///
+/// This stops and removes the containers but keeps the volumes intact,
+/// then recreates the containers with the new/updated image.
+async fn cmd_rebuild(
+    config: &config::Config,
+    pod_name: &str,
+    image_override: Option<&str>,
+    run_create: bool,
+) -> Result<()> {
+    tracing::info!("Rebuilding workspace '{}'...", strip_pod_prefix(pod_name));
+
+    // Get pod labels to find the repo URL
+    let labels = get_pod_labels(pod_name)
+        .ok_or_else(|| color_eyre::eyre::eyre!("Pod '{}' not found", pod_name))?;
+
+    let repo_url = labels
+        .get("io.devaipod.repo")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "Pod '{}' has no repository label. Cannot determine source for rebuild.",
+                pod_name
+            )
+        })?;
+
+    // Convert repo label back to URL (github.com/owner/repo -> https://github.com/owner/repo)
+    let remote_url = format!("https://{}", repo_url);
+    tracing::debug!("Repository: {}", remote_url);
+
+    // Get task label if present (to preserve it)
+    let task = labels
+        .get("io.devaipod.task")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Stop the pod first
+    tracing::info!("Stopping containers...");
+    let stop_output = podman_command()
+        .args(["pod", "stop", pod_name])
+        .output()
+        .context("Failed to stop pod")?;
+
+    if !stop_output.status.success() {
+        tracing::debug!(
+            "Pod stop returned non-zero (may already be stopped): {}",
+            String::from_utf8_lossy(&stop_output.stderr).trim()
+        );
+    }
+
+    // Remove the pod but keep volumes
+    tracing::info!("Removing containers (keeping volumes)...");
+    let rm_output = podman_command()
+        .args(["pod", "rm", "--force", pod_name])
+        .output()
+        .context("Failed to remove pod")?;
+
+    if !rm_output.status.success() {
+        let stderr = String::from_utf8_lossy(&rm_output.stderr);
+        bail!("Failed to remove pod: {}", stderr.trim());
+    }
+
+    // Clone the repo to get the latest devcontainer.json
+    tracing::info!("Fetching latest devcontainer configuration...");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_path = temp_dir.path();
+
+    let clone_output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &remote_url,
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to clone repository")?;
+
+    if !clone_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_output.stderr);
+        bail!("Failed to clone repository: {}", stderr);
+    }
+
+    // Load devcontainer.json
+    let devcontainer_json_path = devcontainer::try_find_devcontainer_json(temp_path);
+    let devcontainer_config = if let Some(ref path) = devcontainer_json_path {
+        devcontainer::load(path)?
+    } else if image_override.is_some() {
+        tracing::info!("No devcontainer.json found, using defaults with image override");
+        devcontainer::DevcontainerConfig::default()
+    } else {
+        bail!(
+            "No devcontainer.json found in repository.\n\
+             Use --image to specify a container image."
+        );
+    };
+
+    // Get the default branch name from the cloned repo
+    let branch_output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(temp_path)
+        .output()
+        .await
+        .context("Failed to get default branch")?;
+
+    let default_branch = if branch_output.status.success() {
+        String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string()
+    } else {
+        "main".to_string()
+    };
+
+    // Extract repo name from URL
+    let repo_name = git::extract_repo_name(&remote_url).unwrap_or_else(|| "workspace".to_string());
+
+    // Create remote info for workspace source
+    let remote_info = git::RemoteRepoInfo {
+        remote_url: remote_url.clone(),
+        default_branch,
+        repo_name,
+    };
+    let source = pod::WorkspaceSource::RemoteRepo(remote_info);
+
+    // Start podman service
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    let enable_gator = config.service_gator.is_enabled();
+    let enable_network_isolation = config.network_isolation.enabled;
+
+    // Build extra labels
+    let mut extra_labels = Vec::new();
+    if let Some(ref task_desc) = task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+
+    // Recreate the pod - volumes already exist so they'll be reused
+    tracing::info!("Recreating containers with new image...");
+    let devaipod_pod = pod::DevaipodPod::create(
+        &podman,
+        temp_path,
+        &devcontainer_config,
+        pod_name,
+        enable_gator,
+        enable_network_isolation,
+        config,
+        &source,
+        &extra_labels,
+        None,
+        image_override,
+        None, // gator_image_override not yet supported for rebuild
+    )
+    .await
+    .context("Failed to recreate pod")?;
+
+    // Start the pod
+    devaipod_pod
+        .start(&podman)
+        .await
+        .context("Failed to start pod")?;
+
+    // Wait for the agent to be ready
+    devaipod_pod
+        .wait_for_agent_ready(&podman, 120, 500)
+        .await
+        .context("Agent container failed to start")?;
+
+    // Copy bind_home files
+    tracing::debug!("Copying bind_home files...");
+    devaipod_pod
+        .copy_bind_home_files(
+            &podman,
+            &devaipod_pod.workspace_bind_home,
+            &devaipod_pod.agent_bind_home,
+            &devaipod_pod.container_home,
+            devcontainer_config.effective_user(),
+        )
+        .await
+        .context("Failed to copy bind_home files")?;
+
+    // Install dotfiles
+    if let Some(ref dotfiles) = config.dotfiles {
+        devaipod_pod
+            .install_dotfiles(&podman, dotfiles, devcontainer_config.effective_user())
+            .await
+            .context("Failed to install dotfiles")?;
+        devaipod_pod
+            .install_dotfiles_agent(&podman, dotfiles)
+            .await
+            .context("Failed to install dotfiles in agent")?;
+    }
+
+    // Run lifecycle commands based on --run-create flag
+    if run_create {
+        // Run all commands including onCreateCommand
+        tracing::debug!("Running all lifecycle commands (including onCreateCommand)...");
+        devaipod_pod
+            .run_lifecycle_commands(&podman, &devcontainer_config)
+            .await
+            .context("Failed to run lifecycle commands")?;
+    } else {
+        // Default for rebuild: run postCreateCommand and postStartCommand (skip onCreateCommand)
+        tracing::debug!("Running rebuild lifecycle commands (postCreate + postStart)...");
+        devaipod_pod
+            .run_rebuild_lifecycle_commands(&podman, &devcontainer_config)
+            .await
+            .context("Failed to run lifecycle commands")?;
+    }
+
+    tracing::info!(
+        "Workspace '{}' rebuilt successfully",
+        strip_pod_prefix(pod_name)
+    );
+    tracing::info!("  Agent: http://localhost:{}", pod::OPENCODE_PORT);
+    tracing::info!(
+        "  SSH: podman exec -it {} bash",
+        devaipod_pod.workspace_container
+    );
 
     Ok(())
 }

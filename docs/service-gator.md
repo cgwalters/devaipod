@@ -50,6 +50,20 @@ devaipod up . \
   --service-gator=github:myorg/backend:write
 ```
 
+### Using a Custom service-gator Image
+
+By default, devaipod pulls `ghcr.io/cgwalters/service-gator:latest`. To use a locally-built or custom image:
+
+```bash
+# Use a local development build
+devaipod up . --service-gator=github:myorg/myrepo --service-gator-image localhost/service-gator:dev
+
+# Use a specific version
+devaipod up . --service-gator=github:myorg/myrepo --service-gator-image ghcr.io/cgwalters/service-gator:v0.2.0
+```
+
+This is useful for testing local changes to service-gator or pinning to a specific version.
+
 ### CLI Scope Format
 
 ```
@@ -124,6 +138,27 @@ GH_TOKEN = "ghp_xxxxxxxxxxxx"
 ```
 
 This ensures credentials are available to service-gator but not directly accessible by the AI agent.
+
+### Podman Secrets (Recommended)
+
+For better security, use podman secrets instead of environment variables. Secrets don't appear in `podman inspect` or process listings, and podman's `type=env` feature sets them directly as environment variables.
+
+1. Create a podman secret:
+   ```bash
+   echo -n "ghp_xxxxxxxxxxxx" | podman secret create gh_token -
+   ```
+
+2. Configure `~/.config/devaipod.toml`:
+   ```toml
+   [trusted]
+   # Use podman secrets with type=env (secrets become env vars directly)
+   # Format: "ENV_VAR_NAME=secret_name"
+   secrets = ["GH_TOKEN=gh_token", "GITLAB_TOKEN=gitlab_token"]
+   ```
+
+3. devaipod passes `--secret gh_token,type=env,target=GH_TOKEN` to podman. The `GH_TOKEN` environment variable is set directly from the secret value.
+
+See [Secret Management](secrets.md) for more details on this approach.
 
 ## Permission Levels
 
