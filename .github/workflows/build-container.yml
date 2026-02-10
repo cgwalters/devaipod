@@ -1,0 +1,115 @@
+# Build and publish the devaipod container image to ghcr.io
+name: Build Container
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup host (newer podman with heredoc support, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Build and test container
+        run: just container-test
+
+  # Multi-arch build and push (only on push to main or tags)
+  push:
+    if: github.event_name != 'pull_request'
+    needs: build-and-test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup host (newer podman with heredoc support, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Log in to Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u ${{ github.actor }} --password-stdin ${{ env.REGISTRY }}
+
+      - name: Build container
+        run: just container-build
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Push by digest
+        id: push
+        run: |
+          digest=$(podman push --digestfile /tmp/digest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest && cat /tmp/digest)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Create multi-arch manifest
+  manifest:
+    runs-on: ubuntu-24.04
+    needs: push
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix={{branch}}-,format=short
+            type=ref,event=tag
+
+      - name: Log in to Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u ${{ github.actor }} --password-stdin ${{ env.REGISTRY }}
+
+      - name: Create and push manifest
+        run: |
+          tags=$(echo '${{ steps.meta.outputs.tags }}' | tr '\n' ' ')
+          digests=$(cd /tmp/digests && printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          for tag in $tags; do
+            podman manifest create "$tag" $digests
+            podman manifest push "$tag" "$tag"
+          done
+
+      - name: Inspect image
+        run: podman manifest inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}

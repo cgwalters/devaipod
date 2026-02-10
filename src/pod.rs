@@ -1194,6 +1194,10 @@ echo "Dotfiles installed successfully"
     ///
     /// For the workspace container, files are copied to the user's home directory.
     /// For the agent container, files are copied to the agent's HOME (persistent volume).
+    ///
+    /// Note: In container mode (devaipod running as a container), bind_home is not
+    /// supported because we don't have access to the host's home directory. Use podman
+    /// secrets via `[trusted.secrets]` instead.
     pub async fn copy_bind_home_files(
         &self,
         podman: &PodmanService,
@@ -1202,6 +1206,20 @@ echo "Dotfiles installed successfully"
         container_home: &str,
         container_user: Option<&str>,
     ) -> Result<()> {
+        // In container mode, bind_home is not supported - credentials must use secrets
+        if crate::podman::is_container_mode() {
+            let total_paths = workspace_bind_home.paths.len() + agent_bind_home.paths.len();
+            if total_paths > 0 {
+                bail!(
+                    "Container mode: bind_home is not supported ({} paths configured). \
+                     Use [trusted.secrets] in your config instead. See: \
+                     https://github.com/cgwalters/devaipod/blob/main/docs/src/container-mode.md",
+                    total_paths
+                );
+            }
+            return Ok(());
+        }
+
         let Some(host_home) = get_host_home() else {
             tracing::warn!("HOME environment variable not set, skipping bind_home file copy");
             return Ok(());

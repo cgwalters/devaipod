@@ -128,6 +128,44 @@ allow-repo-e2e repo=default_test_repo workspace=default_test_workspace:
     ssh {{workspace}}.devpod "echo '{\"allowed_repos\":[\"{{repo}}\"],\"allowed_prs\":[]}' > /run/devaipod/state.json"
     echo "Done! The repo {{repo}} is now allowed for PR creation."
 
+# ============================================================================
+# Container builds
+# ============================================================================
+
+# Container image name
+CONTAINER_IMAGE := "ghcr.io/cgwalters/devaipod"
+
+# Build the container image
+[group('container')]
+container-build:
+    podman build -t {{ CONTAINER_IMAGE }}:latest -f Containerfile .
+
+# Test the container image
+[group('container')]
+container-test: container-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Testing container image..."
+    
+    # Verify the binary runs
+    podman run --rm {{ CONTAINER_IMAGE }}:latest devaipod --help
+    
+    # Verify runtime dependencies are present
+    podman run --rm {{ CONTAINER_IMAGE }}:latest git --version
+    podman run --rm {{ CONTAINER_IMAGE }}:latest tmux -V
+    podman run --rm {{ CONTAINER_IMAGE }}:latest podman --version
+    
+    echo "Container tests passed!"
+
+# Build and push container image (for CI)
+[group('container')]
+container-push tag="latest": container-build
+    podman push {{ CONTAINER_IMAGE }}:{{ tag }}
+
+# ============================================================================
+# Documentation
+# ============================================================================
+
 # Build the documentation (mdbook) via container
 build-mdbook:
     podman build -t localhost/devaipod-mdbook -f docs/Dockerfile.mdbook .

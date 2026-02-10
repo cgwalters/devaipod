@@ -93,12 +93,27 @@ fn get_podman_info() -> Result<PodmanSystemInfo> {
 /// Standard Docker socket path (often symlinked to podman on macOS)
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 
+/// Podman socket path when running devaipod as a container with socket mounted
+const CONTAINER_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
+
 /// Get the local socket path for podman in remote mode
 ///
-/// First checks if /var/run/docker.sock exists (commonly symlinked to podman),
-/// then falls back to `podman machine inspect` to get the actual socket path.
+/// Checks well-known socket paths in order:
+/// 1. /run/podman/podman.sock (container mode with mounted socket)
+/// 2. /var/run/docker.sock (commonly symlinked to podman on macOS)
+/// 3. Falls back to `podman machine inspect` to get the actual socket path.
 fn get_remote_socket() -> Result<PathBuf> {
-    // Fast path: check if /var/run/docker.sock exists
+    // Container mode: check if socket is mounted at /run/podman/podman.sock
+    let container_sock = PathBuf::from(CONTAINER_PODMAN_SOCKET);
+    if container_sock.exists() {
+        tracing::debug!(
+            "Using {} for podman connection (container mode)",
+            CONTAINER_PODMAN_SOCKET
+        );
+        return Ok(container_sock);
+    }
+
+    // macOS/Docker compat: check if /var/run/docker.sock exists
     let docker_sock = PathBuf::from(DOCKER_SOCKET);
     if docker_sock.exists() {
         tracing::debug!("Using {} for podman connection", DOCKER_SOCKET);
@@ -106,10 +121,7 @@ fn get_remote_socket() -> Result<PathBuf> {
     }
 
     // Fallback: query podman machine for the socket path
-    tracing::debug!(
-        "{} not found, querying podman machine inspect",
-        DOCKER_SOCKET
-    );
+    tracing::debug!("No well-known socket found, querying podman machine inspect");
 
     let output = std::process::Command::new("podman")
         .args(["machine", "inspect"])
@@ -157,6 +169,30 @@ pub struct PodmanService {
 /// Check if we're running inside a toolbox container
 fn is_toolbox() -> bool {
     std::env::var_os("TOOLBOX_PATH").is_some()
+}
+
+/// Check if we're running inside a container (not toolbox)
+///
+/// Detects container mode by checking for:
+/// 1. The well-known container socket mount at /run/podman/podman.sock
+/// 2. The /.dockerenv file (created by Docker/Podman)
+/// 3. The /run/.containerenv file (Podman-specific)
+///
+/// Note: toolbox is a special case and is handled separately.
+pub fn is_container_mode() -> bool {
+    // Don't treat toolbox as container mode - it has host filesystem access
+    if is_toolbox() {
+        return false;
+    }
+
+    // Check for our documented container socket mount point
+    if std::path::Path::new(CONTAINER_PODMAN_SOCKET).exists() {
+        return true;
+    }
+
+    // Check for standard container indicators
+    std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
 }
 
 impl PodmanService {
