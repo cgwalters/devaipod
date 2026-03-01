@@ -4,6 +4,7 @@ pub mod advisor;
 pub mod cli;
 pub mod container;
 pub mod orchestration;
+pub mod pod_api;
 pub mod ssh;
 pub mod webui;
 
