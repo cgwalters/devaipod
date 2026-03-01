@@ -1534,6 +1534,20 @@ struct AgentStatusResponse {
     session_count: usize,
 }
 
+impl AgentStatusResponse {
+    /// Construct a response for a given activity with all other fields empty.
+    fn with_activity(activity: &str) -> Self {
+        Self {
+            activity: activity.to_string(),
+            status_line: None,
+            current_tool: None,
+            recent_output: vec![],
+            last_message_ts: None,
+            session_count: 0,
+        }
+    }
+}
+
 /// Get agent status for a pod (thin proxy to pod-api `/summary`).
 ///
 /// Delegates to the pod-api sidecar's `/summary` endpoint, which is the
@@ -1541,18 +1555,9 @@ struct AgentStatusResponse {
 async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
     let pod_name = normalize_pod_name(&name);
 
-    let stopped = AgentStatusResponse {
-        activity: "Stopped".to_string(),
-        status_line: None,
-        current_tool: None,
-        recent_output: vec![],
-        last_message_ts: None,
-        session_count: 0,
-    };
-
     let port = match get_pod_api_port(&pod_name).await {
         Ok(p) => p,
-        Err(_) => return Json(stopped),
+        Err(_) => return Json(AgentStatusResponse::with_activity("Stopped")),
     };
 
     let host = host_for_pod_services();
@@ -1562,16 +1567,7 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
         .build()
     {
         Ok(c) => c,
-        Err(_) => {
-            return Json(AgentStatusResponse {
-                activity: "Unknown".to_string(),
-                status_line: None,
-                current_tool: None,
-                recent_output: vec![],
-                last_message_ts: None,
-                session_count: 0,
-            })
-        }
+        Err(_) => return Json(AgentStatusResponse::with_activity("Unknown")),
     };
 
     // Proxy to pod-api's /summary endpoint.
@@ -1582,23 +1578,9 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
     {
         Ok(resp) if resp.status().is_success() => match resp.json::<AgentStatusResponse>().await {
             Ok(summary) => Json(summary),
-            Err(_) => Json(AgentStatusResponse {
-                activity: "Unknown".to_string(),
-                status_line: None,
-                current_tool: None,
-                recent_output: vec![],
-                last_message_ts: None,
-                session_count: 0,
-            }),
+            Err(_) => Json(AgentStatusResponse::with_activity("Unknown")),
         },
-        _ => Json(AgentStatusResponse {
-            activity: "Unknown".to_string(),
-            status_line: None,
-            current_tool: None,
-            recent_output: vec![],
-            last_message_ts: None,
-            session_count: 0,
-        }),
+        _ => Json(AgentStatusResponse::with_activity("Unknown")),
     }
 }
 
