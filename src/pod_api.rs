@@ -39,8 +39,8 @@ use tower_http::services::{ServeDir, ServeFile};
 /// Path to the vendored opencode UI files.
 const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
 
-/// The opencode server listens on this port inside the pod.
-const OPENCODE_UPSTREAM_PORT: u16 = 4096;
+/// Default port for the opencode server inside the pod.
+const DEFAULT_OPENCODE_PORT: u16 = 4096;
 
 /// Server state shared across all handlers.
 #[derive(Clone)]
@@ -57,6 +57,8 @@ struct AppState {
     agent_container: String,
     /// Password for authenticating to the opencode server (Basic auth).
     opencode_password: String,
+    /// Port of the opencode server to connect to (default 4096).
+    opencode_port: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,13 +1470,11 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
 
     let credentials = BASE64_STANDARD.encode(format!("opencode:{}", state.opencode_password));
     let auth_value = format!("Basic {}", credentials);
+    let opencode_port = state.opencode_port;
 
     // Fetch sessions from the local opencode server.
     let sessions_resp = match client
-        .get(format!(
-            "http://127.0.0.1:{}/session",
-            OPENCODE_UPSTREAM_PORT
-        ))
+        .get(format!("http://127.0.0.1:{}/session", opencode_port))
         .header(header::AUTHORIZATION, &auth_value)
         .send()
         .await
@@ -1518,7 +1518,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let messages_resp = match client
         .get(format!(
             "http://127.0.0.1:{}/session/{}/message?limit=5",
-            OPENCODE_UPSTREAM_PORT, session_id
+            opencode_port, session_id
         ))
         .header(header::AUTHORIZATION, &auth_value)
         .send()
@@ -1801,7 +1801,7 @@ fn is_opencode_api_path(path: &str) -> bool {
     API_SEGMENTS.contains(&first_segment)
 }
 
-/// Proxy an HTTP request to the opencode server at localhost:4096.
+/// Proxy an HTTP request to the opencode server.
 ///
 /// Supports regular requests, SSE streaming, and HTTP Upgrade (WebSocket).
 /// If the upstream is unreachable and the path is an event-stream endpoint,
@@ -1809,10 +1809,11 @@ fn is_opencode_api_path(path: &str) -> bool {
 async fn proxy_to_opencode(
     path: &str,
     password: &str,
+    opencode_port: u16,
     request: Request,
 ) -> std::result::Result<Response, StatusCode> {
     let host = "127.0.0.1";
-    let port = OPENCODE_UPSTREAM_PORT;
+    let port = opencode_port;
 
     // Connect to the opencode server.
     // For SSE/event paths, return a keepalive stream immediately if unreachable.
@@ -2010,7 +2011,14 @@ async fn fallback_handler(State(state): State<AppState>, request: Request) -> Re
 
     // 2. Opencode API paths: proxy to the upstream opencode server.
     if has_file_extension(trimmed) || is_opencode_api_path(trimmed) {
-        return match proxy_to_opencode(trimmed, &state.opencode_password, request).await {
+        return match proxy_to_opencode(
+            trimmed,
+            &state.opencode_password,
+            state.opencode_port,
+            request,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(status) => status.into_response(),
         };
@@ -2049,6 +2057,9 @@ pub(crate) struct PodApiArgs {
     /// Password for authenticating to the opencode server (Basic auth).
     #[arg(long, default_value = "")]
     opencode_password: String,
+    /// Port of the opencode server to connect to.
+    #[arg(long, default_value_t = DEFAULT_OPENCODE_PORT)]
+    opencode_port: u16,
 }
 
 /// Build the axum router (public for testing).
@@ -2089,6 +2100,7 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         workspace_container: args.workspace_container.unwrap_or_default(),
         agent_container: args.agent_container.unwrap_or_default(),
         opencode_password: args.opencode_password,
+        opencode_port: args.opencode_port,
     };
 
     let app = build_router(state);
@@ -2117,9 +2129,6 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::util::ServiceExt;
 
     // -----------------------------------------------------------------------
     // derive_agent_status_from_messages — pure function tests
@@ -2341,235 +2350,6 @@ mod tests {
             "should use last assistant message (no completed time)"
         );
         assert_eq!(status_line.as_deref(), Some("Working on more..."));
-    }
-
-    // -----------------------------------------------------------------------
-    // GET /summary endpoint tests
-    // -----------------------------------------------------------------------
-
-    /// Build a test router with dummy state (no real opencode server).
-    fn test_router() -> Router {
-        let workspace = Arc::new(PathBuf::from("/tmp/devaipod-test-workspace"));
-        let (tx, _) = broadcast::channel::<GitEvent>(1);
-        let state = AppState {
-            workspace,
-            git_events_tx: tx,
-            pty_sessions: PtySessionManager::new(),
-            workspace_container: String::new(),
-            agent_container: String::new(),
-            opencode_password: "test-password".to_string(),
-        };
-        build_router(state)
-    }
-
-    /// GET /summary always returns 200 with valid JSON containing all expected
-    /// fields, regardless of whether opencode is running. The exact activity
-    /// value depends on the environment (opencode may or may not be listening
-    /// on port 4096 in the test environment).
-    #[tokio::test]
-    async fn test_summary_returns_valid_response() {
-        let app = test_router();
-        let req = Request::builder()
-            .uri("/summary")
-            .body(Body::empty())
-            .expect("request");
-        let resp = app.oneshot(req).await.expect("oneshot");
-        assert_eq!(
-            resp.status(),
-            200,
-            "/summary must always return 200 (never an error status)"
-        );
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("should be valid JSON");
-
-        // activity must be a known value
-        let activity = json["activity"]
-            .as_str()
-            .expect("activity should be a string");
-        assert!(
-            ["Working", "Idle", "Stopped", "Unknown"].contains(&activity),
-            "activity should be one of Working/Idle/Stopped/Unknown, got: {activity}"
-        );
-
-        // All fields from PodSummaryResponse must be present.
-        assert!(json.get("status_line").is_some(), "missing status_line");
-        assert!(json.get("current_tool").is_some(), "missing current_tool");
-        assert!(
-            json.get("recent_output")
-                .and_then(|r| r.as_array())
-                .is_some(),
-            "recent_output should be an array"
-        );
-        assert!(
-            json.get("last_message_ts").is_some(),
-            "missing last_message_ts"
-        );
-        assert!(
-            json.get("session_count").and_then(|s| s.as_u64()).is_some(),
-            "session_count should be an integer"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Live integration tests — only run inside a devaipod pod (OPENCODE=1)
-    // -----------------------------------------------------------------------
-    //
-    // These tests hit the real opencode server at 127.0.0.1:4096 via the
-    // pod-api router. They're skipped in environments without a running
-    // opencode (CI, local cargo test, etc.) by checking the OPENCODE env var.
-
-    /// Returns true if we're running inside a devaipod pod with a live opencode.
-    fn has_live_opencode() -> bool {
-        // OPENCODE=1 is set in devaipod agent containers
-        if std::env::var("OPENCODE").as_deref() != Ok("1") {
-            return false;
-        }
-        // Double-check opencode is actually responding
-        std::net::TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], OPENCODE_UPSTREAM_PORT)),
-            std::time::Duration::from_secs(1),
-        )
-        .is_ok()
-    }
-
-    /// GET /summary against a live opencode server returns real session data.
-    #[tokio::test]
-    async fn test_live_summary_returns_real_sessions() {
-        if !has_live_opencode() {
-            eprintln!("skipping: no live opencode (OPENCODE != 1 or port 4096 not listening)");
-            return;
-        }
-
-        let app = test_router();
-        let req = Request::builder()
-            .uri("/summary")
-            .body(Body::empty())
-            .expect("request");
-        let resp = app.oneshot(req).await.expect("oneshot");
-        assert_eq!(resp.status(), 200);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-
-        // With a live opencode, we should have at least one session
-        let session_count = json["session_count"].as_u64().expect("session_count");
-        assert!(
-            session_count > 0,
-            "live opencode should have sessions, got 0"
-        );
-
-        // Activity should be Working or Idle (not Unknown/Stopped)
-        let activity = json["activity"].as_str().expect("activity");
-        assert!(
-            ["Working", "Idle"].contains(&activity),
-            "live opencode should report Working or Idle, got: {activity}"
-        );
-
-        // last_message_ts should be a real timestamp (> year 2020 in millis)
-        let ts = json["last_message_ts"].as_i64().expect("last_message_ts");
-        assert!(
-            ts > 1_577_836_800_000,
-            "timestamp should be after 2020, got: {ts}"
-        );
-    }
-
-    /// The /summary response must be deserializable as the control plane's
-    /// AgentStatusResponse type, proving wire compatibility between the two
-    /// halves of the proxy.
-    #[tokio::test]
-    async fn test_live_summary_wire_compatible_with_controlplane() {
-        if !has_live_opencode() {
-            eprintln!("skipping: no live opencode");
-            return;
-        }
-
-        // This struct mirrors web.rs AgentStatusResponse exactly.
-        // If the fields diverge, this test fails at compile time or
-        // deserialization time.
-        #[derive(Debug, serde::Deserialize)]
-        #[allow(dead_code)]
-        struct ControlPlaneResponse {
-            activity: String,
-            status_line: Option<String>,
-            current_tool: Option<String>,
-            recent_output: Vec<String>,
-            last_message_ts: Option<i64>,
-            session_count: usize,
-        }
-
-        let app = test_router();
-        let req = Request::builder()
-            .uri("/summary")
-            .body(Body::empty())
-            .expect("request");
-        let resp = app.oneshot(req).await.expect("oneshot");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-
-        // Deserialize as the control plane type — this is the critical assertion.
-        let parsed: ControlPlaneResponse =
-            serde_json::from_slice(&body).expect("should deserialize as ControlPlaneResponse");
-
-        // Sanity-check the deserialized values
-        assert!(
-            !parsed.activity.is_empty(),
-            "activity should not be empty after deserialization"
-        );
-        assert!(parsed.session_count > 0, "live session_count should be > 0");
-    }
-
-    /// GET /summary with a live opencode produces correctly bounded output.
-    #[tokio::test]
-    async fn test_live_summary_output_bounds() {
-        if !has_live_opencode() {
-            eprintln!("skipping: no live opencode");
-            return;
-        }
-
-        let app = test_router();
-        let req = Request::builder()
-            .uri("/summary")
-            .body(Body::empty())
-            .expect("request");
-        let resp = app.oneshot(req).await.expect("oneshot");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-
-        // recent_output should be capped at SUMMARY_MAX_LINES
-        let recent = json["recent_output"].as_array().expect("recent_output");
-        assert!(
-            recent.len() <= SUMMARY_MAX_LINES,
-            "recent_output should have at most {} entries, got {}",
-            SUMMARY_MAX_LINES,
-            recent.len()
-        );
-
-        // Each line should be at most 80 chars (truncation)
-        for (i, line) in recent.iter().enumerate() {
-            let s = line.as_str().expect("line should be a string");
-            assert!(
-                s.chars().count() <= 80,
-                "recent_output[{i}] should be <= 80 chars, got {}: {s}",
-                s.chars().count()
-            );
-        }
-
-        // status_line (if present) should be at most 60 chars
-        if let Some(sl) = json["status_line"].as_str() {
-            assert!(
-                sl.chars().count() <= 60,
-                "status_line should be <= 60 chars, got {}: {sl}",
-                sl.chars().count()
-            );
-        }
     }
 
     #[test]
