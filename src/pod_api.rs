@@ -2117,6 +2117,301 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    // -----------------------------------------------------------------------
+    // derive_agent_status_from_messages — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_status_empty_messages() {
+        let messages: Vec<serde_json::Value> = vec![];
+        let (activity, status_line, current_tool, recent_output, last_ts) =
+            derive_agent_status_from_messages(&messages);
+        assert_eq!(activity, "Unknown");
+        assert!(status_line.is_none());
+        assert!(current_tool.is_none());
+        assert!(recent_output.is_empty());
+        assert!(last_ts.is_none());
+    }
+
+    #[test]
+    fn test_derive_status_no_assistant_message() {
+        let messages = vec![serde_json::json!({
+            "info": {"role": "user"},
+            "parts": [{"type": "text", "text": "Hello"}]
+        })];
+        let (activity, ..) = derive_agent_status_from_messages(&messages);
+        assert_eq!(activity, "Unknown");
+    }
+
+    #[test]
+    fn test_derive_status_working_no_completed_time() {
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890}
+            },
+            "parts": [{"type": "text", "text": "Working on it..."}]
+        })];
+        let (activity, status_line, _, _, _) = derive_agent_status_from_messages(&messages);
+        assert_eq!(activity, "Working");
+        assert_eq!(status_line.as_deref(), Some("Working on it..."));
+    }
+
+    #[test]
+    fn test_derive_status_idle_with_stop_finish() {
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891},
+                "finish": "stop"
+            },
+            "parts": [{"type": "text", "text": "Done!"}]
+        })];
+        let (activity, ..) = derive_agent_status_from_messages(&messages);
+        assert_eq!(activity, "Idle");
+    }
+
+    #[test]
+    fn test_derive_status_working_with_tool_calls_finish() {
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891},
+                "finish": "tool-calls"
+            },
+            "parts": [{"type": "text", "text": "Making tool call..."}]
+        })];
+        let (activity, ..) = derive_agent_status_from_messages(&messages);
+        assert_eq!(activity, "Working");
+    }
+
+    #[test]
+    fn test_derive_status_working_with_incomplete_tool() {
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891}
+            },
+            "parts": [
+                {"type": "text", "text": "Running a tool..."},
+                {"type": "tool", "name": "bash", "state": {"status": "running"}}
+            ]
+        })];
+        let (activity, _, current_tool, _, _) = derive_agent_status_from_messages(&messages);
+        assert_eq!(activity, "Working");
+        assert_eq!(current_tool.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn test_derive_status_idle_with_completed_tool() {
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890, "completed": 1234567891}
+            },
+            "parts": [
+                {"type": "text", "text": "Tool result..."},
+                {"type": "tool", "name": "bash", "state": {"status": "completed"}}
+            ]
+        })];
+        let (activity, _, current_tool, _, _) = derive_agent_status_from_messages(&messages);
+        assert_eq!(activity, "Idle");
+        assert!(
+            current_tool.is_none(),
+            "completed tool should not appear as current"
+        );
+    }
+
+    #[test]
+    fn test_derive_status_recent_output_truncates_long_lines() {
+        let long_line = "x".repeat(100);
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890}
+            },
+            "parts": [{"type": "text", "text": long_line}]
+        })];
+        let (_, _, _, recent_output, _) = derive_agent_status_from_messages(&messages);
+        assert!(!recent_output.is_empty());
+        assert!(
+            recent_output[0].len() <= 80,
+            "long line should be truncated to 80 chars, got {}",
+            recent_output[0].len()
+        );
+        assert!(
+            recent_output[0].ends_with("..."),
+            "truncated line should end with ellipsis"
+        );
+    }
+
+    #[test]
+    fn test_derive_status_recent_output_includes_tool_entries() {
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890}
+            },
+            "parts": [
+                {"type": "tool", "name": "read", "state": {"status": "completed"}}
+            ]
+        })];
+        let (_, _, _, recent_output, _) = derive_agent_status_from_messages(&messages);
+        assert!(!recent_output.is_empty());
+        assert!(
+            recent_output[0].contains("read"),
+            "tool entry should appear in recent_output"
+        );
+    }
+
+    #[test]
+    fn test_derive_status_last_message_timestamp() {
+        let messages = vec![
+            serde_json::json!({
+                "info": {
+                    "role": "user",
+                    "time": {"created": 1000}
+                },
+                "parts": []
+            }),
+            serde_json::json!({
+                "info": {
+                    "role": "assistant",
+                    "time": {"created": 2000, "completed": 3000}
+                },
+                "parts": [{"type": "text", "text": "Done"}]
+            }),
+        ];
+        let (_, _, _, _, last_ts) = derive_agent_status_from_messages(&messages);
+        assert_eq!(last_ts, Some(3000), "should pick the max timestamp");
+    }
+
+    #[test]
+    fn test_derive_status_status_line_truncates() {
+        let long_status = "a".repeat(80);
+        let messages = vec![serde_json::json!({
+            "info": {
+                "role": "assistant",
+                "time": {"created": 1234567890}
+            },
+            "parts": [{"type": "text", "text": long_status}]
+        })];
+        let (_, status_line, _, _, _) = derive_agent_status_from_messages(&messages);
+        let sl = status_line.unwrap();
+        assert!(
+            sl.len() <= 60,
+            "status_line should be truncated to 60 chars"
+        );
+        assert!(
+            sl.ends_with("..."),
+            "truncated status_line should end with ..."
+        );
+    }
+
+    #[test]
+    fn test_derive_status_multiple_messages_uses_last_assistant() {
+        let messages = vec![
+            serde_json::json!({
+                "info": {
+                    "role": "assistant",
+                    "time": {"created": 1000, "completed": 1001},
+                    "finish": "stop"
+                },
+                "parts": [{"type": "text", "text": "First response"}]
+            }),
+            serde_json::json!({
+                "info": {"role": "user"},
+                "parts": [{"type": "text", "text": "Do more"}]
+            }),
+            serde_json::json!({
+                "info": {
+                    "role": "assistant",
+                    "time": {"created": 2000}
+                },
+                "parts": [{"type": "text", "text": "Working on more..."}]
+            }),
+        ];
+        let (activity, status_line, _, _, _) = derive_agent_status_from_messages(&messages);
+        assert_eq!(
+            activity, "Working",
+            "should use last assistant message (no completed time)"
+        );
+        assert_eq!(status_line.as_deref(), Some("Working on more..."));
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /summary endpoint tests
+    // -----------------------------------------------------------------------
+
+    /// Build a test router with dummy state (no real opencode server).
+    fn test_router() -> Router {
+        let workspace = Arc::new(PathBuf::from("/tmp/devaipod-test-workspace"));
+        let (tx, _) = broadcast::channel::<GitEvent>(1);
+        let state = AppState {
+            workspace,
+            git_events_tx: tx,
+            pty_sessions: PtySessionManager::new(),
+            workspace_container: String::new(),
+            agent_container: String::new(),
+            opencode_password: "test-password".to_string(),
+        };
+        build_router(state)
+    }
+
+    /// GET /summary always returns 200 with valid JSON containing all expected
+    /// fields, regardless of whether opencode is running. The exact activity
+    /// value depends on the environment (opencode may or may not be listening
+    /// on port 4096 in the test environment).
+    #[tokio::test]
+    async fn test_summary_returns_valid_response() {
+        let app = test_router();
+        let req = Request::builder()
+            .uri("/summary")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            200,
+            "/summary must always return 200 (never an error status)"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("should be valid JSON");
+
+        // activity must be a known value
+        let activity = json["activity"]
+            .as_str()
+            .expect("activity should be a string");
+        assert!(
+            ["Working", "Idle", "Stopped", "Unknown"].contains(&activity),
+            "activity should be one of Working/Idle/Stopped/Unknown, got: {activity}"
+        );
+
+        // All fields from PodSummaryResponse must be present.
+        assert!(json.get("status_line").is_some(), "missing status_line");
+        assert!(json.get("current_tool").is_some(), "missing current_tool");
+        assert!(
+            json.get("recent_output")
+                .and_then(|r| r.as_array())
+                .is_some(),
+            "recent_output should be an array"
+        );
+        assert!(
+            json.get("last_message_ts").is_some(),
+            "missing last_message_ts"
+        );
+        assert!(
+            json.get("session_count").and_then(|s| s.as_u64()).is_some(),
+            "session_count should be an integer"
+        );
+    }
 
     #[test]
     fn test_has_file_extension() {

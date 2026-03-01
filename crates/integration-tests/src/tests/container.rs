@@ -347,6 +347,69 @@ fn test_readonly_api_git_log(fixture: &SharedFixture) -> Result<()> {
 }
 readonly_test!(test_readonly_api_git_log);
 
+/// Verify the pod-api /summary endpoint returns valid JSON with expected fields.
+///
+/// The /summary endpoint is the canonical source of agent status; the control
+/// plane proxies it rather than deriving status from raw opencode messages.
+fn test_readonly_api_summary(fixture: &SharedFixture) -> Result<()> {
+    let sh = shell()?;
+    let agent = fixture.agent_container();
+
+    // Poll with retries since the pod-api sidecar may still be starting.
+    let output = poll_until(Duration::from_secs(30), Duration::from_secs(1), || {
+        let result = cmd!(
+            sh,
+            "podman exec {agent} curl -sf http://localhost:8090/summary"
+        )
+        .ignore_status()
+        .output()?;
+        if result.status.success() {
+            Ok(Some(
+                String::from_utf8_lossy(&result.stdout).trim().to_string(),
+            ))
+        } else {
+            Ok(None)
+        }
+    })
+    .context("pod-api /summary should respond within 30s")?;
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&output).context("pod-api /summary should return valid JSON")?;
+
+    // Verify all expected fields are present.
+    assert!(
+        parsed.get("activity").and_then(|a| a.as_str()).is_some(),
+        "/summary should have an 'activity' string field"
+    );
+    assert!(
+        parsed.get("session_count").is_some(),
+        "/summary should have a 'session_count' field"
+    );
+    assert!(
+        parsed
+            .get("recent_output")
+            .and_then(|r| r.as_array())
+            .is_some(),
+        "/summary should have a 'recent_output' array"
+    );
+    // status_line, current_tool, last_message_ts may be null — just check they're present.
+    assert!(
+        parsed.get("status_line").is_some(),
+        "/summary should have a 'status_line' field"
+    );
+    assert!(
+        parsed.get("current_tool").is_some(),
+        "/summary should have a 'current_tool' field"
+    );
+    assert!(
+        parsed.get("last_message_ts").is_some(),
+        "/summary should have a 'last_message_ts' field"
+    );
+
+    Ok(())
+}
+readonly_test!(test_readonly_api_summary);
+
 /// Verify the pod-api /git/events SSE endpoint returns an initial git.updated event
 fn test_readonly_api_git_events(fixture: &SharedFixture) -> Result<()> {
     let sh = shell()?;
