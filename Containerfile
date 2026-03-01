@@ -68,6 +68,12 @@ ARG OPENCODE_VERSION=v1.1.65
 FROM docker.io/oven/bun:latest AS opencode-web
 ARG OPENCODE_VERSION=v1.1.65
 
+# Disable apt sandboxing for nested container environments (e.g. building
+# inside a devcontainer with rootless podman). Without this, apt fails with
+# "setgroups 65534 failed" when the outer container lacks CAP_SETGID for
+# the _apt user. See bootc-dev/infra@491e950.
+RUN echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99sandbox-disable
+
 # Fonts are gitignored (~60MB binary); fetch from upstream for the build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ca-certificates && rm -rf /var/lib/apt/lists/*
