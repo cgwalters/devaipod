@@ -48,7 +48,9 @@ pub(crate) const INSTANCE_LABEL_KEY: &str = "io.devaipod.instance";
 
 /// Return the current instance identifier, if any.
 pub(crate) fn get_instance_id() -> Option<String> {
-    std::env::var(DEVAIPOD_INSTANCE_ENV).ok().filter(|s| !s.is_empty())
+    std::env::var(DEVAIPOD_INSTANCE_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Normalize a workspace name to a full pod name by adding the prefix

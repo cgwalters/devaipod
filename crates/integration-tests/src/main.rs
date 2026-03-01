@@ -376,7 +376,14 @@ fn cleanup_leaked_test_pods() {
         integration_tests::INTEGRATION_TEST_INSTANCE,
     );
     let output = Command::new("podman")
-        .args(["pod", "ps", "--filter", &label_filter, "--format", "{{.Name}}"])
+        .args([
+            "pod",
+            "ps",
+            "--filter",
+            &label_filter,
+            "--format",
+            "{{.Name}}",
+        ])
         .output();
 
     let output = match output {

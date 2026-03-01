@@ -139,7 +139,9 @@ use crate::{get_instance_id, INSTANCE_LABEL_KEY};
 /// Check whether a container's labels match the current instance filter.
 fn labels_match_instance(labels: Option<&HashMap<String, String>>) -> bool {
     let instance_id = get_instance_id();
-    let pod_instance = labels.and_then(|l| l.get(INSTANCE_LABEL_KEY)).map(|s| s.as_str());
+    let pod_instance = labels
+        .and_then(|l| l.get(INSTANCE_LABEL_KEY))
+        .map(|s| s.as_str());
 
     match (instance_id.as_deref(), pod_instance) {
         (Some(want), Some(have)) => want == have,
