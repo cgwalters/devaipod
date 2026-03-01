@@ -1520,8 +1520,11 @@ fn extract_workspace_name(output: &str) -> Option<String> {
     None
 }
 
-/// Response for agent status endpoint
-#[derive(Debug, Serialize)]
+/// Response for agent status endpoint.
+///
+/// This is now a thin wrapper: the actual status derivation lives in pod-api's
+/// `/summary` endpoint. The control plane just proxies it.
+#[derive(Debug, Serialize, Deserialize)]
 struct AgentStatusResponse {
     activity: String,
     status_line: Option<String>,
@@ -1531,27 +1534,15 @@ struct AgentStatusResponse {
     session_count: usize,
 }
 
-/// Maximum number of output lines to return for agent status
-const AGENT_STATUS_MAX_LINES: usize = 3;
-
-/// Get agent status for a pod
+/// Get agent status for a pod (thin proxy to pod-api `/summary`).
 ///
-/// Queries the pod's opencode server to determine the agent's current state.
-/// Returns a valid `AgentStatusResponse` even on errors (with activity set to
-/// "Stopped" or "Unknown") so the frontend always gets a usable response.
+/// Delegates to the pod-api sidecar's `/summary` endpoint, which is the
+/// source of truth for agent status. See `docs/todo/pod-api-driver.md`.
 async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
     let pod_name = normalize_pod_name(&name);
 
     let stopped = AgentStatusResponse {
         activity: "Stopped".to_string(),
-        status_line: None,
-        current_tool: None,
-        recent_output: vec![],
-        last_message_ts: None,
-        session_count: 0,
-    };
-    let unknown = AgentStatusResponse {
-        activity: "Unknown".to_string(),
         status_line: None,
         current_tool: None,
         recent_output: vec![],
@@ -1571,246 +1562,44 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return Json(unknown),
+        Err(_) => {
+            return Json(AgentStatusResponse {
+                activity: "Unknown".to_string(),
+                status_line: None,
+                current_tool: None,
+                recent_output: vec![],
+                last_message_ts: None,
+                session_count: 0,
+            })
+        }
     };
 
-    // Fetch sessions via the pod-api sidecar (handles opencode auth internally)
-    let sessions_resp = match client
-        .get(format!("http://{}:{}/session", host, port))
+    // Proxy to pod-api's /summary endpoint.
+    match client
+        .get(format!("http://{}:{}/summary", host, port))
         .send()
         .await
     {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Json(unknown),
-    };
-
-    let sessions: Vec<serde_json::Value> = match sessions_resp.json().await {
-        Ok(s) => s,
-        Err(_) => return Json(unknown),
-    };
-
-    let session_count = sessions.len();
-
-    if sessions.is_empty() {
-        return Json(AgentStatusResponse {
-            activity: "Idle".to_string(),
-            status_line: Some("Waiting for input...".to_string()),
+        Ok(resp) if resp.status().is_success() => match resp.json::<AgentStatusResponse>().await {
+            Ok(summary) => Json(summary),
+            Err(_) => Json(AgentStatusResponse {
+                activity: "Unknown".to_string(),
+                status_line: None,
+                current_tool: None,
+                recent_output: vec![],
+                last_message_ts: None,
+                session_count: 0,
+            }),
+        },
+        _ => Json(AgentStatusResponse {
+            activity: "Unknown".to_string(),
+            status_line: None,
             current_tool: None,
             recent_output: vec![],
             last_message_ts: None,
             session_count: 0,
-        });
+        }),
     }
-
-    // Find the root session (no parentID or null parentID)
-    let root_session = sessions.iter().find(|s| {
-        s.get("parentID").is_none() || s.get("parentID").map(|p| p.is_null()).unwrap_or(false)
-    });
-
-    let session_id = match root_session
-        .and_then(|s| s.get("id"))
-        .and_then(|id| id.as_str())
-    {
-        Some(id) => id.to_string(),
-        None => return Json(unknown),
-    };
-
-    // Fetch recent messages via pod-api sidecar
-    let messages_resp = match client
-        .get(format!(
-            "http://{}:{}/session/{}/message?limit=5",
-            host, port, session_id
-        ))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Json(unknown),
-    };
-
-    let messages: Vec<serde_json::Value> = match messages_resp.json().await {
-        Ok(m) => m,
-        Err(_) => return Json(unknown),
-    };
-
-    // Derive agent state from messages (same logic as tui.rs)
-    let (activity, status_line, current_tool, recent_output, last_message_ts) =
-        derive_agent_status_from_messages(&messages);
-
-    Json(AgentStatusResponse {
-        activity,
-        status_line,
-        current_tool,
-        recent_output,
-        last_message_ts,
-        session_count,
-    })
-}
-
-/// Derive agent status fields from opencode session messages.
-///
-/// This reimplements the core logic from `tui.rs::derive_agent_state_from_messages`
-/// directly, returning the fields needed for `AgentStatusResponse`.
-fn derive_agent_status_from_messages(
-    messages: &[serde_json::Value],
-) -> (
-    String,         // activity
-    Option<String>, // status_line
-    Option<String>, // current_tool
-    Vec<String>,    // recent_output
-    Option<i64>,    // last_message_ts
-) {
-    if messages.is_empty() {
-        return ("Unknown".to_string(), None, None, vec![], None);
-    }
-
-    // Find the last assistant message
-    let last_assistant = messages.iter().rev().find(|msg| {
-        msg.get("info")
-            .and_then(|i| i.get("role"))
-            .and_then(|r| r.as_str())
-            == Some("assistant")
-    });
-
-    let Some(last_assistant) = last_assistant else {
-        return ("Unknown".to_string(), None, None, vec![], None);
-    };
-
-    let info = match last_assistant.get("info") {
-        Some(i) => i,
-        None => return ("Unknown".to_string(), None, None, vec![], None),
-    };
-
-    let parts = last_assistant
-        .get("parts")
-        .and_then(|p| p.as_array())
-        .map(|arr| arr.as_slice())
-        .unwrap_or(&[]);
-
-    // Extract recent output from parts
-    let recent_output = {
-        let mut lines = Vec::new();
-        for part in parts {
-            let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match part_type {
-                "text" => {
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        for line in text.lines().rev().take(AGENT_STATUS_MAX_LINES) {
-                            let truncated = if line.chars().count() > 80 {
-                                let s: String = line.chars().take(77).collect();
-                                format!("{s}...")
-                            } else {
-                                line.to_string()
-                            };
-                            if !truncated.trim().is_empty() {
-                                lines.push(truncated);
-                            }
-                            if lines.len() >= AGENT_STATUS_MAX_LINES {
-                                break;
-                            }
-                        }
-                    }
-                }
-                "tool" => {
-                    if let Some(tool_name) = part.get("name").and_then(|n| n.as_str()) {
-                        let status = part
-                            .get("state")
-                            .and_then(|s| s.get("status"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("running");
-                        lines.push(format!("\u{2192} {tool_name}: {status}"));
-                    }
-                }
-                _ => {}
-            }
-            if lines.len() >= AGENT_STATUS_MAX_LINES {
-                break;
-            }
-        }
-        lines.reverse();
-        lines
-    };
-
-    // Extract current tool (first incomplete tool)
-    let current_tool = parts.iter().find_map(|part| {
-        if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
-            let status = part
-                .get("state")
-                .and_then(|s| s.get("status"))
-                .and_then(|s| s.as_str());
-            if status != Some("completed") && status != Some("error") {
-                return part.get("name").and_then(|n| n.as_str()).map(String::from);
-            }
-        }
-        None
-    });
-
-    // Build status line from first text part
-    let status_line = parts.iter().find_map(|part| {
-        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-            part.get("text").and_then(|t| t.as_str()).map(|text| {
-                let first_line = text.lines().next().unwrap_or("");
-                if first_line.chars().count() > 60 {
-                    let s: String = first_line.chars().take(57).collect();
-                    format!("{s}...")
-                } else {
-                    first_line.to_string()
-                }
-            })
-        } else {
-            None
-        }
-    });
-
-    // Determine activity
-    let activity = if info.get("time").and_then(|t| t.get("completed")).is_none() {
-        "Working"
-    } else {
-        let has_incomplete_tool = parts.iter().any(|part| {
-            if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
-                let status = part
-                    .get("state")
-                    .and_then(|s| s.get("status"))
-                    .and_then(|s| s.as_str());
-                status != Some("completed") && status != Some("error")
-            } else {
-                false
-            }
-        });
-
-        if has_incomplete_tool {
-            "Working"
-        } else {
-            let finish = info.get("finish").and_then(|f| f.as_str()).unwrap_or("");
-            if finish == "tool-calls" {
-                "Working"
-            } else {
-                "Idle"
-            }
-        }
-    };
-
-    // Extract the most recent message timestamp
-    let last_message_ts = messages
-        .iter()
-        .filter_map(|msg| {
-            msg.get("info").and_then(|info| {
-                info.get("time").and_then(|time| {
-                    time.get("completed")
-                        .or_else(|| time.get("created"))
-                        .and_then(|t| t.as_i64())
-                })
-            })
-        })
-        .max();
-
-    (
-        activity.to_string(),
-        status_line,
-        current_tool,
-        recent_output,
-        last_message_ts,
-    )
 }
 
 // Git endpoints (git_status, git_diff, git_commits, git_log, git_diff_range,

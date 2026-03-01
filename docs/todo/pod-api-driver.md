@@ -133,10 +133,13 @@ the `podman exec` dance.
 Keep `write_task()` for now but stop adding the task to `instructions` —
 only write the non-task parts of opencode.json.
 
-### Phase 2: `GET /status` endpoint on pod-api
+### Phase 2: `GET /summary` endpoint on pod-api — DONE
 
-Move `derive_agent_status_from_messages()` into pod-api. Control plane's
-`agent_status()` becomes a proxy call.
+Implemented as `GET /summary` (named "summary" rather than "status" to
+avoid confusion with HTTP status codes and to reflect that it returns a
+richer pod-level summary). `derive_agent_status_from_messages()` now
+lives in `pod_api.rs` and the control plane's `agent_status()` is a
+thin proxy to `/summary`.
 
 ### Phase 3: Remove dead code
 
