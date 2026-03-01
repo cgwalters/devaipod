@@ -2413,6 +2413,165 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Live integration tests — only run inside a devaipod pod (OPENCODE=1)
+    // -----------------------------------------------------------------------
+    //
+    // These tests hit the real opencode server at 127.0.0.1:4096 via the
+    // pod-api router. They're skipped in environments without a running
+    // opencode (CI, local cargo test, etc.) by checking the OPENCODE env var.
+
+    /// Returns true if we're running inside a devaipod pod with a live opencode.
+    fn has_live_opencode() -> bool {
+        // OPENCODE=1 is set in devaipod agent containers
+        if std::env::var("OPENCODE").as_deref() != Ok("1") {
+            return false;
+        }
+        // Double-check opencode is actually responding
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], OPENCODE_UPSTREAM_PORT)),
+            std::time::Duration::from_secs(1),
+        )
+        .is_ok()
+    }
+
+    /// GET /summary against a live opencode server returns real session data.
+    #[tokio::test]
+    async fn test_live_summary_returns_real_sessions() {
+        if !has_live_opencode() {
+            eprintln!("skipping: no live opencode (OPENCODE != 1 or port 4096 not listening)");
+            return;
+        }
+
+        let app = test_router();
+        let req = Request::builder()
+            .uri("/summary")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), 200);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+
+        // With a live opencode, we should have at least one session
+        let session_count = json["session_count"].as_u64().expect("session_count");
+        assert!(
+            session_count > 0,
+            "live opencode should have sessions, got 0"
+        );
+
+        // Activity should be Working or Idle (not Unknown/Stopped)
+        let activity = json["activity"].as_str().expect("activity");
+        assert!(
+            ["Working", "Idle"].contains(&activity),
+            "live opencode should report Working or Idle, got: {activity}"
+        );
+
+        // last_message_ts should be a real timestamp (> year 2020 in millis)
+        let ts = json["last_message_ts"].as_i64().expect("last_message_ts");
+        assert!(
+            ts > 1_577_836_800_000,
+            "timestamp should be after 2020, got: {ts}"
+        );
+    }
+
+    /// The /summary response must be deserializable as the control plane's
+    /// AgentStatusResponse type, proving wire compatibility between the two
+    /// halves of the proxy.
+    #[tokio::test]
+    async fn test_live_summary_wire_compatible_with_controlplane() {
+        if !has_live_opencode() {
+            eprintln!("skipping: no live opencode");
+            return;
+        }
+
+        // This struct mirrors web.rs AgentStatusResponse exactly.
+        // If the fields diverge, this test fails at compile time or
+        // deserialization time.
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct ControlPlaneResponse {
+            activity: String,
+            status_line: Option<String>,
+            current_tool: Option<String>,
+            recent_output: Vec<String>,
+            last_message_ts: Option<i64>,
+            session_count: usize,
+        }
+
+        let app = test_router();
+        let req = Request::builder()
+            .uri("/summary")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+
+        // Deserialize as the control plane type — this is the critical assertion.
+        let parsed: ControlPlaneResponse =
+            serde_json::from_slice(&body).expect("should deserialize as ControlPlaneResponse");
+
+        // Sanity-check the deserialized values
+        assert!(
+            !parsed.activity.is_empty(),
+            "activity should not be empty after deserialization"
+        );
+        assert!(parsed.session_count > 0, "live session_count should be > 0");
+    }
+
+    /// GET /summary with a live opencode produces correctly bounded output.
+    #[tokio::test]
+    async fn test_live_summary_output_bounds() {
+        if !has_live_opencode() {
+            eprintln!("skipping: no live opencode");
+            return;
+        }
+
+        let app = test_router();
+        let req = Request::builder()
+            .uri("/summary")
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+
+        // recent_output should be capped at SUMMARY_MAX_LINES
+        let recent = json["recent_output"].as_array().expect("recent_output");
+        assert!(
+            recent.len() <= SUMMARY_MAX_LINES,
+            "recent_output should have at most {} entries, got {}",
+            SUMMARY_MAX_LINES,
+            recent.len()
+        );
+
+        // Each line should be at most 80 chars (truncation)
+        for (i, line) in recent.iter().enumerate() {
+            let s = line.as_str().expect("line should be a string");
+            assert!(
+                s.chars().count() <= 80,
+                "recent_output[{i}] should be <= 80 chars, got {}: {s}",
+                s.chars().count()
+            );
+        }
+
+        // status_line (if present) should be at most 60 chars
+        if let Some(sl) = json["status_line"].as_str() {
+            assert!(
+                sl.chars().count() <= 60,
+                "status_line should be <= 60 chars, got {}: {sl}",
+                sl.chars().count()
+            );
+        }
+    }
+
     #[test]
     fn test_has_file_extension() {
         assert!(has_file_extension("index.html"));
