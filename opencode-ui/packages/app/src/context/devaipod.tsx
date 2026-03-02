@@ -48,6 +48,32 @@ export interface LaunchWorkspaceParams {
   devcontainer_json?: string
 }
 
+/** GitHub repo permission flags from the gator config */
+export interface GhRepoPermission {
+  read?: boolean
+  "create-draft"?: boolean
+  "pending-review"?: boolean
+  "push-new-branch"?: boolean
+  write?: boolean
+}
+
+/** GitHub scope section of gator config */
+export interface GhScope {
+  read?: boolean
+  repos?: Record<string, GhRepoPermission>
+}
+
+/** Full gator scope config (matches JwtScopeConfig on the backend) */
+export interface GatorScopeConfig {
+  gh?: GhScope
+}
+
+/** Response from GET /api/devaipod/pods/{name}/gator-scopes */
+export interface GatorScopesResponse {
+  enabled: boolean
+  scopes?: GatorScopeConfig
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -339,6 +365,25 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       fetchProposals()
     }
 
+    async function getGatorScopes(fullName: string): Promise<GatorScopesResponse> {
+      return apiFetch<GatorScopesResponse>(
+        `/api/devaipod/pods/${encodeURIComponent(fullName)}/gator-scopes`,
+      )
+    }
+
+    async function updateGatorScopes(
+      fullName: string,
+      scopes: GatorScopeConfig,
+    ): Promise<GatorScopesResponse> {
+      return apiFetch<GatorScopesResponse>(
+        `/api/devaipod/pods/${encodeURIComponent(fullName)}/gator-scopes`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ scopes }),
+        },
+      )
+    }
+
     // -- Derived state ------------------------------------------------------
 
     const hasAdvisor = createMemo(() => store.pods.some((p) => p.Name === "devaipod-advisor"))
@@ -383,6 +428,8 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       launchAdvisor,
       dismissLaunch,
       dismissProposal,
+      getGatorScopes,
+      updateGatorScopes,
     }
   },
 })

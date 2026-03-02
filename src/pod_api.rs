@@ -2047,6 +2047,151 @@ async fn fallback_handler(State(state): State<AppState>, request: Request) -> Re
 }
 
 // ---------------------------------------------------------------------------
+// GET/PUT /gator/scopes — service-gator scope management
+// ---------------------------------------------------------------------------
+
+/// Response for the gator scopes endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+struct GatorScopesResponse {
+    /// Whether service-gator is enabled for this pod.
+    enabled: bool,
+    /// Current scope configuration (absent if gator not enabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scopes: Option<crate::service_gator::JwtScopeConfig>,
+}
+
+/// Request body for PUT /gator/scopes.
+#[derive(Debug, Deserialize)]
+struct GatorScopesUpdateRequest {
+    scopes: crate::service_gator::JwtScopeConfig,
+}
+
+/// Resolve the gator config file path from the volume root.
+///
+/// The config is written to the **volume root** at `.devaipod/gator-config.json`
+/// by the init container (which mounts the volume at `/workspaces`). The pod-api
+/// container also mounts the volume at `/workspaces`, but `state.workspace` points
+/// to the project subdirectory (e.g. `/workspaces/myrepo`). We must use the volume
+/// root, not the workspace subdirectory.
+fn gator_config_path(volume_root: &std::path::Path) -> PathBuf {
+    volume_root.join(crate::service_gator::GATOR_CONFIG_PATH)
+}
+
+/// `GET /gator/scopes` — read current service-gator scopes.
+///
+/// Reads the config file directly from the workspace volume. Returns
+/// `enabled: false` if the file doesn't exist (gator not configured).
+async fn get_gator_scopes(State(state): State<AppState>) -> Json<GatorScopesResponse> {
+    let config_path = gator_config_path(&state.volume_root);
+
+    let content = match tokio::fs::read_to_string(&config_path).await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Json(GatorScopesResponse {
+                enabled: false,
+                scopes: None,
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to read gator config at {}: {}",
+                config_path.display(),
+                e
+            );
+            return Json(GatorScopesResponse {
+                enabled: false,
+                scopes: None,
+            });
+        }
+    };
+
+    match serde_json::from_str::<crate::service_gator::GatorConfigFile>(&content) {
+        Ok(config) => Json(GatorScopesResponse {
+            enabled: true,
+            scopes: Some(config.scopes),
+        }),
+        Err(e) => {
+            tracing::error!("Failed to parse gator config JSON: {}", e);
+            Json(GatorScopesResponse {
+                enabled: false,
+                scopes: None,
+            })
+        }
+    }
+}
+
+/// `PUT /gator/scopes` — update service-gator scopes.
+///
+/// Requires `Authorization: Bearer <admin_token>`. This token is known only
+/// to the control plane (passed via `--admin-token` at startup). The agent
+/// does not receive it, preventing self-escalation of scopes.
+///
+/// Writes the updated config file to the workspace volume. Gator watches
+/// this file via inotify and reloads automatically — no restart needed.
+async fn update_gator_scopes(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Json<GatorScopesResponse>, StatusCode> {
+    // Require admin token — the agent does not have this secret
+    if !state.admin_token.is_empty() {
+        let provided = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if provided != Some(&state.admin_token) {
+            tracing::warn!("Rejected gator scope update: invalid or missing admin token");
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    // Parse body manually since we consumed the request for header inspection
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: GatorScopesUpdateRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let config_path = gator_config_path(&state.volume_root);
+
+    let config = crate::service_gator::GatorConfigFile::new(req.scopes.clone());
+    let config_json = serde_json::to_string_pretty(&config).map_err(|e| {
+        tracing::error!("Failed to serialize gator config: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Ensure parent directory exists
+    if let Some(parent) = config_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            tracing::error!("Failed to create gator config dir: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    // Atomic write: write to a temp file in the same directory, then rename.
+    // This prevents gator's inotify watcher from seeing a partial file.
+    let temp_path = config_path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, &config_json)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to write gator config temp file: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    tokio::fs::rename(&temp_path, &config_path)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to rename gator config: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    tracing::info!("Updated gator scopes (auto-reload via inotify)");
+
+    Ok(Json(GatorScopesResponse {
+        enabled: true,
+        scopes: Some(req.scopes),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Server entrypoint
 // ---------------------------------------------------------------------------
 
@@ -2087,6 +2232,11 @@ fn build_router(state: AppState) -> Router {
         .route("/git/events", get(git_events_sse))
         .route("/git/fetch-agent", post(git_fetch_agent))
         .route("/git/push", post(git_push))
+        // Gator scope management
+        .route(
+            "/gator/scopes",
+            get(get_gator_scopes).put(update_gator_scopes),
+        )
         // PTY endpoints
         .route("/pty", get(pty_list).post(pty_create))
         .route(
@@ -2503,5 +2653,307 @@ mod tests {
         assert!(!is_event_stream_path("session"));
         assert!(!is_event_stream_path(""));
         assert!(!is_event_stream_path("config"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Gator scopes endpoint tests (in-process HTTP with temp workspace)
+    // -----------------------------------------------------------------------
+
+    use axum::body::to_bytes;
+    use axum::http::Request as HttpRequest;
+    use tower::util::ServiceExt;
+
+    const TEST_ADMIN_TOKEN: &str = "test-admin-token-secret";
+
+    /// Build a test router backed by a real temp directory.
+    fn test_app(workspace: &std::path::Path) -> Router {
+        let (tx, _rx) = broadcast::channel(16);
+        let state = AppState {
+            workspace: Arc::new(workspace.to_path_buf()),
+            git_events_tx: tx,
+            pty_sessions: PtySessionManager::new(),
+            workspace_container: String::new(),
+            agent_container: String::new(),
+            opencode_password: String::new(),
+            opencode_port: DEFAULT_OPENCODE_PORT,
+            admin_token: TEST_ADMIN_TOKEN.to_string(),
+            // In tests, volume_root == workspace (the temp dir)
+            volume_root: Arc::new(workspace.to_path_buf()),
+        };
+        build_router(state)
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_get_not_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .uri("/gator/scopes")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert!(json.get("scopes").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_get_with_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join(".devaipod");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let config = serde_json::json!({
+            "scopes": {
+                "gh": {
+                    "read": true,
+                    "repos": {
+                        "myorg/myrepo": { "read": true, "create-draft": true }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            config_dir.join("gator-config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .uri("/gator/scopes")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert!(json["scopes"]["gh"]["read"].as_bool().unwrap());
+        assert!(
+            json["scopes"]["gh"]["repos"]["myorg/myrepo"]["create-draft"]
+                .as_bool()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_put_requires_admin_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "scopes": { "gh": { "read": true } }
+        }))
+        .unwrap();
+
+        // No Authorization header → 403
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/gator/scopes")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "PUT without admin token must be rejected"
+        );
+
+        // Wrong Bearer token → 403
+        let app = test_app(tmp.path());
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/gator/scopes")
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer wrong-token")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "PUT with wrong admin token must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_put_creates_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "scopes": {
+                "gh": {
+                    "read": true,
+                    "repos": {
+                        "myorg/myrepo": {
+                            "read": true,
+                            "create-draft": true,
+                            "push-new-branch": true
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/gator/scopes")
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {}", TEST_ADMIN_TOKEN))
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert!(
+            json["scopes"]["gh"]["repos"]["myorg/myrepo"]["create-draft"]
+                .as_bool()
+                .unwrap()
+        );
+
+        // Verify the file was actually written
+        let config_path = tmp.path().join(".devaipod/gator-config.json");
+        assert!(config_path.exists(), "config file must be created on disk");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(written["scopes"]["gh"]["read"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_get_malformed_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join(".devaipod");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("gator-config.json"), "not valid json {{{").unwrap();
+
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .uri("/gator/scopes")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["enabled"], false,
+            "Malformed config should report enabled:false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_put_rejects_invalid_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/gator/scopes")
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {}", TEST_ADMIN_TOKEN))
+            .body(Body::from("not valid json"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "Invalid JSON must produce 4xx, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_put_rejects_wrong_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "wrong_field": "value"
+        }))
+        .unwrap();
+
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/gator/scopes")
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {}", TEST_ADMIN_TOKEN))
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "Missing 'scopes' field must produce 4xx, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gator_scopes_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // PUT scopes
+        let app = test_app(tmp.path());
+        let body = serde_json::to_string(&serde_json::json!({
+            "scopes": {
+                "gh": {
+                    "repos": {
+                        "owner/repo": { "read": true, "pending-review": true }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/gator/scopes")
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {}", TEST_ADMIN_TOKEN))
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET scopes back (fresh router, same temp dir)
+        let app = test_app(tmp.path());
+        let req = HttpRequest::builder()
+            .uri("/gator/scopes")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert!(
+            json["scopes"]["gh"]["repos"]["owner/repo"]["pending-review"]
+                .as_bool()
+                .unwrap()
+        );
     }
 }

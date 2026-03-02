@@ -49,6 +49,8 @@ import { useTheme, type ColorScheme } from "@opencode-ai/ui/theme"
 import { DialogSelectProvider } from "@/components/dialog-select-provider"
 import { DialogSelectServer } from "@/components/dialog-select-server"
 import { DialogSettings } from "@/components/dialog-settings"
+import { DialogGator } from "@/components/dialog-gator"
+import { devaipodPodName } from "@/utils/persist"
 import { useCommand, type CommandOption } from "@/context/command"
 import { ConstrainDragXAxis } from "@/utils/solid-dnd"
 import { navStart } from "@/utils/perf"
@@ -946,6 +948,13 @@ export default function Layout(props: ParentProps) {
         onSelect: () => openSettings(),
       },
       {
+        id: "gator.open",
+        title: "Service Gator",
+        category: language.t("command.category.settings"),
+        disabled: !devaipodPodName(),
+        onSelect: () => openGator(),
+      },
+      {
         id: "session.previous",
         title: language.t("command.session.previous"),
         category: language.t("command.category.session"),
@@ -1091,6 +1100,10 @@ export default function Layout(props: ParentProps) {
 
   function openSettings() {
     dialog.show(() => <DialogSettings />)
+  }
+
+  function openGator() {
+    dialog.show(() => <DialogGator />)
   }
 
   function navigateToProject(directory: string | undefined) {

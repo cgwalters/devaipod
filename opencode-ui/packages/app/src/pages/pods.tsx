@@ -212,7 +212,7 @@ function LaunchForm(props: { onClose: () => void }) {
   const [imageOverride, setImageOverride] = createSignal("")
   const [scopes, setScopes] = createSignal<string[]>([])
   const [gatorImage, setGatorImage] = createSignal("")
-  const [readOnly, setReadOnly] = createSignal(false)
+  const [readOnly, setReadOnly] = createSignal(true)
   const [devcontainerJson, setDevcontainerJson] = createSignal("")
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
@@ -348,7 +348,7 @@ function LaunchForm(props: { onClose: () => void }) {
                 checked={readOnly()}
                 onChange={setReadOnly}
               >
-                Read-only mode (suppress default write scopes)
+                Read-only mode (default; uncheck to enable write scopes)
               </Checkbox>
 
               <TextField

@@ -16,7 +16,7 @@ type PersistTarget = {
 
 const LEGACY_STORAGE = "default.dat"
 
-function devaipodPodName(): string | undefined {
+export function devaipodPodName(): string | undefined {
   if (typeof document === "undefined") return undefined
   const m = document.cookie.match(/(?:^|;\s*)DEVAIPOD_AGENT_POD=([^;]*)/)
   if (!m) return undefined

@@ -1681,6 +1681,64 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
 // The pod-api sidecar now handles all git operations directly, and the frontend
 // routes git requests through the pod-api proxy.
 
+// =============================================================================
+// Service-gator scope management (proxy to pod-api)
+// =============================================================================
+
+/// Proxy GET /gator-scopes to the pod-api sidecar's `/gator/scopes`.
+///
+/// Read-only — no admin auth required.
+async fn get_gator_scopes(
+    Path(name): Path<String>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    proxy_to_pod_api(&name, "gator/scopes".to_string(), request).await
+}
+
+/// Proxy PUT /gator-scopes to the pod-api sidecar's `/gator/scopes`.
+///
+/// Retrieves the pod-api admin token via `podman exec` and injects it as
+/// `Authorization: Bearer`. Pod-api requires this for write operations,
+/// preventing the agent from self-escalating its scopes.
+async fn update_gator_scopes(
+    Path(name): Path<String>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    let pod_name = normalize_pod_name(&name);
+
+    // Retrieve the admin token from the pod-api container's state file
+    let admin_token = get_pod_api_admin_token(&pod_name).await?;
+
+    // Resolve pod-api port
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        if code == StatusCode::NOT_FOUND {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            code
+        }
+    })?;
+    let host = host_for_pod_services();
+
+    // Rebuild the request with the admin token as Authorization: Bearer.
+    // Replace the user's web-token Authorization with the pod-api admin token.
+    let (parts, body) = request.into_parts();
+    let mut builder = hyper::Request::builder()
+        .method(parts.method.clone())
+        .uri("/gator/scopes")
+        .header(header::HOST, format!("{}:{}", host, port))
+        .header(header::AUTHORIZATION, format!("Bearer {}", admin_token));
+    for (key, value) in parts.headers.iter() {
+        if key != header::HOST && key != header::AUTHORIZATION {
+            builder = builder.header(key, value);
+        }
+    }
+    let proxy_req = builder
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    proxy_to_upstream(&host, port, "gator/scopes".to_string(), proxy_req).await
+}
+
 /// Retrieve the pod-api admin token by execing into the pod-api container.
 ///
 /// The pod-api generates its own token at startup and persists it to a state
@@ -1785,6 +1843,10 @@ pub(crate) fn build_app(
         .route("/devaipod/proposals", get(list_proposals_api))
         .route("/devaipod/proposals/{id}/dismiss", post(dismiss_proposal))
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
+        .route(
+            "/devaipod/pods/{name}/gator-scopes",
+            get(get_gator_scopes).put(update_gator_scopes),
+        )
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(
@@ -2313,6 +2375,128 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "MCP token must NOT grant access to regular API endpoints"
+        );
+    }
+
+    // =========================================================================
+    // Gator-scopes endpoint tests (auth/routing layer)
+    // =========================================================================
+
+    /// GET /api/devaipod/pods/{name}/gator-scopes must require authentication.
+    #[tokio::test]
+    async fn test_gator_scopes_get_requires_auth() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/pods/test-pod/gator-scopes")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET gator-scopes must return 401 without auth"
+        );
+    }
+
+    /// PUT /api/devaipod/pods/{name}/gator-scopes must require authentication.
+    #[tokio::test]
+    async fn test_gator_scopes_put_requires_auth() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "scopes": { "gh": { "read": true } }
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/devaipod/pods/test-pod/gator-scopes")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "PUT gator-scopes must return 401 without auth"
+        );
+    }
+
+    /// GET gator-scopes with valid auth should not return 401.
+    #[tokio::test]
+    async fn test_gator_scopes_get_with_auth() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/pods/test-pod/gator-scopes")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET gator-scopes must not return 401 with valid auth"
+        );
+    }
+
+    /// PUT gator-scopes with valid auth should not return 401.
+    #[tokio::test]
+    async fn test_gator_scopes_put_with_auth_and_valid_body() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "scopes": {
+                "gh": {
+                    "read": true,
+                    "repos": {
+                        "myorg/myrepo": {
+                            "read": true,
+                            "create-draft": true,
+                            "push-new-branch": true
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/devaipod/pods/test-pod/gator-scopes")
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "PUT gator-scopes must not return 401 with valid auth"
+        );
+    }
+
+    /// MCP token must not grant access to gator-scopes endpoints.
+    #[tokio::test]
+    async fn test_gator_scopes_rejects_mcp_token() {
+        let app = build_app("test-token".into(), "test-mcp-token".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/pods/test-pod/gator-scopes")
+            .header("Authorization", "Bearer test-mcp-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "MCP token must not grant access to gator-scopes"
         );
     }
 }
