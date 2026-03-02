@@ -1645,6 +1645,8 @@ fn test_mcp_endpoint_requires_auth() -> Result<()> {
     let mcp_body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
     let url = "http://127.0.0.1:8080/api/devaipod/mcp";
     let content_type = "Content-Type: application/json";
+    // Use a variable so xshell doesn't try to interpolate {http_code}
+    let write_format = r"\n%{http_code}";
 
     // Helper: extract HTTP status code from curl -w '\n%{http_code}' output
     let extract_status = |output: &str| -> i32 {
@@ -1659,7 +1661,7 @@ fn test_mcp_endpoint_requires_auth() -> Result<()> {
     // 1. POST without auth -> 401
     let output = cmd!(
         sh,
-        "podman exec {container} curl -s -w \n%{http_code} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -d {mcp_body} {url}"
+        "podman exec {container} curl -s -w {write_format} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -d {mcp_body} {url}"
     )
     .ignore_status()
     .read()?;
@@ -1673,7 +1675,7 @@ fn test_mcp_endpoint_requires_auth() -> Result<()> {
     let auth_header = format!("Authorization: Bearer {}", fixture.token());
     let output = cmd!(
         sh,
-        "podman exec {container} curl -s -w \n%{http_code} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -H {auth_header} -d {mcp_body} {url}"
+        "podman exec {container} curl -s -w {write_format} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -H {auth_header} -d {mcp_body} {url}"
     )
     .ignore_status()
     .read()?;
@@ -1687,7 +1689,7 @@ fn test_mcp_endpoint_requires_auth() -> Result<()> {
     let wrong_auth = "Authorization: Bearer totally-wrong-token-12345";
     let output = cmd!(
         sh,
-        "podman exec {container} curl -s -w \n%{http_code} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -H {wrong_auth} -d {mcp_body} {url}"
+        "podman exec {container} curl -s -w {write_format} --connect-timeout 5 --max-time 10 -X POST -H {content_type} -H {wrong_auth} -d {mcp_body} {url}"
     )
     .ignore_status()
     .read()?;
