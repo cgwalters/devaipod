@@ -42,6 +42,10 @@ const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
 /// Default port for the opencode server inside the pod.
 const DEFAULT_OPENCODE_PORT: u16 = 4096;
 
+/// Path where pod-api persists its admin token.
+/// The control plane retrieves this via `podman exec <container> cat <path>`.
+pub(crate) const ADMIN_TOKEN_PATH: &str = "/var/lib/devaipod/pod-api-token";
+
 /// Server state shared across all handlers.
 #[derive(Clone)]
 struct AppState {
@@ -59,6 +63,13 @@ struct AppState {
     opencode_password: String,
     /// Port of the opencode server to connect to (default 4096).
     opencode_port: u16,
+    /// Admin token for authenticating control plane requests (e.g. gator scope updates).
+    /// Only the control plane knows this token; the agent does not.
+    admin_token: String,
+    /// Root of the workspace volume (always `/workspaces` in production).
+    /// The gator config is stored at `{volume_root}/.devaipod/gator-config.json`.
+    /// Separate from `workspace` which points to the project subdirectory.
+    volume_root: Arc<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2088,10 +2099,58 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Generate or load the admin token and persist it to disk.
+///
+/// The token is a 128-bit random hex string. On first startup it is generated
+/// and written to `ADMIN_TOKEN_PATH`. On subsequent starts (container restart)
+/// the existing token is reused so the control plane doesn't need to re-fetch.
+///
+/// The control plane retrieves the token via:
+///   `podman exec <pod-api-container> cat /var/lib/devaipod/pod-api-token`
+///
+/// The agent container cannot exec into pod-api, so it cannot read this token.
+fn load_or_generate_admin_token() -> Result<String> {
+    use std::io::Read;
+
+    let path = std::path::Path::new(ADMIN_TOKEN_PATH);
+
+    // Try to read existing token
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let mut token = String::new();
+        file.read_to_string(&mut token)?;
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            tracing::debug!("Loaded admin token from {}", ADMIN_TOKEN_PATH);
+            return Ok(token);
+        }
+    }
+
+    // Generate new token
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let bytes: [u8; 16] = rng.random();
+    let token: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Persist it
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, &token)?;
+    tracing::info!("Generated admin token at {}", ADMIN_TOKEN_PATH);
+
+    Ok(token)
+}
+
 /// Run the pod-api HTTP server.
 pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
     let workspace = Arc::new(args.workspace.clone());
     let git_events_tx = GitWatcher::spawn(Arc::clone(&workspace));
+    let admin_token = load_or_generate_admin_token().context("Failed to initialize admin token")?;
+
+    // The workspace volume is always mounted at /workspaces in the pod-api container.
+    // state.workspace points to the project subdirectory (e.g. /workspaces/myrepo),
+    // but the gator config lives at the volume root.
+    let volume_root = Arc::new(PathBuf::from("/workspaces"));
 
     let state = AppState {
         workspace,
@@ -2101,6 +2160,8 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         agent_container: args.agent_container.unwrap_or_default(),
         opencode_password: args.opencode_password,
         opencode_port: args.opencode_port,
+        admin_token,
+        volume_root,
     };
 
     let app = build_router(state);

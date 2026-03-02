@@ -27,6 +27,23 @@ function devaipodPodName(): string | undefined {
   }
 }
 
+let _adminToken: string | undefined
+export function devaipodAdminToken(): string | undefined {
+  if (_adminToken !== undefined) return _adminToken || undefined
+  if (typeof window === "undefined") return undefined
+  const params = new URLSearchParams(window.location.search)
+  const token = params.get("podapi_admin_token") ?? ""
+  _adminToken = token
+  // Strip from URL to avoid leaking in browser history
+  if (token) {
+    params.delete("podapi_admin_token")
+    const clean = params.toString()
+    const newUrl = window.location.pathname + (clean ? `?${clean}` : "") + window.location.hash
+    window.history.replaceState(null, "", newUrl)
+  }
+  return token || undefined
+}
+
 const GLOBAL_STORAGE = devaipodPodName() ? `opencode.global.${devaipodPodName()}.dat` : "opencode.global.dat"
 const LOCAL_PREFIX = "opencode."
 const fallback = new Map<string, boolean>()

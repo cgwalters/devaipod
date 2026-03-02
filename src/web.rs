@@ -911,17 +911,28 @@ async fn agent_ui_root(
         (code, msg)
     })?;
 
+    // Fetch admin token to inject into iframe URL so the UI can authenticate
+    // scope-update requests without exposing a /gator/token endpoint to the
+    // agent process.
+    let admin_token = get_pod_api_admin_token(&pod_name).await.map_err(|code| {
+        let msg = format!("Could not retrieve admin token for {pod_name}");
+        tracing::warn!("{msg}");
+        (code, msg)
+    })?;
+
     // The iframe URL is rendered in the user's browser on the host, so we must
     // use localhost — not host.containers.internal (which is only resolvable
     // inside containers).  Published ports are bound to 0.0.0.0 on the host.
     let host = "localhost";
 
     // Build the base URL, optionally including the session deep-link path.
+    // The admin token is passed as a query parameter so the UI can use it
+    // without ever fetching it from pod-api.
     let base_url = match (query.dir.as_deref(), query.session.as_deref()) {
         (Some(dir), Some(session)) => {
-            format!("http://{host}:{port}/{dir}/session/{session}")
+            format!("http://{host}:{port}/{dir}/session/{session}?podapi_admin_token={admin_token}")
         }
-        _ => format!("http://{host}:{port}/"),
+        _ => format!("http://{host}:{port}/?podapi_admin_token={admin_token}"),
     };
 
     Ok(Response::builder()
@@ -1669,6 +1680,45 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
 // git_fetch_agent, git_push) and exec_in_container have been removed.
 // The pod-api sidecar now handles all git operations directly, and the frontend
 // routes git requests through the pod-api proxy.
+
+/// Retrieve the pod-api admin token by execing into the pod-api container.
+///
+/// The pod-api generates its own token at startup and persists it to a state
+/// file. The control plane reads it via `podman exec`, which establishes the
+/// trust model: ability to exec into the container implies admin access.
+async fn get_pod_api_admin_token(pod_name: &str) -> Result<String, StatusCode> {
+    let api_container = format!("{pod_name}-api");
+
+    let output = tokio::process::Command::new("podman")
+        .args([
+            "exec",
+            &api_container,
+            "cat",
+            crate::pod_api::ADMIN_TOKEN_PATH,
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to exec into {api_container}: {e}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    if !output.status.success() {
+        tracing::error!(
+            "Failed to read admin token from {api_container}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        tracing::error!("Empty admin token from {api_container}");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    Ok(token)
+}
 
 /// Run the web server
 ///
