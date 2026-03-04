@@ -1446,6 +1446,8 @@ struct PodSummaryResponse {
     last_message_ts: Option<i64>,
     /// Total number of opencode sessions in this pod.
     session_count: usize,
+    /// Pod completion status: "active" or "done".
+    completion_status: CompletionStatus,
 }
 
 /// Maximum number of output lines to return in the summary.
@@ -1465,6 +1467,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
         recent_output: vec![],
         last_message_ts: None,
         session_count: 0,
+        completion_status: CompletionStatus::default(),
     };
 
     let client = match reqwest::Client::builder()
@@ -1498,6 +1501,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let session_count = sessions.len();
 
     if sessions.is_empty() {
+        let completion_status = read_completion_status(&state.workspace).await;
         return Json(PodSummaryResponse {
             activity: "Idle".to_string(),
             status_line: Some("Waiting for input...".to_string()),
@@ -1505,6 +1509,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
             recent_output: vec![],
             last_message_ts: None,
             session_count: 0,
+            completion_status,
         });
     }
 
@@ -1543,6 +1548,8 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let (activity, status_line, current_tool, recent_output, last_message_ts) =
         derive_agent_status_from_messages(&messages);
 
+    let completion_status = read_completion_status(&state.workspace).await;
+
     Json(PodSummaryResponse {
         activity,
         status_line,
@@ -1550,6 +1557,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
         recent_output,
         last_message_ts,
         session_count,
+        completion_status,
     })
 }
 
@@ -2062,9 +2070,58 @@ struct GatorScopesUpdateRequest {
     scopes: crate::service_gator::JwtScopeConfig,
 }
 
+/// Completion status for the pod (active vs done).
+///
+/// Persisted to `.devaipod/completion-status.json` in the workspace volume.
+/// The control plane reads this via GET /completion-status and writes via
+/// PUT /completion-status (requires admin token).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum CompletionStatus {
+    /// Pod is actively being worked on (default)
+    #[default]
+    Active,
+    /// Work is done; pod can be cleaned up
+    Done,
+}
+
+/// On-disk format for the completion status file.
+#[derive(Debug, Serialize, Deserialize)]
+struct CompletionStatusFile {
+    status: CompletionStatus,
+}
+
+/// Response for GET /completion-status.
+#[derive(Debug, Serialize)]
+struct CompletionStatusResponse {
+    status: CompletionStatus,
+}
+
+/// Request body for PUT /completion-status.
+#[derive(Debug, Deserialize)]
+struct CompletionStatusUpdateRequest {
+    status: CompletionStatus,
+}
+
 /// Resolve the gator config file path from the workspace root.
 fn gator_config_path(workspace: &std::path::Path) -> PathBuf {
     workspace.join(crate::service_gator::GATOR_CONFIG_PATH)
+}
+
+/// Resolve the completion status file path from the workspace root.
+fn completion_status_path(workspace: &std::path::Path) -> PathBuf {
+    workspace.join(".devaipod/completion-status.json")
+}
+
+/// Read the current completion status from disk.
+async fn read_completion_status(workspace: &std::path::Path) -> CompletionStatus {
+    let path = completion_status_path(workspace);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => serde_json::from_str::<CompletionStatusFile>(&content)
+            .map(|f| f.status)
+            .unwrap_or_default(),
+        Err(_) => CompletionStatus::default(),
+    }
 }
 
 /// `GET /gator/scopes` — read current service-gator scopes.
@@ -2182,6 +2239,75 @@ async fn update_gator_scopes(
 }
 
 // ---------------------------------------------------------------------------
+// Completion status endpoints
+// ---------------------------------------------------------------------------
+
+/// `GET /completion-status` — read current pod completion status.
+async fn get_completion_status(State(state): State<AppState>) -> Json<CompletionStatusResponse> {
+    let status = read_completion_status(&state.workspace).await;
+    Json(CompletionStatusResponse { status })
+}
+
+/// `PUT /completion-status` — update pod completion status.
+///
+/// Requires `Authorization: Bearer <admin_token>` (same as gator scope updates).
+async fn update_completion_status(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Json<CompletionStatusResponse>, StatusCode> {
+    // Require admin token
+    if !state.admin_token.is_empty() {
+        let provided = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if provided != Some(&state.admin_token) {
+            tracing::warn!("Rejected completion status update: invalid or missing admin token");
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let req: CompletionStatusUpdateRequest =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    let file = CompletionStatusFile {
+        status: req.status.clone(),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| {
+        tracing::error!("Failed to serialize completion status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let path = completion_status_path(&state.workspace);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            tracing::error!("Failed to create completion status dir: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    let temp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, &json).await.map_err(|e| {
+        tracing::error!("Failed to write completion status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tokio::fs::rename(&temp_path, &path).await.map_err(|e| {
+        tracing::error!("Failed to rename completion status file: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tracing::info!("Updated completion status to {:?}", file.status);
+
+    Ok(Json(CompletionStatusResponse {
+        status: file.status,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Server entrypoint
 // ---------------------------------------------------------------------------
 
@@ -2226,6 +2352,11 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/gator/scopes",
             get(get_gator_scopes).put(update_gator_scopes),
+        )
+        // Completion status
+        .route(
+            "/completion-status",
+            get(get_completion_status).put(update_completion_status),
         )
         // PTY endpoints
         .route("/pty", get(pty_list).post(pty_create))

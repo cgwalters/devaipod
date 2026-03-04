@@ -836,6 +836,8 @@ fn agent_iframe_wrapper(name: &str, base_url: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;");
     let escaped_url = base_url.replace('&', "&amp;").replace('"', "&quot;");
+    // URL-encode the name for API calls (the raw name, not the HTML-escaped one)
+    let url_name = urlencoding::encode(name);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -844,18 +846,77 @@ fn agent_iframe_wrapper(name: &str, base_url: &str) -> String {
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 html,body{{height:100%;overflow:hidden;background:#1c1717}}
-#dbar{{height:44px;display:flex;align-items:center;padding:0 12px;
+#dbar{{height:44px;display:flex;align-items:center;padding:0 12px;gap:8px;
   background:#1c1717;border-bottom:1px solid rgba(255,255,255,0.12)}}
-#dbar a{{color:#e8e2e2;text-decoration:none;font-size:14px;font-weight:500;
+#dbar a,#dbar button{{color:#e8e2e2;text-decoration:none;font-size:14px;font-weight:500;
   font-family:Inter,system-ui,sans-serif;
-  padding:6px 14px;border-radius:6px;
+  padding:6px 14px;border-radius:6px;cursor:pointer;
   background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);
   transition:background 0.15s,border-color 0.15s}}
-#dbar a:hover{{background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.25)}}
+#dbar a:hover,#dbar button:hover{{background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.25)}}
+#dbar button.done{{background:rgba(34,197,94,0.15);border-color:rgba(34,197,94,0.4);color:#86efac}}
+#dbar button.done:hover{{background:rgba(34,197,94,0.25);border-color:rgba(34,197,94,0.6)}}
+#dbar .spacer{{flex:1}}
 iframe{{width:100%;height:calc(100% - 44px);border:none}}
 </style></head><body>
-<div id="dbar"><a href="/pods">&#8592; Pods</a></div>
+<div id="dbar">
+  <a href="/pods">&#8592; Pods</a>
+  <button id="done-btn" onclick="toggleDone()" title="Mark this pod as done">Loading...</button>
+  <span class="spacer"></span>
+</div>
 <iframe id="oc" src="{escaped_url}" allow="clipboard-read; clipboard-write"></iframe>
+<script>
+let isDone = false;
+const podName = "{url_name}";
+const btn = document.getElementById("done-btn");
+
+async function fetchStatus() {{
+  try {{
+    const r = await fetch("/api/devaipod/pods/" + podName + "/completion-status", {{credentials:"include"}});
+    if (r.ok) {{
+      const d = await r.json();
+      isDone = d.status === "done";
+      updateBtn();
+    }}
+  }} catch(e) {{ btn.textContent = "Status unavailable"; }}
+}}
+
+function updateBtn() {{
+  if (isDone) {{
+    btn.textContent = "Marked Done";
+    btn.classList.add("done");
+    btn.title = "Click to mark as incomplete";
+  }} else {{
+    btn.textContent = "Mark as Done";
+    btn.classList.remove("done");
+    btn.title = "Click to mark this pod as done";
+  }}
+}}
+
+async function toggleDone() {{
+  const newStatus = isDone ? "active" : "done";
+  btn.textContent = "Updating...";
+  try {{
+    const r = await fetch("/api/devaipod/pods/" + podName + "/completion-status", {{
+      method: "PUT",
+      credentials: "include",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{status: newStatus}})
+    }});
+    if (r.ok) {{
+      const d = await r.json();
+      isDone = d.status === "done";
+    }} else {{
+      isDone = !isDone; // revert
+    }}
+  }} catch(e) {{
+    // revert on error
+  }}
+  updateBtn();
+}}
+
+fetchStatus();
+</script>
 </body></html>"#
     )
 }
@@ -1613,6 +1674,9 @@ struct AgentStatusResponse {
     recent_output: Vec<String>,
     last_message_ts: Option<i64>,
     session_count: usize,
+    /// Pod completion status: "active" or "done".
+    #[serde(default)]
+    completion_status: Option<String>,
 }
 
 impl AgentStatusResponse {
@@ -1625,6 +1689,7 @@ impl AgentStatusResponse {
             recent_output: vec![],
             last_message_ts: None,
             session_count: 0,
+            completion_status: None,
         }
     }
 }
@@ -1767,6 +1832,187 @@ async fn get_pod_api_admin_token(pod_name: &str) -> Result<String, StatusCode> {
     Ok(token)
 }
 
+/// Public wrapper for get_pod_api_port (used by CLI commands).
+pub async fn get_pod_api_port_pub(pod_name: &str) -> Result<u16, StatusCode> {
+    get_pod_api_port(pod_name).await
+}
+
+/// Public wrapper for get_pod_api_admin_token (used by CLI commands).
+pub async fn get_pod_api_admin_token_pub(pod_name: &str) -> Result<String, StatusCode> {
+    get_pod_api_admin_token(pod_name).await
+}
+
+/// Proxy GET /completion-status to the pod-api sidecar.
+async fn get_pod_completion_status(
+    Path(name): Path<String>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    proxy_to_pod_api(&name, "completion-status".to_string(), request).await
+}
+
+/// Proxy PUT /completion-status to the pod-api sidecar (with admin token injection).
+async fn update_pod_completion_status(
+    Path(name): Path<String>,
+    request: Request,
+) -> Result<Response, StatusCode> {
+    let pod_name = normalize_pod_name(&name);
+    let admin_token = get_pod_api_admin_token(&pod_name).await?;
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        if code == StatusCode::NOT_FOUND {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            code
+        }
+    })?;
+    let host = host_for_pod_services();
+
+    let (parts, body) = request.into_parts();
+    let mut builder = hyper::Request::builder()
+        .method(parts.method.clone())
+        .uri("/completion-status")
+        .header(header::HOST, format!("{}:{}", host, port))
+        .header(header::AUTHORIZATION, format!("Bearer {}", admin_token));
+    for (key, value) in parts.headers.iter() {
+        if key != header::HOST && key != header::AUTHORIZATION {
+            builder = builder.header(key, value);
+        }
+    }
+    let proxy_req = builder
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    proxy_to_upstream(&host, port, "completion-status".to_string(), proxy_req).await
+}
+
+/// Response for the prune endpoint.
+#[derive(Debug, Serialize)]
+struct PruneResponse {
+    /// Number of pods deleted.
+    deleted: usize,
+    /// Names of pods that were deleted.
+    pod_names: Vec<String>,
+    /// Any errors encountered (pod name -> error message).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
+}
+
+/// Delete all pods marked as "done".
+///
+/// Iterates over all devaipod pods, checks their completion status via the
+/// pod-api sidecar, and deletes those marked as "done".
+async fn prune_done_pods() -> Result<Json<PruneResponse>, StatusCode> {
+    use bollard::Docker;
+
+    let socket_path = get_container_socket().map_err(|e| {
+        tracing::error!("No container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    let docker = Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to connect to container socket: {}", e);
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    // List all devaipod pods
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("name", vec!["devaipod-*-agent"]);
+    let options = bollard::container::ListContainersOptions {
+        all: true,
+        filters,
+        ..Default::default()
+    };
+    let containers = docker.list_containers(Some(options)).await.map_err(|e| {
+        tracing::error!("Failed to list containers: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Collect unique pod names
+    let mut pod_names: Vec<String> = Vec::new();
+    for container in &containers {
+        if let Some(names) = &container.names {
+            for name in names {
+                let name = name.trim_start_matches('/');
+                if let Some(pod_name) = name.strip_suffix("-agent") {
+                    if pod_name.starts_with("devaipod-")
+                        && !pod_names.contains(&pod_name.to_string())
+                    {
+                        pod_names.push(pod_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let host = host_for_pod_services();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    for pod_name in &pod_names {
+        // Check completion status via pod-api sidecar
+        let port = match get_pod_api_port(pod_name).await {
+            Ok(p) => p,
+            Err(_) => continue, // Skip pods without pod-api
+        };
+
+        let resp = match client
+            .get(format!("http://{}:{}/completion-status", host, port))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+
+        #[derive(Deserialize)]
+        struct StatusResp {
+            status: String,
+        }
+        let status: StatusResp = match resp.json().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if status.status != "done" {
+            continue;
+        }
+
+        // Delete the pod
+        tracing::info!("Pruning done pod: {}", pod_name);
+        let output = tokio::process::Command::new("podman")
+            .args(["pod", "rm", "-f", pod_name])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                deleted.push(pod_name.clone());
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                errors.push(format!("{}: {}", pod_name, stderr.trim()));
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", pod_name, e));
+            }
+        }
+    }
+
+    Ok(Json(PruneResponse {
+        deleted: deleted.len(),
+        pod_names: deleted,
+        errors,
+    }))
+}
+
 /// Run the web server
 ///
 /// Starts an HTTP server on the specified port with:
@@ -1836,6 +2082,11 @@ pub(crate) fn build_app(
             "/devaipod/pods/{name}/gator-scopes",
             get(get_gator_scopes).put(update_gator_scopes),
         )
+        .route(
+            "/devaipod/pods/{name}/completion-status",
+            get(get_pod_completion_status).put(update_pod_completion_status),
+        )
+        .route("/devaipod/prune", post(prune_done_pods))
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(

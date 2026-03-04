@@ -608,6 +608,30 @@ enum HostCommand {
         #[arg(short, long)]
         force: bool,
     },
+    /// Mark a workspace as done
+    ///
+    /// Labels a workspace as completed. Done workspaces can be cleaned up
+    /// in bulk with 'devaipod prune'.
+    ///
+    /// Examples:
+    ///   devaipod done myworkspace
+    ///   devaipod done myworkspace --undo    # Mark as incomplete again
+    Done {
+        /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
+        workspace: String,
+        /// Mark as incomplete (undo a previous done)
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Remove all workspaces marked as done
+    ///
+    /// Deletes all pods that have been marked as "done" with 'devaipod done'.
+    /// This is a bulk cleanup operation.
+    ///
+    /// Examples:
+    ///   devaipod prune
+    Prune,
     /// Rebuild a workspace with a new image
     ///
     /// Recreates the containers with a new or updated image while preserving
@@ -1231,6 +1255,10 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Delete { workspace, force } => {
             cmd_delete(&normalize_pod_name(&workspace), force)
         }
+        HostCommand::Done { workspace, undo } => {
+            cmd_done(&normalize_pod_name(&workspace), undo).await
+        }
+        HostCommand::Prune => cmd_prune().await,
         HostCommand::Rebuild {
             workspace,
             image,
@@ -2642,6 +2670,162 @@ async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) ->
         if let Some(ref img) = opts.service_gator_image {
             tracing::info!("  gator image: {}", img);
         }
+    }
+
+    Ok(())
+}
+
+/// Mark a workspace as done (or undo)
+async fn cmd_done(pod_name: &str, undo: bool) -> Result<()> {
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    // Verify pod exists
+    let _labels = podman
+        .get_pod_labels(pod_name)
+        .await
+        .with_context(|| format!("Pod not found: {}", pod_name))?;
+
+    // Get pod-api port and admin token
+    let port = crate::web::get_pod_api_port_pub(pod_name)
+        .await
+        .map_err(|_| color_eyre::eyre::eyre!("Could not find pod-api port. Is the pod running?"))?;
+    let admin_token = crate::web::get_pod_api_admin_token_pub(pod_name)
+        .await
+        .map_err(|_| {
+            color_eyre::eyre::eyre!("Could not get admin token. Is the pod-api container running?")
+        })?;
+
+    let host = crate::podman::host_for_pod_services();
+    let status = if undo { "active" } else { "done" };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let resp = client
+        .put(format!("http://{}:{}/completion-status", host, port))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .body(format!(r#"{{"status":"{}"}}"#, status))
+        .send()
+        .await
+        .context("Failed to update completion status")?;
+
+    if !resp.status().is_success() {
+        bail!("Failed to update completion status: HTTP {}", resp.status());
+    }
+
+    let short = strip_pod_prefix(pod_name);
+    if undo {
+        tracing::info!("Marked '{}' as incomplete", short);
+    } else {
+        tracing::info!("Marked '{}' as done", short);
+    }
+
+    Ok(())
+}
+
+/// Remove all workspaces marked as done
+async fn cmd_prune() -> Result<()> {
+    // We need to iterate all devaipod pods, check their completion status, and delete "done" ones
+    let _podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    // List all devaipod pods
+    let name_filter = format!("name={}*", POD_NAME_PREFIX);
+    let output = podman_command()
+        .args(["pod", "ps", "--filter", &name_filter, "--format=json"])
+        .output()
+        .context("Failed to list pods")?;
+
+    if !output.status.success() {
+        bail!("Failed to list pods");
+    }
+
+    let pods: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse pod list")?;
+
+    if pods.is_empty() {
+        tracing::info!("No devaipod pods found");
+        return Ok(());
+    }
+
+    let host = crate::podman::host_for_pod_services();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let mut deleted = 0;
+
+    for pod in &pods {
+        let pod_name = match pod.get("Name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if !pod_name.starts_with(POD_NAME_PREFIX) {
+            continue;
+        }
+
+        // Check completion status via pod-api sidecar
+        let port = match crate::web::get_pod_api_port_pub(pod_name).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let resp = match client
+            .get(format!("http://{}:{}/completion-status", host, port))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+
+        #[derive(serde::Deserialize)]
+        struct StatusResp {
+            status: String,
+        }
+        let status: StatusResp = match resp.json().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if status.status != "done" {
+            continue;
+        }
+
+        let short = strip_pod_prefix(pod_name);
+        tracing::info!("Pruning done pod: {}", short);
+
+        // Force-delete the pod
+        let del_output = podman_command()
+            .args(["pod", "rm", "-f", pod_name])
+            .output();
+
+        match del_output {
+            Ok(o) if o.status.success() => {
+                deleted += 1;
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::warn!("Failed to delete {}: {}", short, stderr.trim());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to delete {}: {}", short, e);
+            }
+        }
+    }
+
+    if deleted == 0 {
+        tracing::info!("No done pods to prune");
+    } else {
+        tracing::info!("Pruned {} done pod(s)", deleted);
     }
 
     Ok(())
