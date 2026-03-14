@@ -56,6 +56,30 @@ test-kube: build
     DEVAIPOD_HOST_MODE=1 \
         cargo test -p integration-tests -- test_kube
 
+# Run Kubernetes e2e test: deploy devaipod controlplane in k8s and verify health.
+# Requires: minikube with the devaipod image pre-loaded.
+# Load the image with: just kube-load-image
+test-kube-e2e: build
+    DEVAIPOD_PATH="{{justfile_directory()}}/target/debug/devaipod" \
+    DEVAIPOD_HOST_MODE=1 \
+        cargo test -p integration-tests -- test_kube_controlplane
+
+# Load the devaipod container image into minikube.
+# Uses the published image from podman's local store; build first
+# with `just container-build` if you want to test local changes.
+kube-load-image image="ghcr.io/cgwalters/devaipod:latest":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    MINIKUBE=$(command -v minikube || echo /tmp/minikube)
+    echo "Saving {{image}} from podman..."
+    podman save --format docker-archive -o /tmp/devaipod-kube.tar {{image}}
+    echo "Loading into minikube..."
+    $MINIKUBE image load /tmp/devaipod-kube.tar
+    rm /tmp/devaipod-kube.tar
+    echo "Verifying..."
+    $MINIKUBE image ls | grep devaipod
+    echo "Image loaded into minikube."
+
 # Run all tests (unit tests + containerized integration tests)
 test-all: test-container test-integration
 
