@@ -164,52 +164,6 @@ fn parse_podman_secret_json(output: &[u8], secret_name: &str) -> Result<String> 
 mod tests {
     use super::*;
 
-    /// Integration test: connect to a real cluster using ~/.kube/config.
-    ///
-    /// Run with: cargo test kube::tests::test_connect_to_cluster -- --ignored
-    /// Requires a running cluster (e.g. minikube).
-    #[tokio::test]
-    #[ignore]
-    async fn test_connect_to_cluster() {
-        let config = KubernetesConfig {
-            enabled: Some(true),
-            namespace: Some("devaipod".to_string()),
-            ..Default::default()
-        };
-        let client = connect(&config)
-            .await
-            .expect("failed to connect to cluster");
-        assert!(!client.server_version.is_empty());
-        assert_eq!(client.namespace, "devaipod");
-        eprintln!(
-            "connected to cluster, server version: {}",
-            client.server_version
-        );
-    }
-
-    /// Integration test: connect via podman secret named "kubeconfig".
-    ///
-    /// Run with: cargo test kube::tests::test_connect_from_podman_secret -- --ignored
-    /// Requires: `podman secret create kubeconfig ~/.kube/config`
-    #[tokio::test]
-    #[ignore]
-    async fn test_connect_from_podman_secret() {
-        let config = KubernetesConfig {
-            enabled: Some(true),
-            namespace: Some("devaipod".to_string()),
-            kubeconfig_secret: Some("kubeconfig".to_string()),
-            ..Default::default()
-        };
-        let client = connect(&config)
-            .await
-            .expect("failed to connect via podman secret");
-        assert!(!client.server_version.is_empty());
-        eprintln!(
-            "connected via podman secret, server version: {}",
-            client.server_version
-        );
-    }
-
     #[test]
     fn test_kubernetes_config_defaults() {
         let config = KubernetesConfig::default();

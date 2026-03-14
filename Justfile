@@ -48,6 +48,14 @@ test-integration-local: build
     DEVAIPOD_HOST_MODE=1 \
         cargo test -p integration-tests
 
+# Run Kubernetes integration tests against a running cluster.
+# Requires: kubectl access to a cluster (minikube, kind, or remote).
+# Runs only the kube-prefixed tests from the integration test suite.
+test-kube: build
+    DEVAIPOD_PATH="{{justfile_directory()}}/target/debug/devaipod" \
+    DEVAIPOD_HOST_MODE=1 \
+        cargo test -p integration-tests -- test_kube
+
 # Run all tests (unit tests + containerized integration tests)
 test-all: test-container test-integration
 
