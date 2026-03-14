@@ -54,7 +54,24 @@ export function GitReviewTab(props: GitReviewTabProps) {
   const [state, setState] = createStore({
     baseCommit: undefined as string | undefined,
     gitUnavailable: false,
+    fetchInFlight: false,
+    fetchStatus: undefined as string | undefined,
+    branch: undefined as string | undefined,
   })
+
+  // Fetch current branch name from /git/status
+  const [_status, { refetch: refetchStatus }] = createResource(
+    () => true,
+    async () => {
+      try {
+        const data = await apiFetch<{ branch?: string }>("/git/status")
+        setState("branch", data.branch ?? undefined)
+        return data
+      } catch {
+        return undefined
+      }
+    },
+  )
 
   // The SPA runs on the pod-api sidecar which serves git endpoints at /git/*.
   const [log, { refetch: refetchLog }] = createResource(
@@ -102,6 +119,7 @@ export function GitReviewTab(props: GitReviewTabProps) {
           const currentHead = log()?.[0]?.sha
           if (payload.head && payload.head !== currentHead) {
             refetchLog()
+            refetchStatus()
           }
         } catch (err) {
           console.warn("Failed to parse git.updated event:", err)
@@ -113,6 +131,28 @@ export function GitReviewTab(props: GitReviewTabProps) {
       }
       onCleanup(() => es!.close())
     })
+  }
+
+  async function handleFetchAgent() {
+    if (state.fetchInFlight) return
+    setState("fetchInFlight", true)
+    setState("fetchStatus", undefined)
+    try {
+      const data = await apiFetch<{ success: boolean; message: string }>("/git/fetch-agent", {
+        method: "POST",
+      })
+      setState("fetchStatus", data.success ? "Fetched" : `Error: ${data.message}`)
+      if (data.success) {
+        refetchLog()
+        refetchStatus()
+      }
+    } catch (err) {
+      setState("fetchStatus", `Error: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setState("fetchInFlight", false)
+      // Clear status message after a few seconds
+      setTimeout(() => setState("fetchStatus", undefined), 4000)
+    }
   }
 
   const diffParams = () => {
@@ -160,6 +200,11 @@ export function GitReviewTab(props: GitReviewTabProps) {
   const title = (): JSX.Element => (
     <div class="flex items-center gap-3">
       <span>Changes</span>
+      <Show when={state.branch}>
+        <span class="text-text-weak text-13-regular" data-action="branch-name">
+          ({state.branch})
+        </span>
+      </Show>
       <Show when={commitOptions().length > 1}>
         <span class="text-text-weak text-13-regular">from</span>
         <Select
@@ -172,44 +217,57 @@ export function GitReviewTab(props: GitReviewTabProps) {
           size="small"
         />
       </Show>
+      <button
+        data-action="fetch-agent"
+        class="text-13-regular px-2 py-0.5 rounded border border-border hover:bg-fill-element-hover disabled:opacity-50"
+        disabled={state.fetchInFlight}
+        onClick={handleFetchAgent}
+      >
+        {state.fetchInFlight ? "Fetching..." : "Fetch"}
+      </button>
+      <Show when={state.fetchStatus}>
+        <span class="text-text-weak text-13-regular">{state.fetchStatus}</span>
+      </Show>
     </div>
   )
 
   const loading = () => log.loading || diffData.loading
 
   return (
-    <Show
-      when={!state.gitUnavailable}
-      fallback={
-        <div class="flex h-full items-center justify-center text-text-weak text-14-regular">
-          Git review is not available for this workspace.
-        </div>
-      }
-    >
+    <div data-component="git-review-tab">
       <Show
-        when={!loading() || diffs().length > 0}
+        when={!state.gitUnavailable}
         fallback={
-          <div class="flex h-full items-center justify-center text-text-weak text-14-regular">Loading...</div>
+          <div class="flex h-full items-center justify-center text-text-weak text-14-regular">
+            Git review is not available for this workspace.
+          </div>
         }
       >
-        <SessionReview
-          title={title()}
-          scrollRef={(el) => props.onScrollRef?.(el)}
-          classes={{
-            root: props.classes?.root ?? "pb-6",
-            header: props.classes?.header ?? "px-6",
-            container: props.classes?.container ?? "px-6",
-          }}
-          diffs={diffs()}
-          diffStyle={props.diffStyle}
-          onDiffStyleChange={props.onDiffStyleChange}
-          focusedFile={props.focusedFile}
-          onLineComment={props.onLineComment}
-          comments={props.comments}
-          focusedComment={props.focusedComment}
-          onFocusedCommentChange={props.onFocusedCommentChange}
-        />
+        <Show
+          when={!loading() || diffs().length > 0}
+          fallback={
+            <div class="flex h-full items-center justify-center text-text-weak text-14-regular">Loading...</div>
+          }
+        >
+          <SessionReview
+            title={title()}
+            scrollRef={(el) => props.onScrollRef?.(el)}
+            classes={{
+              root: props.classes?.root ?? "pb-6",
+              header: props.classes?.header ?? "px-6",
+              container: props.classes?.container ?? "px-6",
+            }}
+            diffs={diffs()}
+            diffStyle={props.diffStyle}
+            onDiffStyleChange={props.onDiffStyleChange}
+            focusedFile={props.focusedFile}
+            onLineComment={props.onLineComment}
+            comments={props.comments}
+            focusedComment={props.focusedComment}
+            onFocusedCommentChange={props.onFocusedCommentChange}
+          />
+        </Show>
       </Show>
-    </Show>
+    </div>
   )
 }
