@@ -1785,3 +1785,81 @@ fn test_mcp_endpoint_requires_auth() -> Result<()> {
     Ok(())
 }
 container_integration_test!(test_mcp_endpoint_requires_auth);
+
+/// Verify the agent iframe wrapper contains pod switcher UI elements.
+///
+/// Fetches `/_devaipod/agent/{name}/` for a running pod and checks that the
+/// HTML includes the pod switcher dropdown, navigation arrows, and the JS
+/// functions that fetch and render the pod list. If no running pod exists
+/// (404), the test is skipped gracefully.
+///
+/// Tier 2: Parallel safe, uses shared pod for validation
+fn test_web_agent_iframe_has_pod_switcher() -> Result<()> {
+    let fixture = WebFixture::get()?;
+    let token = fixture.token().to_string();
+    let cookie = format!("devaipod_token={}", token);
+
+    let short_name = match super::controlplane::find_running_pod(fixture, &token)? {
+        Some(n) => n,
+        None => {
+            tracing::info!("No running pods found, skipping pod switcher test");
+            return Ok(());
+        }
+    };
+
+    let path = format!("/_devaipod/agent/{}/", short_name);
+    let (status, body) = fixture.curl_in_container_with_cookie(&path, &cookie)?;
+
+    if status == 404 {
+        tracing::info!(
+            "Agent iframe returned 404 for '{}' (pod may not have a healthy sidecar), skipping",
+            short_name
+        );
+        return Ok(());
+    }
+
+    assert_eq!(
+        status,
+        200,
+        "GET {} should return 200 or 404, got {}: {}",
+        path,
+        status,
+        &body[..body.len().min(400)]
+    );
+
+    // Verify all pod switcher HTML elements are present.
+    for (id, description) in [
+        (r#"id="pod-switcher""#, "pod switcher container"),
+        (r#"id="pod-trigger""#, "pod trigger button"),
+        (r#"id="prev-pod""#, "previous pod arrow"),
+        (r#"id="next-pod""#, "next pod arrow"),
+        (r#"id="pod-dropdown""#, "pod dropdown menu"),
+    ] {
+        assert!(
+            body.contains(id),
+            "Agent iframe should contain {description} ({id}); body length={}",
+            body.len()
+        );
+    }
+
+    // Verify JS functions and the fetch URL are present.
+    for (marker, description) in [
+        ("fetchPodList", "fetchPodList function"),
+        ("navigateToPod", "navigateToPod function"),
+        ("renderDropdown", "renderDropdown function"),
+        ("/api/devaipod/pods", "pod list API URL"),
+    ] {
+        assert!(
+            body.contains(marker),
+            "Agent iframe should contain {description} ('{marker}'); body length={}",
+            body.len()
+        );
+    }
+
+    tracing::info!(
+        "Pod switcher elements verified in agent iframe for '{}'",
+        short_name
+    );
+    Ok(())
+}
+container_integration_test!(test_web_agent_iframe_has_pod_switcher);

@@ -11,6 +11,9 @@
 !patches/
 !docs/
 !opencode-ui/
+!e2e-devaipod/
+e2e-devaipod/node_modules/
+e2e-devaipod/playwright-report/
 # Re-exclude large generated/fetched dirs within opencode-ui
 opencode-ui/node_modules/
 opencode-ui/packages/app/dist/

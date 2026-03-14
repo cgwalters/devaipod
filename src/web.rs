@@ -429,6 +429,9 @@ struct ApiErrorBody {
 /// Path to vendored opencode web UI
 const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
 
+/// Agent wrapper JS, embedded at compile time.
+const AGENT_WRAPPER_JS: &str = include_str!("static/agent-wrapper.js");
+
 /// Path to mdbook documentation output
 const DOCS_PATH: &str = "/usr/share/devaipod/docs";
 
@@ -897,6 +900,10 @@ async fn static_or_spa_fallback(request: Request) -> Response {
 /// published port (e.g. `http://localhost:54321/` or
 /// `http://localhost:54321/{base64dir}/session/{id}`). The iframe loads the SPA
 /// directly from the sidecar, which also proxies opencode API calls.
+///
+/// Pod-specific data is passed to the JS via a `<script id="pod-data" type="application/json">`
+/// element, and the logic lives in `src/static/agent-wrapper.js` (served at
+/// `/_devaipod/static/agent-wrapper.js`).
 fn agent_iframe_wrapper(name: &str, base_url: &str) -> String {
     let escaped_name = name
         .replace('&', "&amp;")
@@ -906,6 +913,15 @@ fn agent_iframe_wrapper(name: &str, base_url: &str) -> String {
     let escaped_url = base_url.replace('&', "&amp;").replace('"', "&quot;");
     // URL-encode the name for API calls (the raw name, not the HTML-escaped one)
     let url_name = urlencoding::encode(name);
+    // Pod-specific data as JSON for the external JS to read.
+    // Escape `</` to `<\/` to prevent a `</script>` sequence inside the
+    // JSON from prematurely closing the script tag.
+    let pod_data_json = serde_json::json!({
+        "urlName": &*url_name,
+        "fullName": normalize_pod_name(name)
+    })
+    .to_string()
+    .replace("</", r"<\/");
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -926,82 +942,50 @@ html,body{{height:100%;overflow:hidden;background:#1c1717}}
 #dbar button.done:hover{{background:rgba(34,197,94,0.25);border-color:rgba(34,197,94,0.6)}}
 #dbar .spacer{{flex:1}}
 iframe{{width:100%;height:calc(100% - 44px);border:none}}
+
+/* Pod switcher */
+.pod-switcher{{display:flex;align-items:center;gap:2px;position:relative}}
+.pod-switcher .nav-arrow{{padding:6px 8px;font-size:16px;min-width:30px;text-align:center;
+  font-family:Inter,system-ui,sans-serif}}
+.pod-switcher .nav-arrow:disabled{{opacity:0.3;cursor:default;pointer-events:none}}
+.pod-trigger{{position:relative;min-width:140px;text-align:left;padding-right:28px !important}}
+.pod-trigger::after{{content:"\25BE";position:absolute;right:10px;top:50%;transform:translateY(-50%);
+  font-size:11px;opacity:0.6}}
+.pod-dropdown{{display:none;position:absolute;top:100%;right:0;margin-top:4px;
+  min-width:280px;max-height:360px;overflow-y:auto;
+  background:#2a2323;border:1px solid rgba(255,255,255,0.15);border-radius:8px;
+  box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:100;padding:4px}}
+.pod-dropdown.open{{display:block}}
+.pod-item{{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:6px;
+  cursor:pointer;font-size:13px;font-family:Inter,system-ui,sans-serif;
+  color:#e8e2e2;border:none;background:none;width:100%;text-align:left;
+  transition:background 0.12s}}
+.pod-item:hover{{background:rgba(255,255,255,0.08)}}
+.pod-item.current{{background:rgba(255,255,255,0.06);font-weight:600}}
+.pod-item .dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0}}
+.pod-item .dot.running{{background:#22c55e}}
+.pod-item .dot.working{{background:#22c55e;animation:pulse-dot 1.5s ease-in-out infinite}}
+.pod-item .dot.idle{{background:#3b82f6}}
+.pod-item .dot.stopped{{background:#888}}
+.pod-item .dot.done{{background:#a78bfa}}
+.pod-item .pod-name{{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.pod-item .pod-status{{font-size:11px;opacity:0.55;white-space:nowrap}}
+@keyframes pulse-dot{{0%,100%{{opacity:1}}50%{{opacity:0.4}}}}
 </style></head><body>
 <div id="dbar">
   <a href="/pods">&#8592; Pods</a>
-  <span id="pod-title" style="font-size:14px;font-weight:500;font-family:Inter,system-ui,sans-serif;color:#e8e2e2;opacity:0.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%">{escaped_name}</span>
-  <button id="done-btn" onclick="toggleDone()" title="Mark this pod as done">Loading...</button>
+  <button id="done-btn" title="Mark this pod as done">Loading...</button>
   <span class="spacer"></span>
+  <div class="pod-switcher" id="pod-switcher">
+    <button class="nav-arrow" id="prev-pod" title="Previous pod" disabled>&#8592;</button>
+    <button class="pod-trigger" id="pod-trigger" title="Switch pod">{escaped_name}</button>
+    <button class="nav-arrow" id="next-pod" title="Next pod" disabled>&#8594;</button>
+    <div class="pod-dropdown" id="pod-dropdown"></div>
+  </div>
 </div>
 <iframe id="oc" src="{escaped_url}" allow="clipboard-read; clipboard-write"></iframe>
-<script>
-let isDone = false;
-const podName = "{url_name}";
-const btn = document.getElementById("done-btn");
-
-async function fetchStatus() {{
-  try {{
-    const r = await fetch("/api/devaipod/pods/" + podName + "/completion-status", {{credentials:"include"}});
-    if (r.ok) {{
-      const d = await r.json();
-      isDone = d.status === "done";
-      updateBtn();
-    }}
-  }} catch(e) {{ btn.textContent = "Status unavailable"; }}
-}}
-
-function updateBtn() {{
-  if (isDone) {{
-    btn.textContent = "Marked Done";
-    btn.classList.add("done");
-    btn.title = "Click to mark as incomplete";
-  }} else {{
-    btn.textContent = "Mark as Done";
-    btn.classList.remove("done");
-    btn.title = "Click to mark this pod as done";
-  }}
-}}
-
-async function toggleDone() {{
-  const newStatus = isDone ? "active" : "done";
-  const wasDone = isDone;
-  btn.textContent = "Updating...";
-  try {{
-    const r = await fetch("/api/devaipod/pods/" + podName + "/completion-status", {{
-      method: "PUT",
-      credentials: "include",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{status: newStatus}})
-    }});
-    if (r.ok) {{
-      const d = await r.json();
-      isDone = d.status === "done";
-    }} else {{
-      isDone = wasDone; // revert to previous state on error
-    }}
-  }} catch(e) {{
-    isDone = wasDone; // revert on network error
-  }}
-  updateBtn();
-}}
-
-fetchStatus();
-
-const titleEl = document.getElementById("pod-title");
-async function fetchTitle() {{
-  try {{
-    const r = await fetch("/api/devaipod/pods/" + podName + "/agent-status", {{credentials:"include"}});
-    if (r.ok) {{
-      const d = await r.json();
-      if (d.title) {{
-        titleEl.textContent = d.title;
-        document.title = d.title + " - devaipod";
-      }}
-    }}
-  }} catch(e) {{}}
-}}
-fetchTitle();
-</script>
+<script id="pod-data" type="application/json">{pod_data_json}</script>
+<script src="/_devaipod/static/agent-wrapper.js"></script>
 </body></html>"#
     )
 }
@@ -1098,6 +1082,19 @@ async fn serve_opencode_index() -> Result<Response, StatusCode> {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(content))
         .unwrap())
+}
+
+/// Serve the agent wrapper JS (embedded at compile time).
+async fn serve_agent_wrapper_js() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(Body::from(AGENT_WRAPPER_JS))
+        .unwrap()
 }
 
 /// Redirect `/docs` to `/docs/` for consistency.
@@ -2708,6 +2705,10 @@ fn build_app_with_cache(
         .route("/pods", get(serve_spa_page))
         .route("/_devaipod/agent/{name}", get(agent_wrapper))
         .route("/_devaipod/agent/{name}/", get(agent_ui_root))
+        .route(
+            "/_devaipod/static/agent-wrapper.js",
+            get(serve_agent_wrapper_js),
+        )
         // Serve mdbook documentation at /docs/
         .route("/docs", get(redirect_to_docs))
         .route("/docs/", get(serve_docs_index))
@@ -2877,6 +2878,30 @@ mod tests {
         assert!(html.contains("Pods"), "wrapper must have back-to-pods link");
         assert!(html.contains("/pods"), "back link must point to /pods");
 
+        // Must include pod-data JSON element and external JS reference
+        assert!(
+            html.contains(r#"<script id="pod-data" type="application/json">"#),
+            "wrapper must include pod-data JSON element"
+        );
+        assert!(
+            html.contains(r#""urlName":"test-pod""#),
+            "pod-data must contain urlName"
+        );
+        assert!(
+            html.contains(r#""fullName":"devaipod-test-pod""#),
+            "pod-data must contain fullName with devaipod- prefix"
+        );
+        assert!(
+            html.contains(r#"src="/_devaipod/static/agent-wrapper.js""#),
+            "wrapper must reference external agent-wrapper.js"
+        );
+
+        // Must NOT contain inline JS logic (the old toggleDone, fetchPodList, etc.)
+        assert!(
+            !html.contains("function fetchPodList"),
+            "wrapper must not contain inline JS logic"
+        );
+
         // With session deep-link
         let html = agent_iframe_wrapper("test-pod", "http://localhost:12345/abc123/session/s1");
         assert!(
@@ -2884,15 +2909,85 @@ mod tests {
             "wrapper must include session deep-link in iframe src"
         );
 
-        // HTML-escaping
+        // HTML-escaping: the title and button text must use HTML entities
         let html = agent_iframe_wrapper("<script>alert(1)</script>", "http://localhost:1/");
         assert!(
-            !html.contains("<script>alert"),
-            "pod name must be HTML-escaped"
+            html.contains("&lt;script&gt;"),
+            "angle brackets in pod name must be HTML-escaped in visible elements"
+        );
+        // The JSON data block must not contain a literal "</script>" which would
+        // prematurely close the script tag. We escape it to "<\/script>".
+        assert!(
+            !html.contains(r#"</script><script>"#),
+            "JSON data must not contain literal </script> that closes the tag early"
+        );
+    }
+
+    #[test]
+    fn test_agent_wrapper_json_valid() {
+        // Verify the embedded pod-data JSON is actually parseable.
+        // This catches brace-escaping bugs (e.g. doubled {{ from format!()).
+        for name in ["test-pod", "my-project-abc123", "devaipod-already-prefixed"] {
+            let html = agent_iframe_wrapper(name, "http://localhost:1234/");
+            let json_start = html
+                .find(r#"<script id="pod-data" type="application/json">"#)
+                .expect("must have pod-data script tag");
+            let json_start = json_start + r#"<script id="pod-data" type="application/json">"#.len();
+            let json_end = html[json_start..]
+                .find("</script>")
+                .expect("must have closing script tag");
+            let json_str = &html[json_start..json_start + json_end];
+            let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or_else(|e| {
+                panic!("pod-data JSON must be valid for name={name:?}: {e}\n  got: {json_str:?}")
+            });
+            assert!(parsed.get("urlName").is_some(), "must have urlName");
+            assert!(parsed.get("fullName").is_some(), "must have fullName");
+            let full = parsed["fullName"].as_str().unwrap();
+            assert!(
+                full.starts_with("devaipod-"),
+                "fullName must have devaipod- prefix, got {full:?}"
+            );
+            assert!(
+                !full.starts_with("devaipod-devaipod-"),
+                "fullName must not have double prefix, got {full:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_wrapper_js_syntax() {
+        // Basic static check: the embedded JS file should be valid enough
+        // that it doesn't have obvious syntax issues (unmatched braces,
+        // template interpolation artifacts like {{ or }}).
+        let js = AGENT_WRAPPER_JS;
+        assert!(!js.is_empty(), "agent-wrapper.js must not be empty");
+        assert!(
+            !js.contains("{{"),
+            "JS must not contain {{ (format!() artifact)"
         );
         assert!(
-            html.contains("&lt;script&gt;"),
-            "angle brackets must be escaped"
+            !js.contains("}}"),
+            "JS must not contain }} (format!() artifact)"
+        );
+        // Verify key functions exist
+        for func in [
+            "fetchPodList",
+            "navigateToPod",
+            "renderDropdown",
+            "updateArrows",
+            "fetchTitle",
+            "fetchStatus",
+            "toggleDone",
+        ] {
+            assert!(
+                js.contains(func),
+                "agent-wrapper.js must contain function {func}"
+            );
+        }
+        // Verify it reads from pod-data
+        assert!(
+            js.contains("pod-data"),
+            "JS must reference the pod-data element"
         );
     }
 

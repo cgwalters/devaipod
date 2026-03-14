@@ -58,146 +58,204 @@ review mechanics.
 
 ## Prerequisites
 
-### Container image with Playwright browsers
+### Container image: `integration-web-runner`
 
-The integration test runner image (`Containerfile` target
-`integration-runner`) currently has podman, git, openssh, and tmux.
-For web UI tests it would also need Chromium and the Playwright
-runtime. Two options:
+A new Containerfile stage based on the official Playwright image,
+with the devaipod binary and a small TypeScript test harness copied
+in. This keeps the existing `integration-runner` lean (no Chromium)
+while getting a known-good browser environment from Microsoft.
 
-**Option A: Extend the integration-runner image.** Add Chromium and
-Playwright dependencies to the existing runner image. This keeps
-everything in one container but increases image size.
+```dockerfile
+# New Containerfile stage
+FROM mcr.microsoft.com/playwright:v1.57.0-noble AS integration-web-runner
 
-**Option B: Separate Playwright runner.** Build a second test image
-based on `mcr.microsoft.com/playwright:v1.57.0-noble` (or similar)
-that also has the devaipod test binary. This keeps the base integration
-runner lean and uses a known-good Playwright+Chromium combination.
+# podman-remote for pod lifecycle (same pattern as integration-runner)
+RUN apt-get update && apt-get install -y podman-remote \
+    && ln -sf /usr/bin/podman-remote /usr/bin/podman \
+    && apt-get clean
 
-Option B is probably better -- Playwright's official images handle the
-browser dependency matrix and are tested by Microsoft. The devaipod
-test binary can be copied in as a multi-stage build step.
+# The devaipod binary (for pod creation/teardown)
+COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
 
-### Published pod-api port
+# Playwright test harness (TypeScript tests + config)
+COPY e2e-devaipod/ /opt/e2e-devaipod/
+WORKDIR /opt/e2e-devaipod
+RUN npm ci
 
-The pod-api sidecar listens on port 8090 inside the pod. To reach it
-from the Playwright browser (running outside the pod), we need the
-port published to the host. The existing `get_published_port()`
-utility in the test harness already handles this for other containers.
+ENV DEVAIPOD_CONTAINER=1
+ENV CONTAINER_HOST=unix:///run/docker.sock
 
-The pod-api port needs to be published during pod creation. Currently
-`PodSpec::create()` publishes the opencode port (4096) and optionally
-SSH (2222). Pod-api's port (8090) is **not** published by default; it
-is accessed via the control plane proxy. For integration tests, we need
-direct access.
+CMD ["npx", "playwright", "test"]
+```
 
-Options:
-- Add an `--expose-pod-api` flag to pod creation (test-only)
-- Always publish pod-api in integration test mode
-- Use the control plane proxy (adds a hop but avoids port changes)
+The Playwright image already has Chromium, Firefox, and WebKit
+installed. The `e2e-devaipod/` directory is a new top-level directory
+(not inside `opencode-ui/`) containing devaipod-specific Playwright
+tests, a separate `playwright.config.ts`, and a `package.json` that
+depends only on `@playwright/test`.
 
-Using the control plane proxy is simplest and tests the real production
-path. `DevaipodHarness` already provides authenticated HTTP access; the
-Playwright browser just needs the control plane URL with the auth token.
+### Architecture: Rust orchestrates, Playwright tests
 
-### Devaipod auth token
+The Rust integration test binary remains the orchestrator for pod
+lifecycle. A new Rust test function creates pods, waits for health,
+then spawns `npx playwright test` as a subprocess with env vars:
 
-The pod-api requires a bearer token for all requests. The test harness
-captures this from the `devaipod web` stdout. For Playwright, we need
-to either:
-- Pass the token as a query parameter (`?token=...`) on initial
-  navigation, which the SPA reads and stores in `sessionStorage`
-- Or inject it via `page.addInitScript()` into `sessionStorage`
-  before navigation
+```
+┌─ integration-web-runner container ──────────────────┐
+│                                                      │
+│  devaipod binary                                     │
+│    └─ starts web server on random port               │
+│    └─ creates pods (talks to host podman via socket)  │
+│                                                      │
+│  npx playwright test                                 │
+│    └─ reads DEVAIPOD_BASE_URL, DEVAIPOD_TOKEN        │
+│    └─ launches Chromium                              │
+│    └─ navigates to control plane                     │
+│    └─ interacts with pod switcher, git review, etc.  │
+│                                                      │
+└──────────────┬───────────────────────────────────────┘
+               │ podman socket
+               ▼
+         host podman
+```
 
-The existing opencode-ui fixtures use `page.addInitScript()` for
-localStorage seeding, so the same pattern works here.
+The key difference from the existing integration tests: instead of
+verifying HTML strings via raw HTTP, Playwright opens a real browser
+and interacts with the rendered DOM.
+
+### Control plane proxy (no port publishing needed)
+
+Playwright navigates to the control plane URL
+(`http://localhost:<port>/`) which proxies to pod-api sidecars. This
+tests the real production path. No need to publish pod-api ports
+directly.
+
+### Auth token injection
+
+The devaipod login endpoint (`/_devaipod/login?token=...`) sets an
+HttpOnly cookie. Playwright navigates to this URL first, which sets
+the cookie, then navigates to the agent iframe. Alternatively, use
+`page.addInitScript()` to inject the token into `sessionStorage`
+(matching the pattern in `opencode-ui/packages/app/e2e/fixtures.ts`).
 
 ## Test Fixture Design
 
-### `DevaipodWebFixture`
+### File layout
 
-A new Playwright fixture that wraps `DevaipodHarness` (or equivalent
-podman setup) and provides:
+```
+e2e-devaipod/                     # New top-level directory
+├── package.json                  # { "@playwright/test": "1.57.0" }
+├── playwright.config.ts          # Chromium only, reads env vars
+├── fixtures.ts                   # DevaipodFixture (auth, navigation)
+├── pod-switcher.spec.ts          # Pod switcher tests
+├── git-review.spec.ts            # Git review tab tests (future)
+└── tsconfig.json
+```
+
+This is separate from `opencode-ui/packages/app/e2e/` which tests
+the upstream opencode SPA. The `e2e-devaipod/` tests target the
+devaipod control plane and agent iframe wrapper.
+
+### Playwright config
 
 ```typescript
-type DevaipodWebFixture = {
-  // The control plane base URL (e.g., http://localhost:38291)
+// e2e-devaipod/playwright.config.ts
+import { defineConfig, devices } from "@playwright/test"
+
+export default defineConfig({
+  testDir: ".",
+  timeout: 60_000,
+  expect: { timeout: 10_000 },
+  retries: process.env.CI ? 2 : 0,
+  reporter: [["html", { open: "never" }], ["line"]],
+  use: {
+    baseURL: process.env.DEVAIPOD_BASE_URL || "http://localhost:8080",
+    trace: "on-first-retry",
+    screenshot: "only-on-failure",
+  },
+  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+})
+```
+
+### `DevaipodFixture`
+
+```typescript
+// e2e-devaipod/fixtures.ts
+import { test as base, expect, Page } from "@playwright/test"
+
+type DevaipodFixture = {
   baseUrl: string
-  // Auth token for API access
   token: string
-  // Pod name (for constructing API paths)
-  podName: string
-  // Navigate to the pod's web UI with auth
-  gotoAgent: (page: Page) => Promise<void>
-  // Exec a git command in the agent container
-  agentGitExec: (command: string) => Promise<string>
-  // Exec a git command in the workspace container
-  workspaceGitExec: (command: string) => Promise<string>
-  // Wait for pod-api /git/log to reflect a commit
-  waitForCommit: (sha: string) => Promise<void>
+  // Navigate to the login endpoint, setting the auth cookie
+  login: (page: Page) => Promise<void>
+  // Navigate to a specific pod's agent iframe
+  gotoAgent: (page: Page, podShortName: string) => Promise<void>
+  // Fetch the pod list from the API
+  getPods: () => Promise<Array<{ name: string; status: string }>>
+}
+
+export const test = base.extend<DevaipodFixture>({
+  baseUrl: async ({}, use) => {
+    await use(process.env.DEVAIPOD_BASE_URL || "http://localhost:8080")
+  },
+  token: async ({}, use) => {
+    const token = process.env.DEVAIPOD_TOKEN
+    if (!token) throw new Error("DEVAIPOD_TOKEN not set")
+    await use(token)
+  },
+  login: async ({ baseUrl, token }, use) => {
+    await use(async (page) => {
+      await page.goto(`${baseUrl}/_devaipod/login?token=${token}`)
+      // Login redirects to /pods; cookie is now set
+    })
+  },
+  gotoAgent: async ({ baseUrl, token }, use) => {
+    await use(async (page, podShortName) => {
+      // Login first to set cookie
+      await page.goto(`${baseUrl}/_devaipod/login?token=${token}`)
+      await page.goto(`${baseUrl}/_devaipod/agent/${podShortName}/`)
+      await page.waitForSelector("#dbar")
+    })
+  },
+  getPods: async ({ baseUrl, token }, use) => {
+    await use(async () => {
+      const resp = await fetch(`${baseUrl}/api/devaipod/pods`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      return resp.json()
+    })
+  },
+})
+
+export { expect }
+```
+
+### Bridging: Playwright `globalSetup` orchestrates pods
+
+Rather than Rust spawning Playwright as a subprocess, the Playwright
+`globalSetup` script handles everything. The `devaipod` binary is
+available in the container image:
+
+```typescript
+// e2e-devaipod/global-setup.ts
+import { execSync } from "child_process"
+
+export default async function globalSetup() {
+  // Start devaipod web server
+  // Create test pods via CLI
+  // Store base URL and token in process.env for fixtures
+  // Pod cleanup happens in globalTeardown
 }
 ```
 
-The fixture lifecycle:
-1. **beforeAll** (worker-scoped): Start `devaipod web`, create a pod
-   from a test repo, wait for pod-api health, exec an initial commit
-   into the agent container to have git data ready.
-2. **Per-test**: Navigate to the pod's web UI, seed auth token.
-3. **afterAll**: Remove pod, kill web server.
+This is simpler than the Rust-subprocess approach because:
+- No need for the Rust integration test binary in the web runner image
+- Playwright controls the full lifecycle
+- The `devaipod` binary handles pod creation robustly
+- Cleanup is straightforward in `globalTeardown`
 
-Worker-scoping the pod creation is important for performance. Creating
-a pod takes 5-15 seconds; sharing one pod across all review-tab tests
-avoids that overhead per test. Tests that mutate state (push) need
-their own pod or need to reset state between runs.
-
-### Bridging Rust and Playwright
-
-The test harness is Rust (`DevaipodHarness`) but Playwright tests are
-TypeScript. Two approaches:
-
-**Approach A: Rust sets up, Playwright tests.**
-
-A Rust integration test creates the pod and execs commits, then spawns
-`npx playwright test` as a subprocess with the pod details passed via
-environment variables:
-
-```rust
-container_integration_test!(test_web_git_review);
-fn test_web_git_review() -> Result<()> {
-    let mut harness = DevaipodHarness::start()?;
-    harness.create_pod(&repo_path, "web-review-test")?;
-
-    // Exec commits into agent container
-    podman_exec(&agent_container, "git commit ...");
-
-    // Run Playwright with pod details
-    Command::new("npx")
-        .args(["playwright", "test", "--project=devaipod"])
-        .env("DEVAIPOD_BASE_URL", harness.base_url())
-        .env("DEVAIPOD_TOKEN", harness.token())
-        .env("DEVAIPOD_POD_NAME", "web-review-test")
-        .status()?;
-    Ok(())
-}
-```
-
-This keeps the Rust harness as the orchestrator and Playwright as a
-subprocess. The Playwright tests read env vars to know where to connect.
-
-**Approach B: Playwright orchestrates everything.**
-
-A Playwright `globalSetup` script shells out to `devaipod` to create
-the pod, captures the token, and stores them in Playwright's
-`process.env` for test fixtures. Teardown removes the pod.
-
-This is more self-contained but requires the `devaipod` binary and
-podman to be available in the Playwright environment, and duplicates
-setup logic that already exists in Rust.
-
-**Recommended: Approach A.** The Rust harness already handles pod
-lifecycle robustly (cleanup on drop, volume removal, timeout handling).
-Playwright focuses purely on browser interactions.
+The tradeoff is some duplication of setup logic vs the Rust harness,
+but TypeScript is the natural language for Playwright tests.
 
 ## Test Scenarios
 
@@ -273,6 +331,74 @@ upstream (bare git repo). This test needs its own pod (mutates state).
 5. Assert: file count and diff content change appropriately
 ```
 
+### 7. Pod switcher dropdown with multiple pods (Playwright)
+
+**Precondition**: Two pods created and Running, pod-api sidecars
+healthy. Both pods visible in `/api/devaipod/pods`.
+
+```
+1. Navigate to pod A's agent iframe via control plane proxy
+2. Assert: #pod-switcher is visible in the top bar
+3. Click #pod-trigger to open the dropdown
+4. Assert: dropdown is visible, contains entries for both pod A and pod B
+5. Assert: pod A is highlighted as current (has .current class)
+6. Assert: both entries show status dots (green/blue/purple)
+7. Click pod B's entry in the dropdown
+8. Assert: browser navigates to /_devaipod/agent/<pod-b-name>/
+9. Assert: #pod-trigger now shows pod B's name or title
+10. Click the right arrow (#next-pod) -- should be disabled (last pod)
+11. Click the left arrow (#prev-pod) -- should navigate back to pod A
+12. Assert: browser navigates to /_devaipod/agent/<pod-a-name>/
+```
+
+This is the primary pod switcher test. It validates the full
+interactive flow: dropdown rendering, pod selection, and arrow
+navigation between pods.
+
+**Current coverage**: The server-side HTML/JS generation and API
+responses are validated by `test_harness_pod_switcher_multi_pod` in
+`controlplane.rs` (Rust, no browser). The Playwright test above
+would replace/supplement that by testing the actual rendered DOM
+interactions.
+
+### 8. Pod switcher shows session title (Playwright)
+
+**Precondition**: One pod Running with a session title set via
+`/agent-status`.
+
+```
+1. Navigate to pod's agent iframe
+2. Assert: #pod-trigger initially shows the pod short name
+3. Wait for fetchTitle() to complete (polls /agent-status)
+4. Assert: #pod-trigger text updates to the session title
+5. Assert: document.title contains the session title
+```
+
+### 9. Pod switcher with single pod (Playwright)
+
+**Precondition**: Only one pod Running.
+
+```
+1. Navigate to the pod's agent iframe
+2. Click #pod-trigger to open dropdown
+3. Assert: dropdown shows one entry, highlighted as current
+4. Assert: both arrow buttons (#prev-pod, #next-pod) are disabled
+5. Click the current entry -- no navigation (stays on same page)
+```
+
+### 10. Pod switcher HTML structure (Rust, no browser)
+
+The Rust integration tests validate the server-side contract that
+Playwright tests depend on:
+
+- `test_harness_pod_switcher_multi_pod` (`controlplane.rs`): Creates
+  two pods, verifies both appear as Running in the API, and checks
+  that each pod's iframe wrapper HTML contains the expected DOM
+  element IDs and JS function names.
+- `test_web_agent_iframe_has_pod_switcher` (`webui.rs`): Same
+  HTML structure checks running inside the container test
+  infrastructure.
+
 ## Frontend Prerequisites
 
 Before these tests can run, the `GitReviewTab` component needs
@@ -289,53 +415,115 @@ exclusively (never CSS classes or IDs). Needed attributes:
 - `data-action="signoff-checkbox"` on the Signed-off-by toggle
 - `data-slot="diff-before"` / `data-slot="diff-after"` on diff panels
 
+The pod switcher component uses `id` attributes (already implemented):
+
+- `id="pod-switcher"` on the switcher container
+- `id="pod-trigger"` on the trigger button
+- `id="prev-pod"` and `id="next-pod"` on arrow buttons
+- `id="pod-dropdown"` on the dropdown container
+
 ## CI Integration
 
-### Justfile target
+### Containerfile stage
 
+Add `integration-web-runner` as a new target in the Containerfile:
+
+```dockerfile
+FROM mcr.microsoft.com/playwright:v1.57.0-noble AS integration-web-runner
+
+RUN apt-get update && apt-get install -y podman-remote git \
+    && ln -sf /usr/bin/podman-remote /usr/bin/podman \
+    && apt-get clean
+
+COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
+COPY e2e-devaipod/ /opt/e2e-devaipod/
+WORKDIR /opt/e2e-devaipod
+RUN npm ci
+
+ENV DEVAIPOD_CONTAINER=1
+ENV CONTAINER_HOST=unix:///run/docker.sock
+
+CMD ["npx", "playwright", "test"]
 ```
-test-integration-web: container-build build-integration
-    # 1. Ensure Playwright browsers are available
-    # 2. Run Rust integration test that creates pod + spawns Playwright
-    ...
+
+### Justfile targets
+
+```just
+# Build the web integration test runner image
+build-integration-web: container-build
+    podman build --target integration-web-runner \
+        -t localhost/devaipod-integration-web:latest .
+
+# Run Playwright-based web integration tests in a container
+test-integration-web: build-integration-web
+    podman run --rm --privileged \
+        --name devaipod-integration-web \
+        -v {{podman_socket}}:/run/docker.sock \
+        -v /tmp:/tmp:shared \
+        -e DEVAIPOD_HOST_SOCKET={{podman_socket}} \
+        -e DEVAIPOD_CONTAINER_IMAGE=localhost/devaipod:latest \
+        -e DEVAIPOD_INSTANCE=integration-test \
+        -e DEVAIPOD_MOCK_AGENT=1 \
+        localhost/devaipod-integration-web:latest
 ```
+
+This mirrors the existing `test-integration` target structure.
+The `--privileged` flag and socket mount are the same as the
+existing integration runner.
 
 ### GitHub Actions
 
-Add a step after the existing `test-integration` job:
-
 ```yaml
-- name: Web integration tests
+- name: Web integration tests (Playwright)
   run: just test-integration-web
   timeout-minutes: 15
 ```
 
-This runs only on the full CI pipeline (push to main, PRs), not on
-every commit. The container build is shared with the existing
-integration tests to avoid rebuilding.
+Runs after `test-integration` in the CI pipeline. The
+`container-build` step is shared (cached) between both jobs.
 
 ### Performance budget
 
-Target: the web integration tests should complete in under 3 minutes.
-Pod creation is the bottleneck (~10-15s). Sharing a pod across
-read-only tests (scenarios 1, 2, 5, 6) keeps total pod creation to
-2 pods (one shared, one for the push test). Playwright tests
-themselves should be fast (<5s each) since they're testing UI
-rendering against an already-running backend.
+Target: under 3 minutes total. Pod creation is ~10-15s per pod.
+The `globalSetup` creates 2 pods (one shared for read-only tests,
+one for mutating tests like push). Playwright tests should be
+<5s each since the backend is already running.
 
 ## Relationship to Existing Tests
 
 This complements, not replaces, the existing test infrastructure:
 
-- **Unit tests** (`cargo test`): Pure logic, no containers
+- **Unit tests** (`cargo test`): Pure logic, no containers. Sub-second.
 - **Integration tests** (`just test-integration`): Container structure,
   volume mounts, HTTP endpoints, SSH -- verified via Rust HTTP client
-  and `podman exec`. No browser.
-- **Web integration tests** (this doc): Browser-driven tests against
-  real containers. Validates the full user experience from browser
-  to container.
+  and `podman exec`. No browser. Includes pod switcher HTML structure
+  checks (`test_harness_pod_switcher_multi_pod`).
+- **Web integration tests** (`just test-integration-web`, this doc):
+  Playwright in Chromium against real containers. Validates interactive
+  UI behavior (dropdown clicks, navigation, status updates). New
+  `integration-web-runner` container image.
 - **E2E GitHub tests** (`just test-e2e-gh`): Real GitHub API
   operations (draft PRs, etc.). Slowest, requires network access.
+
+The Rust integration tests and Playwright tests are complementary:
+Rust validates the server-side contract (correct HTML structure,
+correct API responses). Playwright validates that the browser
+correctly renders and interacts with that contract. If a Rust HTML
+structure test passes but the Playwright interactive test fails,
+the bug is in the frontend JS. If both fail, the bug is in the
+server-side template.
+
+## Implementation Steps
+
+1. Create `e2e-devaipod/` directory with `package.json`,
+   `playwright.config.ts`, `fixtures.ts`, `global-setup.ts`,
+   `global-teardown.ts`.
+2. Write `pod-switcher.spec.ts` implementing scenarios 7-9.
+3. Add the `integration-web-runner` stage to the Containerfile.
+4. Add `build-integration-web` and `test-integration-web` targets
+   to the Justfile.
+5. Run locally: `just test-integration-web`.
+6. Add to CI workflow.
 
 ## References
 
@@ -343,5 +531,7 @@ This complements, not replaces, the existing test infrastructure:
 - [test-performance.md](./test-performance.md) — integration test performance
 - [opencode-webui-fork.md](./opencode-webui-fork.md) — vendored opencode SPA
 - `crates/integration-tests/src/harness.rs` — `DevaipodHarness`
-- `opencode-ui/packages/app/e2e/` — upstream Playwright infrastructure
-- `opencode-ui/packages/app/playwright.config.ts` — Playwright config
+- `crates/integration-tests/src/tests/controlplane.rs` — pod switcher Rust tests
+- `e2e-devaipod/` — devaipod-specific Playwright tests (to be created)
+- `opencode-ui/packages/app/e2e/` — upstream opencode Playwright tests (reference)
+- `opencode-ui/packages/app/playwright.config.ts` — upstream Playwright config (reference)

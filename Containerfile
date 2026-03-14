@@ -206,6 +206,33 @@ ENV CONTAINER_HOST=unix:///run/docker.sock
 
 CMD ["/usr/bin/devaipod-integration"]
 
+# -- web integration test runner (Playwright + Chromium) --
+# Browser-driven tests for the devaipod control plane UI (pod switcher,
+# git review tab, etc.). Based on the official Playwright image which
+# bundles Chromium, Firefox, and WebKit.
+# Build: podman build --target integration-web-runner -t localhost/devaipod-integration-web .
+# Run:   podman run --rm --privileged -v /run/podman/podman.sock:/run/docker.sock localhost/devaipod-integration-web
+FROM mcr.microsoft.com/playwright:v1.57.0-noble AS integration-web-runner
+
+# podman-remote for pod lifecycle (same pattern as integration-runner)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        podman-remote git \
+    && ln -sf /usr/bin/podman-remote /usr/bin/podman \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# The devaipod binary (for creating/managing pods)
+COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
+
+# Playwright test harness
+COPY --from=src /src/e2e-devaipod/ /opt/e2e-devaipod/
+WORKDIR /opt/e2e-devaipod
+RUN npm ci && npx playwright install --with-deps chromium
+
+ENV DEVAIPOD_CONTAINER=1
+ENV CONTAINER_HOST=unix:///run/docker.sock
+
+CMD ["npx", "playwright", "test"]
+
 # -- final minimal image --
 FROM quay.io/centos/centos:stream10
 

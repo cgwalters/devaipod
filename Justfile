@@ -258,6 +258,80 @@ test-integration image=default_test_image: container-build build-integration
         -e DEVAIPOD_CONTAINER_IMAGE={{ CONTAINER_IMAGE }}:latest \
         {{ CONTAINER_IMAGE }}-integration:latest
 
+# Build web integration test runner (Playwright + Chromium)
+[group('container')]
+build-integration-web no_cache="":
+    podman build --jobs=4 {{ no_cache }} --target integration-web-runner -t {{ CONTAINER_IMAGE }}-integration-web:latest -f Containerfile .
+
+# Run Playwright-based web integration tests (pod switcher, git review, etc.)
+# Builds the main devaipod image + the Playwright runner image, then runs
+# browser-driven tests inside a container with podman socket access.
+[group('container')]
+test-integration-web image=default_test_image: container-build build-integration-web
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Reuse the same socket-finding logic as test-integration
+    PODMAN_PID=""
+    cleanup() {
+        if [ -n "$PODMAN_PID" ]; then
+            kill "$PODMAN_PID" 2>/dev/null || true
+            wait "$PODMAN_PID" 2>/dev/null || true
+        fi
+    }
+    trap cleanup EXIT
+    CONFIG="${DEVAIPOD_CONFIG:-$HOME/.config/devaipod.toml}"
+    if [ ! -f "$CONFIG" ]; then
+        mkdir -p "$(dirname "$CONFIG")"
+        echo "# Auto-generated for integration tests" > "$CONFIG"
+    fi
+    SOCKET=""
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
+        SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
+    elif [ -n "${DOCKER_HOST:-}" ]; then
+        SOCKET="${DOCKER_HOST#unix://}"
+    elif [ -S "/tmp/devaipod-podman-$(id -u)/podman.sock" ]; then
+        SOCKET="/tmp/devaipod-podman-$(id -u)/podman.sock"
+    elif command -v podman &>/dev/null; then
+        SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
+    fi
+    if [ -z "$SOCKET" ] || [ ! -S "$SOCKET" ]; then
+        if command -v podman &>/dev/null; then
+            SOCKET="/tmp/devaipod-podman-$(id -u)/podman.sock"
+            mkdir -p "$(dirname "$SOCKET")"
+            echo "No podman socket found; auto-starting podman system service at $SOCKET..."
+            podman system service --time=120 "unix://$SOCKET" &
+            PODMAN_PID=$!
+            for i in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.1; done
+            if [ ! -S "$SOCKET" ]; then
+                echo "Failed to start podman socket service"
+                exit 1
+            fi
+        else
+            echo "Could not find podman socket."
+            exit 1
+        fi
+    fi
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] || [[ "$SOCKET" == /tmp/* ]]; then
+        HOST_SOCKET="$SOCKET"
+    else
+        HOST_SOCKET="/run/podman/podman.sock"
+    fi
+    echo "Running Playwright web integration tests..."
+    PRIV_FLAG="--privileged"
+    if ! podman run --rm --privileged alpine true 2>/dev/null; then
+        PRIV_FLAG="--security-opt label=disable"
+    fi
+    podman run --rm $PRIV_FLAG --pids-limit=-1 \
+        -v "$HOST_SOCKET":/run/docker.sock \
+        -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
+        -v /tmp:/tmp:shared \
+        -v "$CONFIG":/root/.config/devaipod.toml:ro \
+        -e DEVAIPOD_TEST_IMAGE={{image}} \
+        -e DEVAIPOD_CONTAINER_IMAGE={{ CONTAINER_IMAGE }}:latest \
+        -e DEVAIPOD_INSTANCE=integration-test \
+        -e DEVAIPOD_MOCK_AGENT=1 \
+        {{ CONTAINER_IMAGE }}-integration-web:latest
+
 # Smoke-test the container image
 [group('container')]
 container-test: container-build

@@ -80,7 +80,7 @@ container_integration_test!(test_unified_pod_list);
 /// a concurrently running test that may be mid-teardown.
 ///
 /// Returns `None` if the shared pod is not found or not running.
-fn find_running_pod(fixture: &WebFixture, token: &str) -> Result<Option<String>> {
+pub(crate) fn find_running_pod(fixture: &WebFixture, token: &str) -> Result<Option<String>> {
     let (status, body) = fixture.curl_in_container("/api/devaipod/pods", Some(token))?;
     if status != 200 {
         return Ok(None);
@@ -370,3 +370,126 @@ fn test_harness_completion_status_e2e() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_harness_completion_status_e2e);
+
+/// Multi-pod test for the pod switcher dropdown.
+///
+/// Creates two pods via the harness, verifies both appear as Running in
+/// `/api/devaipod/pods`, and confirms the agent iframe wrapper HTML for
+/// each pod contains the pod switcher UI elements (dropdown, arrow buttons,
+/// and JS functions for fetching/rendering the pod list).
+fn test_harness_pod_switcher_multi_pod() -> Result<()> {
+    let mut harness = DevaipodHarness::start()?;
+
+    let repo_a = TestRepo::new()?;
+    let repo_b = TestRepo::new()?;
+
+    let pod_name_a = crate::unique_test_name("switcher-a");
+    let short_a = crate::short_name(&pod_name_a);
+    let pod_name_b = crate::unique_test_name("switcher-b");
+    let short_b = crate::short_name(&pod_name_b);
+
+    harness.create_pod(repo_a.repo_path.to_str().unwrap(), short_a)?;
+    harness.create_pod(repo_b.repo_path.to_str().unwrap(), short_b)?;
+
+    // Wait for both pod-api containers to become healthy.
+    for pod_name in [&pod_name_a, &pod_name_b] {
+        let api_container = format!("{pod_name}-api");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let output = std::process::Command::new("podman")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{.State.Health.Status}}",
+                    &api_container,
+                ])
+                .output()?;
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if status == "healthy" {
+                tracing::info!("{api_container} is healthy");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                color_eyre::eyre::bail!(
+                    "pod-api container {api_container} did not become healthy within 60s (status: {status})"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    // Verify both pods appear in the unified pod list as Running.
+    let (status, body) = harness.get("/api/devaipod/pods")?;
+    assert_eq!(status, 200, "GET /api/devaipod/pods: {body}");
+    let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+
+    let running_pods: Vec<&serde_json::Value> = pods
+        .iter()
+        .filter(|p| {
+            p.get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s.eq_ignore_ascii_case("running"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let names: Vec<&str> = running_pods
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+        .collect();
+    tracing::info!("Running pods: {:?}", names);
+
+    assert!(
+        names.contains(&pod_name_a.as_str()),
+        "Pod A ({pod_name_a}) should be in the running list; got: {names:?}"
+    );
+    assert!(
+        names.contains(&pod_name_b.as_str()),
+        "Pod B ({pod_name_b}) should be in the running list; got: {names:?}"
+    );
+
+    // Fetch the agent iframe wrapper for each pod and verify pod switcher elements.
+    for short in [short_a, short_b] {
+        let path = format!("/_devaipod/agent/{short}/");
+        let (status, body) = harness.get(&path)?;
+        assert_eq!(
+            status,
+            200,
+            "GET {path} should return 200, got {status}: {}",
+            &body[..body.len().min(300)]
+        );
+
+        for marker in [
+            r#"id="pod-switcher""#,
+            r#"id="pod-trigger""#,
+            r#"id="prev-pod""#,
+            r#"id="next-pod""#,
+            r#"id="pod-dropdown""#,
+            "fetchPodList",
+            "navigateToPod",
+            "renderDropdown",
+            "/api/devaipod/pods",
+        ] {
+            assert!(
+                body.contains(marker),
+                "Agent iframe for '{short}' should contain '{marker}'; body length={}",
+                body.len()
+            );
+        }
+    }
+
+    // Confirm the pod list has at least 2 running entries, meaning the JS
+    // would enable back-and-forth arrow navigation.
+    assert!(
+        running_pods.len() >= 2,
+        "Expected at least 2 running pods for switcher navigation; got {}",
+        running_pods.len()
+    );
+
+    tracing::info!(
+        "Pod switcher multi-pod test passed ({} running pods)",
+        running_pods.len()
+    );
+    Ok(())
+}
+podman_integration_test!(test_harness_pod_switcher_multi_pod);
