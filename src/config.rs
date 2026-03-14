@@ -77,6 +77,11 @@ pub struct Config {
     #[serde(default)]
     pub orchestration: OrchestrationConfig,
 
+    /// Kubernetes backend configuration
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub kubernetes: KubernetesConfig,
+
     /// SSH configuration for editor integration
     #[serde(default)]
     pub ssh: SshConfig,
@@ -762,6 +767,66 @@ pub enum WorkerGatorMode {
 }
 
 // =============================================================================
+// Kubernetes configuration
+// =============================================================================
+
+/// Default Kubernetes namespace for devaipod workspaces
+const DEFAULT_KUBE_NAMESPACE: &str = "devaipod";
+
+/// Kubernetes backend configuration
+///
+/// When configured, devaipod can spawn workspace pods in a Kubernetes cluster
+/// instead of (or in addition to) local podman. The kubeconfig can be provided
+/// as a podman secret, a file path, or auto-detected from the environment
+/// (in-cluster ServiceAccount or ~/.kube/config).
+///
+/// Example configuration:
+/// ```toml
+/// [kubernetes]
+/// enabled = true
+/// namespace = "devaipod"
+/// kubeconfig-secret = "kubeconfig"  # podman secret name containing kubeconfig YAML
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub struct KubernetesConfig {
+    /// Whether Kubernetes backend is enabled (default: false).
+    /// When enabled, devaipod will attempt to connect to a Kubernetes cluster
+    /// on startup using the configured kubeconfig source.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Kubernetes namespace for workspace pods (default: "devaipod").
+    #[serde(default)]
+    pub namespace: Option<String>,
+
+    /// Name of a podman secret containing kubeconfig YAML.
+    /// Read via `podman secret inspect --showsecret` at startup.
+    /// Takes precedence over kubeconfig-path and environment detection.
+    #[serde(default)]
+    pub kubeconfig_secret: Option<String>,
+
+    /// Path to a kubeconfig file. Falls back to ~/.kube/config or
+    /// in-cluster ServiceAccount detection if not set.
+    #[serde(default)]
+    pub kubeconfig_path: Option<String>,
+}
+
+#[allow(dead_code)]
+impl KubernetesConfig {
+    /// Check if Kubernetes backend is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    /// Get the target namespace, defaulting to "devaipod".
+    pub fn namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or(DEFAULT_KUBE_NAMESPACE)
+    }
+}
+
+// =============================================================================
 // SSH configuration
 // =============================================================================
 
@@ -1006,6 +1071,7 @@ mod tests {
         assert!(config.dotfiles.is_none());
         assert!(config.default_image.is_none());
         assert!(!config.container_nesting);
+        assert!(!config.kubernetes.is_enabled());
     }
 
     #[test]

@@ -20,6 +20,8 @@ mod git;
 #[allow(dead_code)] // Preparatory infrastructure for GPU passthrough
 mod gpu;
 mod init;
+#[allow(dead_code)] // Preparatory infrastructure for Kubernetes backend
+mod kube;
 mod mcp;
 mod pod;
 mod pod_api;
