@@ -4,6 +4,10 @@
 //! a real cluster (e.g. minikube). They are skipped when no kubeconfig is
 //! available.
 //!
+//! The test namespace is controlled by `DEVAIPOD_KUBE_NAMESPACE` (defaults
+//! to `devaipod-test`). It is auto-created if absent and cleaned up after
+//! tests complete.
+//!
 //! Run with: `just test-kube`
 
 use color_eyre::eyre::Context;
@@ -13,10 +17,6 @@ use std::collections::BTreeMap;
 use crate::integration_test;
 
 /// Check whether a working kubeconfig is available.
-///
-/// Returns true if ~/.kube/config exists or KUBECONFIG is set to a
-/// readable file. Tests call this to skip gracefully when no cluster
-/// is configured.
 fn kubeconfig_available() -> bool {
     if let Ok(path) = std::env::var("KUBECONFIG") {
         return std::path::Path::new(&path).is_file();
@@ -27,13 +27,63 @@ fn kubeconfig_available() -> bool {
     false
 }
 
+/// Get the test namespace from config or environment.
+///
+/// Priority: DEVAIPOD_KUBE_NAMESPACE env var > default "devaipod-test".
+fn test_namespace() -> String {
+    std::env::var("DEVAIPOD_KUBE_NAMESPACE").unwrap_or_else(|_| "devaipod-test".to_string())
+}
+
 /// Build a kube::Client from default kubeconfig, installing the rustls
-/// crypto provider first (required when no other crate has done it).
+/// crypto provider first.
 async fn make_client() -> Result<kube::Client> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     kube::Client::try_default()
         .await
         .context("failed to create kube client from default kubeconfig")
+}
+
+/// Ensure a namespace exists, creating it if absent (same logic as
+/// src/kube.rs ensure_namespace, duplicated here to avoid coupling
+/// the test crate to the main binary's internal API).
+async fn ensure_namespace(client: &kube::Client, name: &str) -> Result<()> {
+    use k8s_openapi::api::core::v1::Namespace;
+    use kube::api::{ObjectMeta, PostParams};
+
+    let ns_api: kube::Api<Namespace> = kube::Api::all(client.clone());
+
+    match ns_api.get(name).await {
+        Ok(_) => {
+            eprintln!("namespace {name} already exists");
+            return Ok(());
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(e) => return Err(e).context(format!("failed to check namespace '{name}'")),
+    }
+
+    let ns = Namespace {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            labels: Some(BTreeMap::from([(
+                "io.devaipod/managed".to_string(),
+                "true".to_string(),
+            )])),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    match ns_api.create(&PostParams::default(), &ns).await {
+        Ok(_) => {
+            eprintln!("created namespace {name}");
+            Ok(())
+        }
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            eprintln!("namespace {name} created concurrently");
+            Ok(())
+        }
+        Err(e) => Err(e).context(format!("failed to create namespace '{name}'")),
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -61,8 +111,9 @@ fn test_kube_connect() -> Result<()> {
 }
 integration_test!(test_kube_connect);
 
-/// Create a pod in a fresh namespace, wait for Running, list by label,
-/// then clean up both pod and namespace.
+/// Ensure the configured namespace exists (auto-create if absent),
+/// then create a pod, wait for Running, list by label, and clean up
+/// the pod. The namespace is left in place for other tests.
 fn test_kube_pod_lifecycle() -> Result<()> {
     if !kubeconfig_available() {
         eprintln!("skipping: no kubeconfig available");
@@ -71,45 +122,21 @@ fn test_kube_pod_lifecycle() -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        use k8s_openapi::api::core::v1::{Container, Namespace, Pod, PodSpec};
+        use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
         use kube::api::{DeleteParams, ListParams, ObjectMeta, PostParams};
 
         let client = make_client().await?;
+        let ns_name = test_namespace();
 
-        // Use a unique namespace per test run to avoid collisions
+        // Ensure namespace exists (auto-create if absent)
+        ensure_namespace(&client, &ns_name).await?;
+
         let run_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
             & 0xFFFF;
-        let ns_name = format!("devaipod-test-{run_id:x}");
         let pod_name = format!("lifecycle-{run_id:x}");
-
-        // Create namespace
-        let ns_api: kube::Api<Namespace> = kube::Api::all(client.clone());
-        let ns = Namespace {
-            metadata: ObjectMeta {
-                name: Some(ns_name.clone()),
-                labels: Some(BTreeMap::from([(
-                    "io.devaipod/test".to_string(),
-                    "true".to_string(),
-                )])),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        ns_api
-            .create(&PostParams::default(), &ns)
-            .await
-            .context("failed to create test namespace")?;
-        eprintln!("created namespace {ns_name}");
-
-        // From here, always clean up the namespace on exit
-        let cleanup = |client: kube::Client, ns: String| async move {
-            let ns_api: kube::Api<Namespace> = kube::Api::all(client);
-            let _ = ns_api.delete(&ns, &DeleteParams::default()).await;
-            eprintln!("deleted namespace {ns}");
-        };
 
         // Create pod
         let pods: kube::Api<Pod> = kube::Api::namespaced(client.clone(), &ns_name);
@@ -135,22 +162,15 @@ fn test_kube_pod_lifecycle() -> Result<()> {
             ..Default::default()
         };
 
-        if let Err(e) = pods.create(&PostParams::default(), &pod).await {
-            cleanup(client.clone(), ns_name.clone()).await;
-            return Err(e).context("failed to create test pod");
-        }
-        eprintln!("created pod {pod_name}");
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .context("failed to create test pod")?;
+        eprintln!("created pod {pod_name} in namespace {ns_name}");
 
         // Wait for Running (up to 120s for image pull)
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            let p = match pods.get(&pod_name).await {
-                Ok(p) => p,
-                Err(e) => {
-                    cleanup(client.clone(), ns_name.clone()).await;
-                    return Err(e.into());
-                }
-            };
+            let p = pods.get(&pod_name).await?;
             let phase = p
                 .status
                 .as_ref()
@@ -162,17 +182,18 @@ fn test_kube_pod_lifecycle() -> Result<()> {
                 break;
             }
             if phase == "Failed" || phase == "Succeeded" {
-                cleanup(client.clone(), ns_name.clone()).await;
+                // Clean up before bailing
+                let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
                 color_eyre::eyre::bail!("pod entered terminal phase: {phase}");
             }
             if std::time::Instant::now() > deadline {
-                cleanup(client.clone(), ns_name.clone()).await;
+                let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
                 color_eyre::eyre::bail!("pod did not reach Running within 120s (phase: {phase})");
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
 
-        // Verify we can list pods with label selector
+        // Verify label-based listing works
         let lp = ListParams::default().labels("io.devaipod/test=true");
         let pod_list = pods.list(&lp).await?;
         let found = pod_list.items.iter().any(|p| {
@@ -182,24 +203,22 @@ fn test_kube_pod_lifecycle() -> Result<()> {
                 .map(|n| n == pod_name)
                 .unwrap_or(false)
         });
-        if !found {
-            cleanup(client.clone(), ns_name.clone()).await;
-            color_eyre::eyre::bail!("created pod not found in label-filtered list");
-        }
+        assert!(found, "created pod not found in label-filtered list");
         eprintln!(
             "label selector found {} pod(s) with io.devaipod/test=true",
             pod_list.items.len()
         );
 
-        // Clean up: delete pod (force) then namespace
-        let dp = DeleteParams {
-            grace_period_seconds: Some(0),
-            ..Default::default()
-        };
-        let _ = pods.delete(&pod_name, &dp).await;
+        // Clean up pod (force-delete, don't wait for graceful shutdown)
+        pods.delete(
+            &pod_name,
+            &DeleteParams {
+                grace_period_seconds: Some(0),
+                ..Default::default()
+            },
+        )
+        .await?;
         eprintln!("deleted pod {pod_name}");
-
-        cleanup(client.clone(), ns_name.clone()).await;
 
         Ok(())
     })

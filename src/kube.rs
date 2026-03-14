@@ -62,17 +62,71 @@ pub async fn connect(config: &KubernetesConfig) -> Result<KubeClient> {
         .context("failed to contact Kubernetes API server")?;
     let server_version = format!("{}.{}", version.major, version.minor);
 
+    let namespace = config.namespace().to_string();
+
+    // Ensure the target namespace exists (create if absent).
+    ensure_namespace(&client, &namespace).await?;
+
     tracing::info!(
         server_version = %server_version,
-        namespace = %config.namespace(),
+        namespace = %namespace,
         "connected to Kubernetes cluster"
     );
 
     Ok(KubeClient {
         client,
-        namespace: config.namespace().to_string(),
+        namespace,
         server_version,
     })
+}
+
+/// Ensure a namespace exists, creating it if absent.
+///
+/// This is idempotent: if the namespace already exists, it's a no-op.
+async fn ensure_namespace(client: &kube::Client, name: &str) -> Result<()> {
+    use k8s_openapi::api::core::v1::Namespace;
+    use kube::api::{ObjectMeta, PostParams};
+
+    let ns_api: kube::Api<Namespace> = kube::Api::all(client.clone());
+
+    // Check if it already exists before trying to create
+    match ns_api.get(name).await {
+        Ok(_) => {
+            tracing::debug!(namespace = %name, "namespace already exists");
+            return Ok(());
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            // Doesn't exist, create it below
+        }
+        Err(e) => {
+            return Err(e).context(format!("failed to check namespace '{name}'"));
+        }
+    }
+
+    let ns = Namespace {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            labels: Some(std::collections::BTreeMap::from([(
+                "io.devaipod/managed".to_string(),
+                "true".to_string(),
+            )])),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    match ns_api.create(&PostParams::default(), &ns).await {
+        Ok(_) => {
+            tracing::info!(namespace = %name, "created namespace");
+            Ok(())
+        }
+        // Race: another process created it between our get and create
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            tracing::debug!(namespace = %name, "namespace created concurrently");
+            Ok(())
+        }
+        Err(e) => Err(e).context(format!("failed to create namespace '{name}'")),
+    }
 }
 
 /// Build a [`kube::Client`] from a podman secret containing kubeconfig YAML.
