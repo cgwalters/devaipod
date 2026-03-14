@@ -372,11 +372,29 @@ async fn git_events_sse(
 // ---------------------------------------------------------------------------
 
 /// Validate that a string looks like a safe git ref (no shell metacharacters).
+///
+/// Allows `~` and `^` for rev-walking in read endpoints (log, diff-range).
 fn is_valid_git_ref(s: &str) -> bool {
     !s.is_empty()
         && !s.contains("..")
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '.' | '_' | '~' | '^'))
+}
+
+/// Validate that a string is a safe git branch name for write operations.
+///
+/// Stricter than [`is_valid_git_ref`]: branch names must not contain `~`,
+/// `^`, or `/` prefixed with `.` (git's own branch naming restrictions).
+/// This prevents rev-walking tricks and matches `git check-ref-format --branch`.
+fn is_valid_branch_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && !s.starts_with('-')
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && !s.ends_with(".lock")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '.' | '_'))
 }
 
 /// Maximum number of files allowed in a diff-range response.
@@ -402,11 +420,16 @@ async fn run_git(workspace: &PathBuf, args: &[&str]) -> Result<(i32, Vec<u8>, Ve
         // that could achieve code execution as root.
         .args(["-c", "core.fsmonitor=false"]) // Prevents RCE via git status/diff
         .args(["-c", "core.hooksPath=/dev/null"]) // Disables all git hooks
+        .args(["-c", "core.sshCommand=true"]) // Prevents RCE via SSH transport
+        .args(["-c", "core.pager=cat"]) // Prevents pager-based RCE
         .args(["-c", "credential.helper="]) // Prevents credential helper RCE
         .args(["-c", "protocol.ext.allow=never"]) // Blocks ext:: transport commands
         .args(["-c", "protocol.file.allow=never"]) // Blocks local path traversal
         .args(["-c", "diff.external="]) // Prevents external diff program execution
         .env("GIT_TERMINAL_PROMPT", "0") // Prevents interactive prompts
+        .env("GIT_ASKPASS", "") // Prevents askpass-based RCE
+        .env("GIT_SSH_COMMAND", "") // Prevents SSH command RCE
+        .env("GIT_CONFIG_NOSYSTEM", "1") // Ignores system-level git config
         .args(args)
         .current_dir(workspace)
         .output()
@@ -858,6 +881,12 @@ async fn fetch_file_contents(
 /// Runs `git fetch <agent-workspace-path>` in the main workspace to pull
 /// the agent's latest commits. This uses the local filesystem transport,
 /// which is safe because git is content-addressed (see security docs).
+///
+/// TODO(security): This endpoint currently has no authentication gate.
+/// In the autonomous flow the agent is *expected* to call this directly,
+/// but in the interactive review-gate flow, write operations should
+/// require human approval (admin token or similar). See the "Server-side
+/// review enforcement" item in `docs/todo/lightweight-review.md`.
 async fn git_fetch_agent(
     State(state): State<AppState>,
 ) -> Result<Json<GitFetchResponse>, (StatusCode, String)> {
@@ -910,7 +939,7 @@ async fn git_push(
     State(state): State<AppState>,
     Json(body): Json<GitPushRequest>,
 ) -> Result<Json<GitPushResponse>, (StatusCode, String)> {
-    if !is_valid_git_ref(&body.branch) {
+    if !is_valid_branch_name(&body.branch) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("Invalid branch name: {}", body.branch),
@@ -962,7 +991,7 @@ async fn git_create_branch(
     State(state): State<AppState>,
     Json(body): Json<GitCreateBranchRequest>,
 ) -> Result<Json<GitCreateBranchResponse>, (StatusCode, String)> {
-    if !is_valid_git_ref(&body.branch) {
+    if !is_valid_branch_name(&body.branch) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("Invalid branch name: {}", body.branch),
@@ -1002,8 +1031,10 @@ async fn git_create_branch(
         }));
     }
 
-    // Step 2: Determine the agent's current HEAD branch.
-    // Read the agent's HEAD to find which branch to track.
+    // Step 2: Determine the agent's current HEAD.
+    // First try to get the branch name; if HEAD is detached, fall back
+    // to the raw commit SHA so we can point the new branch at the
+    // exact commit rather than a non-existent remote-tracking ref.
     let (exit_code, stdout, _stderr) =
         run_git(&state.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
             .await
@@ -1015,16 +1046,42 @@ async fn git_create_branch(
                 )
             })?;
 
-    let agent_branch = if exit_code == 0 {
+    let abbrev = if exit_code == 0 {
         String::from_utf8_lossy(&stdout).trim().to_string()
     } else {
         "HEAD".to_string()
     };
 
+    // When detached ("HEAD"), resolve to the actual commit SHA and
+    // use FETCH_HEAD or the SHA directly. When on a branch, use the
+    // fetched remote-tracking ref.
+    let agent_target = if abbrev == "HEAD" {
+        // Detached HEAD: resolve the full commit SHA from the agent workspace
+        let (exit_code, stdout, _stderr) = run_git(&state.workspace, &["rev-parse", "HEAD"])
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to resolve agent HEAD SHA: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to resolve agent HEAD SHA: {e}"),
+                )
+            })?;
+        if exit_code != 0 {
+            return Ok(Json(GitCreateBranchResponse {
+                success: false,
+                message: "Agent HEAD could not be resolved (no commits?)".to_string(),
+            }));
+        }
+        // The SHA is content-addressed, so it will exist in the main workspace
+        // after the fetch above.
+        String::from_utf8_lossy(&stdout).trim().to_string()
+    } else {
+        format!("refs/remotes/agent/{}", abbrev)
+    };
+
     // Step 3: Create/update the branch in main workspace at the fetched ref
-    let agent_ref = format!("refs/remotes/agent/{}", agent_branch);
     let (exit_code, _stdout, stderr) =
-        run_git_trusted(&main_ws, &["branch", "-f", &body.branch, &agent_ref])
+        run_git_trusted(&main_ws, &["branch", "-f", &body.branch, &agent_target])
             .await
             .map_err(|e| {
                 tracing::error!("git branch failed: {e}");
@@ -3166,6 +3223,61 @@ mod tests {
         // Random unknown paths should not be treated as API
         assert!(!is_opencode_api_path("unknown"));
         assert!(!is_opencode_api_path("foo/bar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_git_ref / is_valid_branch_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_git_ref() {
+        // Valid refs
+        assert!(is_valid_git_ref("main"));
+        assert!(is_valid_git_ref("HEAD"));
+        assert!(is_valid_git_ref("feature/foo"));
+        assert!(is_valid_git_ref("v1.0.0"));
+        assert!(is_valid_git_ref("HEAD~3"));
+        assert!(is_valid_git_ref("main^2"));
+        assert!(is_valid_git_ref("abc123"));
+
+        // Invalid refs
+        assert!(!is_valid_git_ref(""), "empty string");
+        assert!(!is_valid_git_ref("bad..ref"), "contains ..");
+        assert!(!is_valid_git_ref("has space"), "contains space");
+        assert!(!is_valid_git_ref("has\ttab"), "contains tab");
+        assert!(!is_valid_git_ref("has;semi"), "contains semicolon");
+        assert!(!is_valid_git_ref("has$dollar"), "contains dollar");
+        assert!(!is_valid_git_ref("has`backtick"), "contains backtick");
+    }
+
+    #[test]
+    fn test_is_valid_branch_name() {
+        // Valid branch names
+        assert!(is_valid_branch_name("main"));
+        assert!(is_valid_branch_name("feature/foo"));
+        assert!(is_valid_branch_name("fix-bug-123"));
+        assert!(is_valid_branch_name("v1.0.0"));
+        assert!(is_valid_branch_name("my_branch"));
+
+        // Invalid branch names (stricter than git ref)
+        assert!(!is_valid_branch_name(""), "empty string");
+        assert!(!is_valid_branch_name("bad..ref"), "contains ..");
+        assert!(!is_valid_branch_name("-leading-dash"), "leading dash");
+        assert!(!is_valid_branch_name(".leading-dot"), "leading dot");
+        assert!(!is_valid_branch_name("trailing-dot."), "trailing dot");
+        assert!(!is_valid_branch_name("branch.lock"), "ends with .lock");
+        assert!(
+            !is_valid_branch_name("with~tilde"),
+            "tilde not allowed in branch names"
+        );
+        assert!(
+            !is_valid_branch_name("with^caret"),
+            "caret not allowed in branch names"
+        );
+        assert!(
+            !is_valid_branch_name("has space"),
+            "space not allowed in branch names"
+        );
     }
 
     #[test]
