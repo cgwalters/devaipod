@@ -181,51 +181,46 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Initialize a minimal git repo in the given directory with one commit.
+///
+/// Creates a README.md, sets user config, and makes an initial commit.
+fn init_git_repo(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let _ = Command::new("git").args(["init"]).current_dir(dir).output();
+    let _ = Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(dir)
+        .output();
+    let _ = Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir)
+        .output();
+    let readme = dir.join("README.md");
+    if !readme.exists() {
+        std::fs::write(&readme, "# test\n")?;
+    }
+    let _ = Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir)
+        .output();
+    let _ = Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(dir)
+        .output();
+    Ok(())
+}
+
 /// Start the pod-api binary on a given port, pointing at a mock opencode.
 ///
 /// Returns the child process. Caller is responsible for killing it.
 fn start_pod_api(pod_api_port: u16, opencode_port: u16) -> Result<std::process::Child> {
-    let binary = get_devaipod_binary_path()?;
     let workspace = std::env::temp_dir().join("devaipod-integration-test-workspace");
-    std::fs::create_dir_all(&workspace)?;
+    init_git_repo(&workspace)?;
 
-    // Initialize a minimal git repo so the git watcher doesn't error
-    let git_dir = workspace.join(".git");
-    if !git_dir.exists() {
-        let _ = Command::new("git")
-            .args(["init"])
-            .current_dir(&workspace)
-            .output();
-        let _ = Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&workspace)
-            .output();
-        let _ = Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&workspace)
-            .output();
-        let readme = workspace.join("README.md");
-        if !readme.exists() {
-            std::fs::write(&readme, "# test\n")?;
-        }
-        let _ = Command::new("git")
-            .args(["add", "."])
-            .current_dir(&workspace)
-            .output();
-        let _ = Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&workspace)
-            .output();
-    }
-
-    // Override the state directory so the admin token and completion status
-    // files are written under the workspace (the default /var/lib/devaipod/
-    // requires root, which we don't have in local dev / devaipod-in-devaipod).
-    // Pre-create it because the pod-api avoids create_dir_all at runtime
-    // (mkdir on overlayfs can EPERM when capabilities are dropped).
     let state_dir = workspace.join(".devaipod-state");
     std::fs::create_dir_all(&state_dir)?;
 
+    let binary = get_devaipod_binary_path()?;
     let child = Command::new(&binary)
         .args([
             "pod-api",
@@ -245,6 +240,83 @@ fn start_pod_api(pod_api_port: u16, opencode_port: u16) -> Result<std::process::
         .with_context(|| format!("Failed to start {binary} pod-api"))?;
 
     Ok(child)
+}
+
+/// Start pod-api with a specific workspace directory and optional main workspace.
+///
+/// Returns the child process. Caller must keep `workspace` and `main_workspace`
+/// directories alive (e.g. via `tempfile::TempDir`).
+fn start_pod_api_in(
+    pod_api_port: u16,
+    opencode_port: u16,
+    workspace: &std::path::Path,
+    main_workspace: Option<&std::path::Path>,
+) -> Result<std::process::Child> {
+    let state_dir = workspace.join(".devaipod-state");
+    std::fs::create_dir_all(&state_dir)?;
+
+    let binary = get_devaipod_binary_path()?;
+    let mut args = vec![
+        "pod-api".to_string(),
+        "--port".to_string(),
+        pod_api_port.to_string(),
+        "--workspace".to_string(),
+        workspace.to_str().unwrap().to_string(),
+        "--opencode-port".to_string(),
+        opencode_port.to_string(),
+        "--opencode-password".to_string(),
+        String::new(),
+    ];
+    if let Some(mw) = main_workspace {
+        args.push("--main-workspace".to_string());
+        args.push(mw.to_str().unwrap().to_string());
+    }
+
+    let child = Command::new(&binary)
+        .args(&args)
+        .env("DEVAIPOD_STATE_DIR", &state_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to start {binary} pod-api"))?;
+
+    Ok(child)
+}
+
+/// Simple HTTP POST that sends a JSON body and returns the response.
+fn http_post(url: &str, body: &str) -> Result<(u16, String)> {
+    let url_without_scheme = url.strip_prefix("http://").unwrap_or(url);
+    let (host_port, path) = url_without_scheme
+        .split_once('/')
+        .unwrap_or((url_without_scheme, ""));
+
+    let mut stream = std::net::TcpStream::connect(host_port)
+        .with_context(|| format!("connect to {host_port}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    let request = format!(
+        "POST /{path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    let status_line = response.lines().next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+
+    Ok((status_code, body))
 }
 
 /// Simple HTTP GET that returns the response body as a string.
@@ -461,3 +533,347 @@ fn test_pod_api_summary_wire_compatibility() -> Result<()> {
     Ok(())
 }
 integration_test!(test_pod_api_summary_wire_compatibility);
+
+// ---------------------------------------------------------------------------
+// Git endpoint tests
+// ---------------------------------------------------------------------------
+
+/// GET /git/status includes a `branch` field along with `files` and `exit_code`.
+fn test_pod_api_git_status_has_branch() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+    let api_port = free_port()?;
+    let child = start_pod_api(api_port, mock_port)?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    let (status, body) = http_get(&format!("http://127.0.0.1:{api_port}/git/status"))?;
+    assert_eq!(status, 200, "GET /git/status should return 200");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&body).context("response should be valid JSON")?;
+
+    // The workspace has a single commit, so branch should be "main" or "master"
+    let branch = json["branch"]
+        .as_str()
+        .expect("branch should be a string (not detached HEAD)");
+    assert!(
+        branch == "main" || branch == "master",
+        "branch should be 'main' or 'master', got '{branch}'"
+    );
+
+    assert!(
+        json["files"].as_array().is_some(),
+        "response should have files array"
+    );
+    assert!(
+        json["exit_code"].is_number(),
+        "response should have exit_code"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_git_status_has_branch);
+
+/// GET /git/log returns structured commits with expected fields.
+fn test_pod_api_git_log() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+    let api_port = free_port()?;
+    let child = start_pod_api(api_port, mock_port)?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    let (status, body) = http_get(&format!("http://127.0.0.1:{api_port}/git/log"))?;
+    assert_eq!(status, 200, "GET /git/log should return 200");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&body).context("response should be valid JSON")?;
+
+    let commits = json["commits"]
+        .as_array()
+        .expect("response should have commits array");
+    assert!(
+        !commits.is_empty(),
+        "should have at least 1 commit (the init commit)"
+    );
+
+    let first = &commits[0];
+    assert!(first["sha"].as_str().is_some(), "commit should have sha");
+    assert!(
+        first["short_sha"].as_str().is_some(),
+        "commit should have short_sha"
+    );
+    assert!(
+        first["message"].as_str().is_some(),
+        "commit should have message"
+    );
+    assert!(
+        first["author"].as_str().is_some(),
+        "commit should have author"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_git_log);
+
+/// GET /git/diff-range returns per-file diffs between two commits.
+fn test_pod_api_git_diff_range() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+
+    // Create a workspace with two commits so we have a range to diff.
+    let tmp = tempfile::TempDir::new()?;
+    let workspace = tmp.path().join("diff-range-ws");
+    init_git_repo(&workspace)?;
+
+    // Make a second commit that adds a file.
+    std::fs::write(workspace.join("new-file.txt"), "hello\n")?;
+    let _ = Command::new("git")
+        .args(["add", "new-file.txt"])
+        .current_dir(&workspace)
+        .output();
+    let _ = Command::new("git")
+        .args(["commit", "-m", "add new-file"])
+        .current_dir(&workspace)
+        .output();
+
+    let api_port = free_port()?;
+    let child = start_pod_api_in(api_port, mock_port, &workspace, None)?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    // Get the two commit SHAs via /git/log
+    let (status, body) = http_get(&format!("http://127.0.0.1:{api_port}/git/log"))?;
+    assert_eq!(status, 200);
+    let log_json: serde_json::Value = serde_json::from_str(&body)?;
+    let commits = log_json["commits"].as_array().expect("should have commits");
+    assert!(
+        commits.len() >= 2,
+        "expected at least 2 commits, got {}",
+        commits.len()
+    );
+
+    // git log returns newest first, so commits[0] is HEAD, commits[1] is the init.
+    let head_sha = commits[0]["sha"].as_str().unwrap();
+    let base_sha = commits[1]["sha"].as_str().unwrap();
+
+    let (status, body) = http_get(&format!(
+        "http://127.0.0.1:{api_port}/git/diff-range?base={base_sha}&head={head_sha}"
+    ))?;
+    assert_eq!(status, 200, "GET /git/diff-range should return 200");
+
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    let files = json["files"]
+        .as_array()
+        .expect("response should have files array");
+    assert!(!files.is_empty(), "should have at least 1 changed file");
+
+    let file = &files[0];
+    assert!(
+        file["file"].as_str().is_some(),
+        "file entry should have 'file'"
+    );
+    assert!(
+        file["before"].is_string(),
+        "file entry should have 'before'"
+    );
+    assert!(file["after"].is_string(), "file entry should have 'after'");
+    assert!(
+        file["status"].as_str().is_some(),
+        "file entry should have 'status'"
+    );
+    assert!(
+        file["additions"].is_number(),
+        "file entry should have 'additions'"
+    );
+    assert!(
+        file["deletions"].is_number(),
+        "file entry should have 'deletions'"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_git_diff_range);
+
+/// POST /git/fetch-agent returns failure when --main-workspace is not set.
+fn test_pod_api_fetch_agent_no_main_workspace() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+    let api_port = free_port()?;
+    let child = start_pod_api(api_port, mock_port)?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    let (status, body) = http_post(
+        &format!("http://127.0.0.1:{api_port}/git/fetch-agent"),
+        "{}",
+    )?;
+    assert_eq!(status, 200, "POST /git/fetch-agent should return 200");
+
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["success"].as_bool(),
+        Some(false),
+        "should report failure"
+    );
+    let message = json["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("Main workspace not configured"),
+        "message should mention main workspace not configured, got: {message}"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_fetch_agent_no_main_workspace);
+
+/// POST /git/push returns failure when --main-workspace is not set.
+fn test_pod_api_push_no_main_workspace() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+    let api_port = free_port()?;
+    let child = start_pod_api(api_port, mock_port)?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    let (status, body) = http_post(
+        &format!("http://127.0.0.1:{api_port}/git/push"),
+        r#"{"branch": "test"}"#,
+    )?;
+    assert_eq!(status, 200, "POST /git/push should return 200");
+
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["success"].as_bool(),
+        Some(false),
+        "should report failure"
+    );
+    let message = json["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("Main workspace not configured"),
+        "message should mention main workspace not configured, got: {message}"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_push_no_main_workspace);
+
+/// POST /git/create-branch returns failure when --main-workspace is not set.
+fn test_pod_api_create_branch_no_main_workspace() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+    let api_port = free_port()?;
+    let child = start_pod_api(api_port, mock_port)?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    let (status, body) = http_post(
+        &format!("http://127.0.0.1:{api_port}/git/create-branch"),
+        r#"{"branch": "test"}"#,
+    )?;
+    assert_eq!(status, 200, "POST /git/create-branch should return 200");
+
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["success"].as_bool(),
+        Some(false),
+        "should report failure"
+    );
+    let message = json["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("Main workspace not configured"),
+        "message should mention main workspace not configured, got: {message}"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_create_branch_no_main_workspace);
+
+/// POST /git/create-branch rejects invalid ref names with 400.
+fn test_pod_api_create_branch_invalid_ref() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+    let api_port = free_port()?;
+    let child = start_pod_api(api_port, mock_port)?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    let (status, _body) = http_post(
+        &format!("http://127.0.0.1:{api_port}/git/create-branch"),
+        r#"{"branch": "bad..ref"}"#,
+    )?;
+    assert_eq!(
+        status, 400,
+        "POST /git/create-branch with invalid ref should return 400"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_create_branch_invalid_ref);
+
+/// POST /git/fetch-agent succeeds when --main-workspace is set, and the
+/// fetched commits appear in the main workspace.
+fn test_pod_api_fetch_agent_with_main_workspace() -> Result<()> {
+    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+
+    // Create the agent workspace with two commits.
+    let tmp = tempfile::TempDir::new()?;
+    let agent_ws = tmp.path().join("agent-ws");
+    init_git_repo(&agent_ws)?;
+    std::fs::write(agent_ws.join("agent-change.txt"), "from agent\n")?;
+    let _ = Command::new("git")
+        .args(["add", "agent-change.txt"])
+        .current_dir(&agent_ws)
+        .output();
+    let _ = Command::new("git")
+        .args(["commit", "-m", "agent commit"])
+        .current_dir(&agent_ws)
+        .output();
+
+    // Record the agent HEAD sha for later verification.
+    let agent_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&agent_ws)
+        .output()?;
+    let agent_head_sha = String::from_utf8_lossy(&agent_head.stdout)
+        .trim()
+        .to_string();
+
+    // Create the main workspace with its own initial commit.
+    let main_ws = tmp.path().join("main-ws");
+    init_git_repo(&main_ws)?;
+
+    let api_port = free_port()?;
+    let child = start_pod_api_in(api_port, mock_port, &agent_ws, Some(&main_ws))?;
+    let _guard = ProcessGuard::new(child);
+
+    wait_for_port(api_port, Duration::from_secs(30))?;
+
+    // Fetch agent commits into the main workspace.
+    let (status, body) = http_post(
+        &format!("http://127.0.0.1:{api_port}/git/fetch-agent"),
+        "{}",
+    )?;
+    assert_eq!(status, 200, "POST /git/fetch-agent should return 200");
+
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        json["success"].as_bool(),
+        Some(true),
+        "fetch-agent should succeed when main-workspace is configured"
+    );
+
+    // Verify the agent's commit is now reachable in the main workspace.
+    let log_output = Command::new("git")
+        .args(["log", "--all", "--format=%H"])
+        .current_dir(&main_ws)
+        .output()?;
+    let all_shas = String::from_utf8_lossy(&log_output.stdout);
+    assert!(
+        all_shas.contains(&agent_head_sha),
+        "agent HEAD ({agent_head_sha}) should appear in main workspace's git log --all"
+    );
+
+    Ok(())
+}
+integration_test!(test_pod_api_fetch_agent_with_main_workspace);
