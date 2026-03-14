@@ -241,154 +241,281 @@ impl KubeBackend {
         &self,
         spec: &crate::backend::WorkspacePodSpec,
     ) -> k8s_openapi::api::core::v1::Pod {
-        use k8s_openapi::api::core::v1::{
-            Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
-            PersistentVolumeClaimVolumeSource, Pod, PodSpec, Volume, VolumeMount,
-        };
-        use kube::api::ObjectMeta;
+        build_pod_manifest_for_namespace(spec, &self.client.namespace)
+    }
+}
 
-        let labels: std::collections::BTreeMap<String, String> = spec.labels.clone();
-        let annotations: std::collections::BTreeMap<String, String> = spec.annotations.clone();
+/// Build a Pod manifest from a [`WorkspacePodSpec`], targeting the given namespace.
+///
+/// Extracted as a standalone function so unit tests can exercise manifest
+/// generation without constructing a real [`KubeClient`].
+///
+/// Maps our backend-agnostic spec types to native k8s objects including
+/// security contexts, healthcheck probes, and secret references.
+fn build_pod_manifest_for_namespace(
+    spec: &crate::backend::WorkspacePodSpec,
+    namespace: &str,
+) -> k8s_openapi::api::core::v1::Pod {
+    use k8s_openapi::api::core::v1::{
+        Container, EmptyDirVolumeSource, EnvVar, PersistentVolumeClaimVolumeSource, Pod, PodSpec,
+        Volume, VolumeMount,
+    };
+    use kube::api::ObjectMeta;
 
-        // Build volumes
-        let volumes: Vec<Volume> = spec
-            .volumes
-            .iter()
-            .map(|v| {
-                let volume_source = match &v.volume_type {
-                    crate::backend::VolumeType::Persistent => Volume {
-                        name: v.name.clone(),
-                        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                            claim_name: v.name.clone(),
+    let labels: std::collections::BTreeMap<String, String> = spec.labels.clone();
+    let annotations: std::collections::BTreeMap<String, String> = spec.annotations.clone();
+
+    // Build volumes
+    let volumes: Vec<Volume> = spec
+        .volumes
+        .iter()
+        .map(|v| match &v.volume_type {
+            crate::backend::VolumeType::Persistent => Volume {
+                name: v.name.clone(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: v.name.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            crate::backend::VolumeType::Ephemeral => Volume {
+                name: v.name.clone(),
+                empty_dir: Some(EmptyDirVolumeSource::default()),
+                ..Default::default()
+            },
+        })
+        .collect();
+
+    // Build a lookup of secret refs by name for env var injection
+    let secret_map: std::collections::HashMap<&str, &crate::backend::SecretRef> =
+        spec.secrets.iter().map(|s| (s.name.as_str(), s)).collect();
+
+    // Translate container specs
+    let containers: Vec<Container> = spec
+        .containers
+        .iter()
+        .map(|c| translate_container_spec(c, &secret_map))
+        .collect();
+
+    // Translate init containers
+    let init_containers: Option<Vec<Container>> = if spec.init_containers.is_empty() {
+        None
+    } else {
+        Some(
+            spec.init_containers
+                .iter()
+                .map(|ic| {
+                    let env: Vec<EnvVar> = ic
+                        .env
+                        .iter()
+                        .map(|(k, v)| EnvVar {
+                            name: k.clone(),
+                            value: Some(v.clone()),
+                            ..Default::default()
+                        })
+                        .collect();
+
+                    let volume_mounts: Vec<VolumeMount> = ic
+                        .volume_mounts
+                        .iter()
+                        .map(|vm| VolumeMount {
+                            name: vm.volume.clone(),
+                            mount_path: vm.mount_path.clone(),
+                            read_only: Some(vm.read_only),
+                            ..Default::default()
+                        })
+                        .collect();
+
+                    // Init containers that need root get a security context
+                    let security_context = ic.user.as_deref().and_then(|u| {
+                        u.parse::<i64>().ok().map(|uid| {
+                            k8s_openapi::api::core::v1::SecurityContext {
+                                run_as_user: Some(uid),
+                                ..Default::default()
+                            }
+                        })
+                    });
+
+                    Container {
+                        name: ic.name.clone(),
+                        image: Some(ic.image.clone()),
+                        image_pull_policy: Some("IfNotPresent".to_string()),
+                        command: Some(ic.command.clone()),
+                        env: Some(env),
+                        volume_mounts: Some(volume_mounts),
+                        security_context,
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+        )
+    };
+
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(spec.name.clone()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels),
+            annotations: Some(annotations),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            init_containers,
+            containers,
+            volumes: Some(volumes),
+            restart_policy: Some("Never".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Translate a single [`ContainerSpec`] into a k8s Container, including
+/// security context, healthcheck probe, and secret env var references.
+fn translate_container_spec(
+    c: &crate::backend::ContainerSpec,
+    secret_map: &std::collections::HashMap<&str, &crate::backend::SecretRef>,
+) -> k8s_openapi::api::core::v1::Container {
+    use k8s_openapi::api::core::v1::{
+        Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, Probe,
+        SecretKeySelector, VolumeMount,
+    };
+
+    // Plain env vars
+    let mut env: Vec<EnvVar> = c
+        .env
+        .iter()
+        .map(|(k, v)| EnvVar {
+            name: k.clone(),
+            value: Some(v.clone()),
+            ..Default::default()
+        })
+        .collect();
+
+    // Secret-backed env vars: look up each secret ref and translate to
+    // k8s secretKeyRef (the k8s Secret must exist in the namespace).
+    for secret_name in &c.secret_refs {
+        if let Some(secret_ref) = secret_map.get(secret_name.as_str()) {
+            match &secret_ref.injection {
+                crate::backend::SecretInjection::EnvVar { var_name, key } => {
+                    env.push(EnvVar {
+                        name: var_name.clone(),
+                        value_from: Some(EnvVarSource {
+                            secret_key_ref: Some(SecretKeySelector {
+                                name: secret_ref.name.clone(),
+                                key: key.clone(),
+                                optional: Some(true),
+                            }),
                             ..Default::default()
                         }),
                         ..Default::default()
-                    },
-                    crate::backend::VolumeType::Ephemeral => Volume {
-                        name: v.name.clone(),
-                        empty_dir: Some(EmptyDirVolumeSource::default()),
-                        ..Default::default()
-                    },
-                };
-                volume_source
-            })
-            .collect();
-
-        // Translate container specs
-        let containers: Vec<Container> = spec
-            .containers
-            .iter()
-            .map(|c| {
-                let env: Vec<EnvVar> = c
-                    .env
-                    .iter()
-                    .map(|(k, v)| EnvVar {
-                        name: k.clone(),
-                        value: Some(v.clone()),
-                        ..Default::default()
-                    })
-                    .collect();
-
-                let volume_mounts: Vec<VolumeMount> = c
-                    .volume_mounts
-                    .iter()
-                    .map(|vm| VolumeMount {
-                        name: vm.volume.clone(),
-                        mount_path: vm.mount_path.clone(),
-                        read_only: Some(vm.read_only),
-                        ..Default::default()
-                    })
-                    .collect();
-
-                let ports: Option<Vec<ContainerPort>> = if c.ports.is_empty() {
-                    None
-                } else {
-                    Some(
-                        c.ports
-                            .iter()
-                            .map(|p| ContainerPort {
-                                container_port: p.container_port as i32,
-                                name: p.name.clone(),
-                                ..Default::default()
-                            })
-                            .collect(),
-                    )
-                };
-
-                Container {
-                    name: c.name.clone(),
-                    image: Some(c.image.clone()),
-                    image_pull_policy: Some("IfNotPresent".to_string()),
-                    command: c.command.clone(),
-                    env: Some(env),
-                    volume_mounts: Some(volume_mounts),
-                    working_dir: c.workdir.clone(),
-                    ports,
-                    ..Default::default()
+                    });
                 }
-            })
-            .collect();
-
-        // Translate init containers
-        let init_containers: Option<Vec<Container>> = if spec.init_containers.is_empty() {
-            None
-        } else {
-            Some(
-                spec.init_containers
-                    .iter()
-                    .map(|ic| {
-                        let env: Vec<EnvVar> = ic
-                            .env
-                            .iter()
-                            .map(|(k, v)| EnvVar {
-                                name: k.clone(),
-                                value: Some(v.clone()),
-                                ..Default::default()
-                            })
-                            .collect();
-
-                        let volume_mounts: Vec<VolumeMount> = ic
-                            .volume_mounts
-                            .iter()
-                            .map(|vm| VolumeMount {
-                                name: vm.volume.clone(),
-                                mount_path: vm.mount_path.clone(),
-                                read_only: Some(vm.read_only),
-                                ..Default::default()
-                            })
-                            .collect();
-
-                        Container {
-                            name: ic.name.clone(),
-                            image: Some(ic.image.clone()),
-                            image_pull_policy: Some("IfNotPresent".to_string()),
-                            command: Some(ic.command.clone()),
-                            env: Some(env),
-                            volume_mounts: Some(volume_mounts),
-                            ..Default::default()
-                        }
-                    })
-                    .collect(),
-            )
-        };
-
-        Pod {
-            metadata: ObjectMeta {
-                name: Some(spec.name.clone()),
-                namespace: Some(self.client.namespace.clone()),
-                labels: Some(labels),
-                annotations: Some(annotations),
-                ..Default::default()
-            },
-            spec: Some(PodSpec {
-                init_containers,
-                containers,
-                volumes: Some(volumes),
-                restart_policy: Some("Never".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
+                crate::backend::SecretInjection::File { .. } => {
+                    // File-based secrets would need a volume mount; for now we
+                    // log a warning since this path isn't used yet.
+                    tracing::warn!(
+                        secret = %secret_ref.name,
+                        "file-based secret injection not yet supported in k8s backend"
+                    );
+                }
+            }
         }
+    }
+
+    let volume_mounts: Vec<VolumeMount> = c
+        .volume_mounts
+        .iter()
+        .map(|vm| VolumeMount {
+            name: vm.volume.clone(),
+            mount_path: vm.mount_path.clone(),
+            read_only: Some(vm.read_only),
+            ..Default::default()
+        })
+        .collect();
+
+    let ports: Option<Vec<ContainerPort>> = if c.ports.is_empty() {
+        None
+    } else {
+        Some(
+            c.ports
+                .iter()
+                .map(|p| ContainerPort {
+                    container_port: p.container_port as i32,
+                    name: p.name.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        )
+    };
+
+    // TODO: ContainerSpec.user and SecurityContext.security_opts are not yet
+    // translated. user would map to runAsUser in the k8s SecurityContext;
+    // security_opts (SELinux/AppArmor) would map to seLinuxOptions/appArmorProfile.
+    // Currently unused in spec construction, so deferring.
+
+    // Translate security context
+    let security_context = {
+        let sec = &c.security;
+        let has_security =
+            sec.privileged || sec.drop_all_caps || !sec.cap_add.is_empty() || sec.no_new_privileges;
+
+        if has_security {
+            let capabilities = if sec.drop_all_caps || !sec.cap_add.is_empty() {
+                Some(Capabilities {
+                    drop: if sec.drop_all_caps {
+                        Some(vec!["ALL".to_string()])
+                    } else {
+                        None
+                    },
+                    add: if sec.cap_add.is_empty() {
+                        None
+                    } else {
+                        Some(sec.cap_add.clone())
+                    },
+                })
+            } else {
+                None
+            };
+
+            Some(k8s_openapi::api::core::v1::SecurityContext {
+                privileged: if sec.privileged { Some(true) } else { None },
+                capabilities,
+                allow_privilege_escalation: if sec.no_new_privileges {
+                    Some(false)
+                } else {
+                    None
+                },
+                ..Default::default()
+            })
+        } else {
+            None
+        }
+    };
+
+    // Translate healthcheck to liveness probe
+    let liveness_probe = c.healthcheck.as_ref().map(|hc| Probe {
+        exec: Some(ExecAction {
+            command: Some(hc.command.clone()),
+        }),
+        period_seconds: Some(hc.interval_secs as i32),
+        failure_threshold: Some(hc.retries as i32),
+        initial_delay_seconds: Some(hc.initial_delay_secs as i32),
+        ..Default::default()
+    });
+
+    Container {
+        name: c.name.clone(),
+        image: Some(c.image.clone()),
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        command: c.command.clone(),
+        env: Some(env),
+        volume_mounts: Some(volume_mounts),
+        working_dir: c.workdir.clone(),
+        ports,
+        security_context,
+        liveness_probe,
+        ..Default::default()
     }
 }
 
@@ -486,10 +613,15 @@ impl crate::backend::ContainerBackend for KubeBackend {
         pod_name: &str,
         container: &str,
         cmd: &[String],
-        _user: Option<&str>,
-        _workdir: Option<&str>,
+        user: Option<&str>,
+        workdir: Option<&str>,
     ) -> Result<i64> {
-        let (code, _, _) = self.exec_output(pod_name, container, cmd).await?;
+        // k8s exec doesn't natively support user/workdir, so wrap the command
+        // in a shell invocation that handles them. This matches how kubectl does it.
+        let effective_cmd = wrap_exec_cmd(cmd, user, workdir);
+        let (code, _, _) = self
+            .exec_output(pod_name, container, &effective_cmd)
+            .await?;
         Ok(code)
     }
 
@@ -588,6 +720,74 @@ impl crate::backend::ContainerBackend for KubeBackend {
             .await
             .with_context(|| format!("failed to get logs for {pod_name}/{container}"))
     }
+}
+
+/// Wrap an exec command to run with a specific user and/or working directory.
+///
+/// Kubernetes exec doesn't support `--user` or `--workdir` natively (unlike
+/// `podman exec`), so we wrap the command in a shell invocation that uses
+/// `su` for user switching and `cd` for working directory.
+fn wrap_exec_cmd(cmd: &[String], user: Option<&str>, workdir: Option<&str>) -> Vec<String> {
+    match (user, workdir) {
+        (None, None) => cmd.to_vec(),
+        (None, Some(dir)) => {
+            // Just cd to workdir, then exec the command
+            let inner = cmd
+                .iter()
+                .map(|s| shell_escape(s))
+                .collect::<Vec<_>>()
+                .join(" ");
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("cd {} && exec {inner}", shell_escape(dir)),
+            ]
+        }
+        (Some(u), None) => {
+            // Run as a different user via su
+            let inner = cmd
+                .iter()
+                .map(|s| shell_escape(s))
+                .collect::<Vec<_>>()
+                .join(" ");
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "exec su -s /bin/sh {} -c {}",
+                    shell_escape(u),
+                    shell_escape(&inner)
+                ),
+            ]
+        }
+        (Some(u), Some(dir)) => {
+            let inner = cmd
+                .iter()
+                .map(|s| shell_escape(s))
+                .collect::<Vec<_>>()
+                .join(" ");
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "cd {} && exec su -s /bin/sh {} -c {}",
+                    shell_escape(dir),
+                    shell_escape(u),
+                    shell_escape(&inner)
+                ),
+            ]
+        }
+    }
+}
+
+/// Minimal shell escaping: wrap in single quotes, escaping existing single quotes.
+fn shell_escape(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.')
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Convert a k8s Pod object to our backend-agnostic PodInfo.
@@ -707,5 +907,264 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("failed to parse"));
+    }
+
+    /// Verify that security context (drop_all_caps, cap_add, no_new_privileges,
+    /// privileged) is correctly translated to the k8s SecurityContext.
+    #[test]
+    fn test_manifest_security_context() {
+        let spec = crate::backend::WorkspacePodSpec {
+            name: "sec-test".to_string(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            containers: vec![crate::backend::ContainerSpec {
+                name: "locked-down".to_string(),
+                image: "alpine:latest".to_string(),
+                command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                env: Default::default(),
+                volume_mounts: vec![],
+                workdir: None,
+                user: None,
+                security: crate::backend::SecurityContext {
+                    privileged: false,
+                    drop_all_caps: true,
+                    cap_add: vec!["NET_BIND_SERVICE".to_string()],
+                    no_new_privileges: true,
+                    security_opts: vec![],
+                },
+                ports: vec![],
+                healthcheck: None,
+                secret_refs: vec![],
+            }],
+            init_containers: vec![],
+            volumes: vec![],
+            secrets: vec![],
+            self_image: "devaipod:latest".to_string(),
+        };
+
+        let pod = build_pod_manifest_for_namespace(&spec, "test-ns");
+        let containers = pod.spec.as_ref().unwrap().containers.clone();
+        assert_eq!(containers.len(), 1);
+
+        let sc = containers[0]
+            .security_context
+            .as_ref()
+            .expect("should have security context");
+
+        // privileged should not be set (false means omit)
+        assert!(sc.privileged.is_none());
+
+        // caps: drop ALL, add NET_BIND_SERVICE
+        let caps = sc.capabilities.as_ref().expect("should have capabilities");
+        assert_eq!(caps.drop.as_ref().unwrap(), &vec!["ALL".to_string()]);
+        assert_eq!(
+            caps.add.as_ref().unwrap(),
+            &vec!["NET_BIND_SERVICE".to_string()]
+        );
+
+        // no_new_privileges maps to allowPrivilegeEscalation: false
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+    }
+
+    /// Verify that healthcheck specs become k8s liveness probes.
+    #[test]
+    fn test_manifest_healthcheck_probe() {
+        let spec = crate::backend::WorkspacePodSpec {
+            name: "hc-test".to_string(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            containers: vec![crate::backend::ContainerSpec {
+                name: "api".to_string(),
+                image: "devaipod:latest".to_string(),
+                command: None,
+                env: Default::default(),
+                volume_mounts: vec![],
+                workdir: None,
+                user: None,
+                security: Default::default(),
+                ports: vec![crate::backend::PortSpec {
+                    container_port: 8090,
+                    name: Some("api".to_string()),
+                    publish: false,
+                }],
+                healthcheck: Some(crate::backend::HealthcheckSpec {
+                    command: vec![
+                        "curl".to_string(),
+                        "-sf".to_string(),
+                        "http://localhost:8090/healthz".to_string(),
+                    ],
+                    interval_secs: 5,
+                    retries: 3,
+                    initial_delay_secs: 10,
+                }),
+                secret_refs: vec![],
+            }],
+            init_containers: vec![],
+            volumes: vec![],
+            secrets: vec![],
+            self_image: "devaipod:latest".to_string(),
+        };
+
+        let pod = build_pod_manifest_for_namespace(&spec, "test-ns");
+        let container = &pod.spec.as_ref().unwrap().containers[0];
+
+        let probe = container
+            .liveness_probe
+            .as_ref()
+            .expect("should have liveness probe");
+
+        let exec_cmd = probe
+            .exec
+            .as_ref()
+            .expect("probe should use exec")
+            .command
+            .as_ref()
+            .unwrap();
+        assert_eq!(exec_cmd[0], "curl");
+        assert_eq!(probe.period_seconds, Some(5));
+        assert_eq!(probe.failure_threshold, Some(3));
+        assert_eq!(probe.initial_delay_seconds, Some(10));
+    }
+
+    /// Verify that secret refs are translated to k8s secretKeyRef env vars.
+    #[test]
+    fn test_manifest_secret_env_refs() {
+        let spec = crate::backend::WorkspacePodSpec {
+            name: "secret-test".to_string(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            containers: vec![crate::backend::ContainerSpec {
+                name: "agent".to_string(),
+                image: "alpine:latest".to_string(),
+                command: None,
+                env: std::collections::BTreeMap::from([(
+                    "PLAIN_VAR".to_string(),
+                    "plain-value".to_string(),
+                )]),
+                volume_mounts: vec![],
+                workdir: None,
+                user: None,
+                security: Default::default(),
+                ports: vec![],
+                healthcheck: None,
+                secret_refs: vec!["api-key-secret".to_string()],
+            }],
+            init_containers: vec![],
+            volumes: vec![],
+            secrets: vec![crate::backend::SecretRef {
+                name: "api-key-secret".to_string(),
+                injection: crate::backend::SecretInjection::EnvVar {
+                    var_name: "ANTHROPIC_API_KEY".to_string(),
+                    key: "api-key".to_string(),
+                },
+            }],
+            self_image: "devaipod:latest".to_string(),
+        };
+
+        let pod = build_pod_manifest_for_namespace(&spec, "test-ns");
+        let env = pod.spec.as_ref().unwrap().containers[0]
+            .env
+            .as_ref()
+            .unwrap();
+
+        // Should have both the plain env var and the secret-backed one
+        let plain = env.iter().find(|e| e.name == "PLAIN_VAR");
+        assert!(plain.is_some());
+        assert_eq!(plain.unwrap().value.as_deref(), Some("plain-value"));
+
+        let secret_var = env.iter().find(|e| e.name == "ANTHROPIC_API_KEY");
+        assert!(secret_var.is_some(), "should have secret-backed env var");
+        let vf = secret_var.unwrap().value_from.as_ref().unwrap();
+        let skr = vf.secret_key_ref.as_ref().unwrap();
+        assert_eq!(skr.name, "api-key-secret");
+        assert_eq!(skr.key, "api-key");
+        assert_eq!(skr.optional, Some(true));
+    }
+
+    /// Verify that init containers with user="0" get a runAsUser security context.
+    #[test]
+    fn test_manifest_init_container_user() {
+        let spec = crate::backend::WorkspacePodSpec {
+            name: "init-test".to_string(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            containers: vec![crate::backend::ContainerSpec {
+                name: "main".to_string(),
+                image: "alpine:latest".to_string(),
+                command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                env: Default::default(),
+                volume_mounts: vec![],
+                workdir: None,
+                user: None,
+                security: Default::default(),
+                ports: vec![],
+                healthcheck: None,
+                secret_refs: vec![],
+            }],
+            init_containers: vec![crate::backend::InitContainerSpec {
+                name: "setup".to_string(),
+                image: "alpine:latest".to_string(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo hi".to_string(),
+                ],
+                volume_mounts: vec![],
+                env: Default::default(),
+                user: Some("0".to_string()),
+            }],
+            volumes: vec![],
+            secrets: vec![],
+            self_image: "devaipod:latest".to_string(),
+        };
+
+        let pod = build_pod_manifest_for_namespace(&spec, "test-ns");
+        let init = pod.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
+        assert_eq!(init.len(), 1);
+
+        let sc = init[0]
+            .security_context
+            .as_ref()
+            .expect("root init container should have security context");
+        assert_eq!(sc.run_as_user, Some(0));
+    }
+
+    /// Verify wrap_exec_cmd handling for user and workdir.
+    #[test]
+    fn test_wrap_exec_cmd() {
+        // No wrapping needed
+        let cmd = vec!["echo".to_string(), "hello".to_string()];
+        let result = wrap_exec_cmd(&cmd, None, None);
+        assert_eq!(result, cmd);
+
+        // Workdir only
+        let result = wrap_exec_cmd(&cmd, None, Some("/workspaces"));
+        assert_eq!(result[0], "/bin/sh");
+        assert_eq!(result[1], "-c");
+        assert!(result[2].contains("cd /workspaces"));
+        assert!(result[2].contains("echo hello"));
+
+        // User only
+        let result = wrap_exec_cmd(&cmd, Some("user"), None);
+        assert_eq!(result[0], "/bin/sh");
+        assert!(result[2].contains("su"));
+        assert!(result[2].contains("user"));
+
+        // Both
+        let result = wrap_exec_cmd(&cmd, Some("user"), Some("/workspaces"));
+        assert!(result[2].contains("cd /workspaces"));
+        assert!(result[2].contains("su"));
+    }
+
+    /// Verify shell_escape handles safe and unsafe strings.
+    #[test]
+    fn test_shell_escape() {
+        // Safe strings pass through
+        assert_eq!(shell_escape("hello"), "hello");
+        assert_eq!(shell_escape("/usr/bin/echo"), "/usr/bin/echo");
+
+        // Unsafe strings are quoted
+        assert_eq!(shell_escape("hello world"), "'hello world'");
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
     }
 }
