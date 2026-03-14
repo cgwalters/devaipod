@@ -67,6 +67,10 @@ fn state_dir() -> PathBuf {
 struct AppState {
     /// Path to the workspace root (default `/workspaces`).
     workspace: Arc<PathBuf>,
+    /// Path to the main (trusted) workspace for fetch/push operations.
+    /// When present, write operations (fetch, push, create-branch) run
+    /// against this directory. Read operations still use the agent workspace.
+    main_workspace: Option<Arc<PathBuf>>,
     /// Broadcast sender for git filesystem change events.
     git_events_tx: broadcast::Sender<GitEvent>,
     /// PTY session manager.
@@ -93,6 +97,9 @@ struct GitStatusResponse {
     exit_code: i32,
     output: String,
     files: Vec<GitStatusFile>,
+    /// Current branch name (e.g. "main", "feature-xyz").
+    /// `None` if HEAD is detached.
+    branch: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,6 +182,18 @@ struct GitPushRequest {
 
 #[derive(Debug, Serialize)]
 struct GitPushResponse {
+    success: bool,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCreateBranchRequest {
+    /// Branch name to create/update (e.g. "fix-xyz").
+    branch: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GitCreateBranchResponse {
     success: bool,
     message: String,
 }
@@ -367,12 +386,44 @@ const DIFF_RANGE_MAX_FILES: usize = 100;
 // Git command helpers
 // ---------------------------------------------------------------------------
 
-/// Run a git command in the workspace directory and return (exit_code, stdout, stderr).
+/// Run a git command in the agent workspace directory and return (exit_code, stdout, stderr).
+///
+/// The agent workspace's `.git/config` is controlled by the agent, so it may
+/// contain hostile entries (fsmonitor, hooks, credential helpers, etc.) that
+/// achieve code execution when git reads them.  We neutralize all known RCE
+/// vectors via `-c` overrides and environment variables.
 async fn run_git(workspace: &PathBuf, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     let output = Command::new("git")
         // The workspace is bind-mounted into the container and may be owned by a
         // different UID than the pod-api process. Tell git to trust it regardless;
         // we're inside a container where the mount was deliberate.
+        .args(["-c", "safe.directory=*"])
+        // Hardened config: neutralize agent-controlled .git/config entries
+        // that could achieve code execution as root.
+        .args(["-c", "core.fsmonitor=false"]) // Prevents RCE via git status/diff
+        .args(["-c", "core.hooksPath=/dev/null"]) // Disables all git hooks
+        .args(["-c", "credential.helper="]) // Prevents credential helper RCE
+        .args(["-c", "protocol.ext.allow=never"]) // Blocks ext:: transport commands
+        .args(["-c", "protocol.file.allow=never"]) // Blocks local path traversal
+        .args(["-c", "diff.external="]) // Prevents external diff program execution
+        .env("GIT_TERMINAL_PROMPT", "0") // Prevents interactive prompts
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .await
+        .with_context(|| format!("Failed to spawn git {}", args.first().unwrap_or(&"")))?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    Ok((exit_code, output.stdout, output.stderr))
+}
+
+/// Run a git command in the trusted main workspace directory.
+///
+/// The main workspace has its `.git/config` set up by our clone scripts;
+/// the agent has no write access.  Only `safe.directory=*` is needed here
+/// (unlike `run_git()` which fully hardens against hostile config).
+async fn run_git_trusted(workspace: &PathBuf, args: &[&str]) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    let output = Command::new("git")
         .args(["-c", "safe.directory=*"])
         .args(args)
         .current_dir(workspace)
@@ -390,12 +441,15 @@ async fn run_git(workspace: &PathBuf, args: &[&str]) -> Result<(i32, Vec<u8>, Ve
 
 /// `GET /git/status` — `git status --porcelain`
 async fn git_status(State(state): State<AppState>) -> Result<Json<GitStatusResponse>, StatusCode> {
-    let (exit_code, stdout, _stderr) = run_git(&state.workspace, &["status", "--porcelain"])
-        .await
-        .map_err(|e| {
-            tracing::error!("git status failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let (status_result, branch_result) = tokio::join!(
+        run_git(&state.workspace, &["status", "--porcelain"]),
+        run_git(&state.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]),
+    );
+
+    let (exit_code, stdout, _stderr) = status_result.map_err(|e| {
+        tracing::error!("git status failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let output = String::from_utf8_lossy(&stdout).to_string();
 
@@ -409,10 +463,23 @@ async fn git_status(State(state): State<AppState>) -> Result<Json<GitStatusRespo
         })
         .collect();
 
+    let branch = match branch_result {
+        Ok((0, stdout, _)) => {
+            let name = String::from_utf8_lossy(&stdout).trim().to_string();
+            if name == "HEAD" {
+                None
+            } else {
+                Some(name)
+            }
+        }
+        _ => None,
+    };
+
     Ok(Json(GitStatusResponse {
         exit_code,
         output,
         files,
+        branch,
     }))
 }
 
@@ -751,6 +818,7 @@ async fn git_diff_range(
 /// Fetch the content of multiple files at a given git ref, concurrently.
 ///
 /// Returns a map from file path to content. Missing files map to empty strings.
+/// Uses `run_git()` (hardened) because this reads from the agent workspace.
 #[allow(clippy::ptr_arg)] // PathBuf needed: spawned tasks clone it, &Path would require 'static
 async fn fetch_file_contents(
     workspace: &PathBuf,
@@ -767,13 +835,8 @@ async fn fetch_file_contents(
         let ref_path = format!("{git_ref}:{file}");
         let file_owned = file.to_string();
         tasks.push(tokio::spawn(async move {
-            let output = Command::new("git")
-                .args(["show", &ref_path])
-                .current_dir(&ws)
-                .output()
-                .await;
-            let content = match output {
-                Ok(o) if o.status.success() => String::from_utf8(o.stdout)
+            let content = match run_git(&ws, &["show", &ref_path]).await {
+                Ok((0, stdout, _)) => String::from_utf8(stdout)
                     .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
                 _ => String::new(),
             };
@@ -790,19 +853,40 @@ async fn fetch_file_contents(
     map
 }
 
-/// `POST /git/fetch-agent` — `git fetch agent`
+/// `POST /git/fetch-agent` — fetch agent commits into the main workspace.
+///
+/// Runs `git fetch <agent-workspace-path>` in the main workspace to pull
+/// the agent's latest commits. This uses the local filesystem transport,
+/// which is safe because git is content-addressed (see security docs).
 async fn git_fetch_agent(
     State(state): State<AppState>,
 ) -> Result<Json<GitFetchResponse>, (StatusCode, String)> {
-    let (exit_code, _stdout, stderr) = run_git(&state.workspace, &["fetch", "agent"])
-        .await
-        .map_err(|e| {
-            tracing::error!("git fetch agent failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to run git fetch agent: {e}"),
-            )
-        })?;
+    let main_ws = match &state.main_workspace {
+        Some(ws) => ws.clone(),
+        None => {
+            return Ok(Json(GitFetchResponse {
+                success: false,
+                message: "Main workspace not configured (--main-workspace not set)".to_string(),
+            }));
+        }
+    };
+
+    // Fetch from the agent workspace path into the main workspace.
+    // Using the filesystem path directly is safe: git verifies every
+    // object matches its SHA hash via the local transport.
+    let agent_ws_str = state.workspace.to_string_lossy().to_string();
+    let (exit_code, _stdout, stderr) = run_git_trusted(
+        &main_ws,
+        &["fetch", &agent_ws_str, "+refs/heads/*:refs/remotes/agent/*"],
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("git fetch agent failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to run git fetch: {e}"),
+        )
+    })?;
 
     if exit_code != 0 {
         let stderr_text = String::from_utf8_lossy(&stderr);
@@ -814,11 +898,14 @@ async fn git_fetch_agent(
 
     Ok(Json(GitFetchResponse {
         success: true,
-        message: "Fetched latest agent commits".to_string(),
+        message: "Fetched latest agent commits into main workspace".to_string(),
     }))
 }
 
-/// `POST /git/push` — `git push origin <branch>`
+/// `POST /git/push` — push a branch from the main workspace to origin.
+///
+/// Operates on the main workspace which has push credentials (GH_TOKEN).
+/// The agent workspace never has push access.
 async fn git_push(
     State(state): State<AppState>,
     Json(body): Json<GitPushRequest>,
@@ -830,7 +917,17 @@ async fn git_push(
         ));
     }
 
-    let (exit_code, _stdout, stderr) = run_git(&state.workspace, &["push", "origin", &body.branch])
+    let main_ws = match &state.main_workspace {
+        Some(ws) => ws.clone(),
+        None => {
+            return Ok(Json(GitPushResponse {
+                success: false,
+                message: "Main workspace not configured (--main-workspace not set)".to_string(),
+            }));
+        }
+    };
+
+    let (exit_code, _stdout, stderr) = run_git_trusted(&main_ws, &["push", "origin", &body.branch])
         .await
         .map_err(|e| {
             tracing::error!("git push failed: {e}");
@@ -851,6 +948,123 @@ async fn git_push(
     Ok(Json(GitPushResponse {
         success: true,
         message: format!("Pushed branch '{}' to origin", body.branch),
+    }))
+}
+
+/// `POST /git/create-branch` — fetch agent commits + push as a new branch.
+///
+/// This is the combined operation for the autonomous flow: the agent calls
+/// this to get its commits pushed to origin under a named branch. It:
+/// 1. Fetches from the agent workspace into the main workspace
+/// 2. Creates/updates a local branch pointing at the fetched HEAD
+/// 3. Pushes the branch to origin
+async fn git_create_branch(
+    State(state): State<AppState>,
+    Json(body): Json<GitCreateBranchRequest>,
+) -> Result<Json<GitCreateBranchResponse>, (StatusCode, String)> {
+    if !is_valid_git_ref(&body.branch) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid branch name: {}", body.branch),
+        ));
+    }
+
+    let main_ws = match &state.main_workspace {
+        Some(ws) => ws.clone(),
+        None => {
+            return Ok(Json(GitCreateBranchResponse {
+                success: false,
+                message: "Main workspace not configured (--main-workspace not set)".to_string(),
+            }));
+        }
+    };
+
+    // Step 1: Fetch agent commits into main workspace
+    let agent_ws_str = state.workspace.to_string_lossy().to_string();
+    let (exit_code, _stdout, stderr) = run_git_trusted(
+        &main_ws,
+        &["fetch", &agent_ws_str, "+refs/heads/*:refs/remotes/agent/*"],
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("git fetch for create-branch failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to fetch agent commits: {e}"),
+        )
+    })?;
+
+    if exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        return Ok(Json(GitCreateBranchResponse {
+            success: false,
+            message: format!("Failed to fetch agent commits: {stderr_text}"),
+        }));
+    }
+
+    // Step 2: Determine the agent's current HEAD branch.
+    // Read the agent's HEAD to find which branch to track.
+    let (exit_code, stdout, _stderr) =
+        run_git(&state.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to read agent HEAD: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to read agent HEAD: {e}"),
+                )
+            })?;
+
+    let agent_branch = if exit_code == 0 {
+        String::from_utf8_lossy(&stdout).trim().to_string()
+    } else {
+        "HEAD".to_string()
+    };
+
+    // Step 3: Create/update the branch in main workspace at the fetched ref
+    let agent_ref = format!("refs/remotes/agent/{}", agent_branch);
+    let (exit_code, _stdout, stderr) =
+        run_git_trusted(&main_ws, &["branch", "-f", &body.branch, &agent_ref])
+            .await
+            .map_err(|e| {
+                tracing::error!("git branch failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create branch: {e}"),
+                )
+            })?;
+
+    if exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        return Ok(Json(GitCreateBranchResponse {
+            success: false,
+            message: format!("Failed to create branch '{}': {stderr_text}", body.branch),
+        }));
+    }
+
+    // Step 4: Push the branch to origin
+    let (exit_code, _stdout, stderr) =
+        run_git_trusted(&main_ws, &["push", "-f", "origin", &body.branch])
+            .await
+            .map_err(|e| {
+                tracing::error!("git push failed: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to push branch: {e}"),
+                )
+            })?;
+
+    if exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        return Ok(Json(GitCreateBranchResponse {
+            success: false,
+            message: format!("Failed to push branch '{}': {stderr_text}", body.branch),
+        }));
+    }
+
+    Ok(Json(GitCreateBranchResponse {
+        success: true,
+        message: format!("Created and pushed branch '{}'", body.branch),
     }))
 }
 
@@ -2423,6 +2637,11 @@ pub(crate) struct PodApiArgs {
     /// Path to the workspace directory
     #[arg(long, default_value = "/workspaces")]
     workspace: PathBuf,
+    /// Path to the main (trusted) workspace directory for fetch/push operations.
+    /// When set, POST /git/fetch-agent and POST /git/push operate on this
+    /// directory rather than the agent workspace.
+    #[arg(long)]
+    main_workspace: Option<PathBuf>,
     /// Name of the workspace container to exec into for PTY sessions.
     #[arg(long)]
     workspace_container: Option<String>,
@@ -2458,6 +2677,7 @@ fn build_router(state: AppState) -> Router {
         .route("/git/events", get(git_events_sse))
         .route("/git/fetch-agent", post(git_fetch_agent))
         .route("/git/push", post(git_push))
+        .route("/git/create-branch", post(git_create_branch))
         // Gator scope management
         .route(
             "/gator/scopes",
@@ -2543,8 +2763,11 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
     let git_events_tx = GitWatcher::spawn(Arc::clone(&workspace));
     let admin_token = load_or_generate_admin_token().context("Failed to initialize admin token")?;
 
+    let main_workspace = args.main_workspace.map(Arc::new);
+
     let state = AppState {
         workspace,
+        main_workspace,
         git_events_tx,
         pty_sessions: PtySessionManager::new(),
         workspace_container: args.workspace_container.unwrap_or_default(),
@@ -2971,6 +3194,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(16);
         let state = AppState {
             workspace: Arc::new(workspace.to_path_buf()),
+            main_workspace: None,
             git_events_tx: tx,
             pty_sessions: PtySessionManager::new(),
             workspace_container: String::new(),
