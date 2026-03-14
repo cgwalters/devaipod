@@ -138,7 +138,6 @@ pub struct GitRepoInfo {
     /// Current commit SHA (full 40-character hash)
     pub commit_sha: String,
     /// Current branch name (None if detached HEAD)
-    #[allow(dead_code)] // Useful for future features like branch-based workspace naming
     pub branch: Option<String>,
     /// Whether the working tree has uncommitted changes
     pub is_dirty: bool,
@@ -290,6 +289,20 @@ fn get_current_branch(project_path: &Path) -> Option<String> {
     None
 }
 
+/// Generate the git checkout command, preferring branch checkout over detached HEAD.
+///
+/// When a branch name is available, uses `git checkout -B <branch> <sha>` to create
+/// (or reset) a local branch at the given commit. This avoids detached HEAD state,
+/// which is confusing for agents and users working in the container.
+///
+/// When no branch is known, creates a `devaipod-work` branch rather than
+/// leaving HEAD detached, since detached HEAD confuses agents that need
+/// to commit.
+fn checkout_cmd(commit: &str, branch: Option<&str>) -> String {
+    let branch = branch.unwrap_or("devaipod-work");
+    format!(r#"git checkout -B "{branch}" "{commit}" 2>&1"#)
+}
+
 /// Generate a shell script to clone and checkout a repository from remote
 ///
 /// Note: For local repos, prefer `clone_from_local_script` which clones from
@@ -309,6 +322,8 @@ pub fn clone_script(git_info: &GitRepoInfo, workspace_folder: &str) -> Result<St
         )
     })?;
 
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+
     let script = format!(
         r#"
 set -e
@@ -320,14 +335,14 @@ git clone "{url}" "{workspace}" 2>&1
 
 cd "{workspace}"
 
-# Checkout the exact commit
-git checkout "{commit}" 2>&1
+# Checkout the exact commit (on a branch when possible to avoid detached HEAD)
+{checkout}
 
 echo "Repository cloned successfully at commit {short_commit}"
 "#,
         url = remote_url,
         workspace = workspace_folder,
-        commit = git_info.commit_sha,
+        checkout = checkout,
         short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
     );
 
@@ -381,6 +396,8 @@ git remote add {REMOTE_FORK} "{fork_url}" 2>/dev/null || git remote set-url {REM
         String::new()
     };
 
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+
     format!(
         r#"
 set -e
@@ -396,14 +413,14 @@ git clone --no-hardlinks /mnt/host-git "{workspace}" 2>&1
 
 cd "{workspace}"
 
-# Checkout the exact commit
-git checkout "{commit}" 2>&1
+# Checkout the exact commit (on a branch when possible to avoid detached HEAD)
+{checkout}
 {setup_remote}
 {fork_remote_setup}{chown_cmd}
 echo "Repository cloned successfully at commit {short_commit}"
 "#,
         workspace = workspace_folder,
-        commit = git_info.commit_sha,
+        checkout = checkout,
         short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
         setup_remote = setup_remote,
         fork_remote_setup = fork_remote_setup,
@@ -452,6 +469,8 @@ git remote add {REMOTE_FORK} "{fork_url}" 2>/dev/null || git remote set-url {REM
         String::new()
     };
 
+    let checkout = checkout_cmd(&pr_info.head_sha, Some(&pr_info.head_ref));
+
     format!(
         r#"
 set -e
@@ -463,8 +482,8 @@ git clone --branch "{branch}" "{clone_url}" "{workspace}" 2>&1
 
 cd "{workspace}"
 
-# Checkout the exact commit
-git checkout "{commit}" 2>&1
+# Checkout the exact commit (on the PR branch to avoid detached HEAD)
+{checkout}
 
 # Set 'origin' to point to the upstream repo (where PR merges to)
 git remote set-url {REMOTE_ORIGIN} "{upstream_url}"
@@ -476,7 +495,7 @@ echo "PR #{number} cloned successfully at commit {short_commit}"
         workspace = workspace_folder,
         clone_url = clone_url,
         branch = pr_info.head_ref,
-        commit = pr_info.head_sha,
+        checkout = checkout,
         short_commit = &pr_info.head_sha[..pr_info.head_sha.len().min(8)],
         upstream_url = upstream_url,
         fork_remote_setup = fork_remote_setup,
@@ -658,6 +677,8 @@ git remote set-url origin "{url}" 2>/dev/null || git remote add origin "{url}"
         String::new()
     };
 
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+
     format!(
         r#"
 set -e
@@ -672,8 +693,8 @@ git config --global --add safe.directory "{reference}"
 
 cd "{workspace}"
 
-# Checkout the exact commit from the main workspace
-git checkout "{commit}" 2>&1
+# Checkout the exact commit from the main workspace (on a branch when possible to avoid detached HEAD)
+{checkout}
 {setup_remote}
 {chown_cmd}
 echo "Agent workspace cloned successfully at commit {short_commit}"
@@ -681,7 +702,7 @@ echo "Agent workspace cloned successfully at commit {short_commit}"
         workspace = workspace_folder,
         reference = reference_git_path,
         clone_source = clone_source,
-        commit = git_info.commit_sha,
+        checkout = checkout,
         setup_remote = setup_remote,
         short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
         chown_cmd = target_user
@@ -765,6 +786,8 @@ git remote add {REMOTE_OWNER} "{reference}/.git" 2>/dev/null || git remote set-u
         )
     };
 
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+
     format!(
         r#"
 set -e
@@ -777,8 +800,8 @@ git config --global --add safe.directory "{reference}"
 
 {clone_source}
 
-# Checkout the exact commit from the task owner's workspace
-git checkout "{commit}" 2>&1
+# Checkout the exact commit from the task owner's workspace (on a branch when possible to avoid detached HEAD)
+{checkout}
 {setup_remotes}
 {chown_cmd}
 echo "Worker workspace cloned successfully at commit {short_commit}"
@@ -786,7 +809,7 @@ echo "Worker workspace cloned successfully at commit {short_commit}"
         workspace = workspace_folder,
         reference = reference_git_path,
         clone_source = clone_source,
-        commit = git_info.commit_sha,
+        checkout = checkout,
         setup_remotes = setup_remotes,
         short_commit = &git_info.commit_sha[..git_info.commit_sha.len().min(8)],
         chown_cmd = target_user

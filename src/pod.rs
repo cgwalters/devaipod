@@ -63,6 +63,15 @@ impl WorkspaceSource {
         }
     }
 
+    /// Get the branch name for this workspace source.
+    pub fn branch_name(&self) -> Option<String> {
+        match self {
+            WorkspaceSource::LocalRepo(git_info) => git_info.branch.clone(),
+            WorkspaceSource::RemoteRepo(remote_info) => Some(remote_info.default_branch.clone()),
+            WorkspaceSource::PullRequest(pr_info) => Some(pr_info.head_ref.clone()),
+        }
+    }
+
     /// Get a short description for logging
     pub fn description(&self) -> String {
         match self {
@@ -366,6 +375,8 @@ pub struct DevaipodPod {
     pub enable_orchestration: bool,
     /// Upstream repository URL (for prompt context)
     pub repo_url: Option<String>,
+    /// Git branch name in the workspace
+    pub branch: Option<String>,
 }
 
 impl DevaipodPod {
@@ -1069,6 +1080,7 @@ impl DevaipodPod {
             enable_gator,
             enable_orchestration,
             repo_url: source.upstream_url(),
+            branch: source.branch_name(),
         })
     }
 
@@ -1732,6 +1744,7 @@ chmod 644 '{config_path}'
             enable_gator,
             self.enable_orchestration,
             self.repo_url.as_deref(),
+            self.branch.as_deref(),
         );
 
         let task_file_path = format!("{}/{}", AGENT_HOME_PATH, task_file);
@@ -1834,8 +1847,12 @@ CONFIG_EOF"#,
         // that omits orchestration instructions (the worker is the leaf executor).
         if self.enable_orchestration {
             let worker_task_file = ".config/opencode/devaipod-task-worker.md";
-            let worker_task_content =
-                crate::prompt::generate_worker_prompt(task, enable_gator, self.repo_url.as_deref());
+            let worker_task_content = crate::prompt::generate_worker_prompt(
+                task,
+                enable_gator,
+                self.repo_url.as_deref(),
+                self.branch.as_deref(),
+            );
             let worker_task_script = format!(
                 r#"cat > '{agent_home}/{worker_task_file}' << 'TASK_EOF'
 {worker_task_content}

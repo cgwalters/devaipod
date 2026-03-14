@@ -8,12 +8,20 @@ use crate::pod::{AGENT_HOME_PATH, WORKER_OPENCODE_PORT};
 
 /// Format git context section for inclusion in prompts.
 ///
-/// When a repo URL is available, produces a line like:
-/// `## Context\n\ngit: https://github.com/owner/repo.git`
-fn format_git_context(repo_url: Option<&str>) -> String {
-    match repo_url {
-        Some(url) => format!("\n## Context\n\ngit: {url}\n", url = url,),
-        None => String::new(),
+/// Produces a `## Context` block with repository URL and branch information.
+/// When no branch is detected, falls back to `devaipod-work` as the branch name.
+fn format_git_context(repo_url: Option<&str>, branch: Option<&str>) -> String {
+    match (repo_url, branch) {
+        (Some(url), Some(branch)) => format!(
+            "\n## Context\n\nRepository: {url}\nBranch: `{branch}`\n\nYour workspace is checked out on the `{branch}` branch. Commit your work to this branch.\n",
+        ),
+        (Some(url), None) => format!(
+            "\n## Context\n\nRepository: {url}\nBranch: `devaipod-work`\n\nYour workspace is on the `devaipod-work` branch (no upstream branch was detected). Commit your work to this branch.\n",
+        ),
+        (None, Some(branch)) => format!(
+            "\n## Context\n\nBranch: `{branch}`\n\nYour workspace is checked out on the `{branch}` branch. Commit your work to this branch.\n",
+        ),
+        (None, None) => "\n## Context\n\nBranch: `devaipod-work`\n\nYour workspace is on the `devaipod-work` branch. Commit your work to this branch.\n".to_string(),
     }
 }
 
@@ -198,7 +206,12 @@ git log --oneline -5  # Show recent commits
 ///
 /// The worker is the leaf executor -- it should implement changes directly,
 /// not try to delegate further. This prompt omits all orchestration instructions.
-pub fn generate_worker_prompt(task: &str, enable_gator: bool, repo_url: Option<&str>) -> String {
+pub fn generate_worker_prompt(
+    task: &str,
+    enable_gator: bool,
+    repo_url: Option<&str>,
+    branch: Option<&str>,
+) -> String {
     let gator_instructions = if enable_gator {
         r#"
 ## IMPORTANT: GitHub/GitLab Operations
@@ -211,7 +224,7 @@ The `gh` and `glab` CLI tools are NOT available in this environment.
         String::new()
     };
 
-    let git_context = format_git_context(repo_url);
+    let git_context = format_git_context(repo_url, branch);
 
     format!(
         r#"# devaipod Worker Task
@@ -253,6 +266,7 @@ pub fn generate_system_prompt(
     enable_gator: bool,
     enable_orchestration: bool,
     repo_url: Option<&str>,
+    branch: Option<&str>,
 ) -> String {
     // Build service-gator instructions if enabled
     let gator_instructions = if enable_gator {
@@ -274,7 +288,7 @@ The `gh` and `glab` CLI tools are NOT available in this environment.
         String::new()
     };
 
-    let git_context = format_git_context(repo_url);
+    let git_context = format_git_context(repo_url, branch);
 
     format!(
         r#"# devaipod Task
@@ -386,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_generate_system_prompt_basic() {
-        let prompt = generate_system_prompt("Fix the bug", false, false, None);
+        let prompt = generate_system_prompt("Fix the bug", false, false, None, None);
         assert!(prompt.contains("Fix the bug"), "Should contain task");
         assert!(prompt.contains("# devaipod Task"), "Should have header");
         assert!(
@@ -398,8 +412,8 @@ mod tests {
             "Should not mention orchestration when disabled"
         );
         assert!(
-            !prompt.contains("## Context"),
-            "Should not have context section without repo URL"
+            prompt.contains("## Context"),
+            "Should always have context section with branch info"
         );
     }
 
@@ -410,17 +424,22 @@ mod tests {
             false,
             false,
             Some("https://github.com/owner/repo.git"),
+            Some("main"),
         );
         assert!(prompt.contains("## Context"), "Should have context section");
         assert!(
-            prompt.contains("git: https://github.com/owner/repo.git"),
+            prompt.contains("Repository: https://github.com/owner/repo.git"),
             "Should contain repo URL"
+        );
+        assert!(
+            prompt.contains("Branch: `main`"),
+            "Should contain branch name"
         );
     }
 
     #[test]
     fn test_generate_system_prompt_with_gator() {
-        let prompt = generate_system_prompt("Fix the bug", true, false, None);
+        let prompt = generate_system_prompt("Fix the bug", true, false, None, None);
         assert!(
             prompt.contains("service-gator"),
             "Should mention service-gator when enabled"
@@ -433,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_generate_system_prompt_with_orchestration() {
-        let prompt = generate_system_prompt("Implement feature", false, true, None);
+        let prompt = generate_system_prompt("Implement feature", false, true, None, None);
         assert!(
             prompt.contains("Multi-Agent Orchestration"),
             "Should include orchestration section"
@@ -450,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_generate_system_prompt_with_both() {
-        let prompt = generate_system_prompt("Complex task", true, true, None);
+        let prompt = generate_system_prompt("Complex task", true, true, None, None);
         assert!(
             prompt.contains("service-gator"),
             "Should mention service-gator"
@@ -467,10 +486,15 @@ mod tests {
             "Implement feature",
             false,
             Some("https://github.com/org/project.git"),
+            Some("develop"),
         );
         assert!(
-            prompt.contains("git: https://github.com/org/project.git"),
+            prompt.contains("Repository: https://github.com/org/project.git"),
             "Worker prompt should contain repo URL"
+        );
+        assert!(
+            prompt.contains("Branch: `develop`"),
+            "Worker prompt should contain branch name"
         );
     }
 }

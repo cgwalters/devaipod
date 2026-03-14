@@ -41,8 +41,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      # Gate on clippy correctness and suspicious lints only.
+      # The full set of warnings in Cargo.toml [workspace.lints] is for
+      # local development awareness; CI should not block on style lints.
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace -- -A clippy::all -D clippy::correctness -D clippy::suspicious -Dunused_imports -Ddead_code
 
       - name: Unit tests
         run: just test

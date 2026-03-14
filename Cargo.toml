@@ -65,6 +65,18 @@ tokio-stream = "0.1.18"
 insta = "1"
 rstest = "0.24"
 
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "forbid"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+dead_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
+
+[lints]
+workspace = true
