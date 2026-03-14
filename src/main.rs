@@ -13,6 +13,8 @@ use color_eyre::eyre::{bail, Context, Result};
 
 #[allow(dead_code)] // MCP server will use these in a follow-up
 mod advisor;
+#[allow(dead_code)] // Preparatory: ContainerBackend trait for kube/podman abstraction
+mod backend;
 mod config;
 mod devcontainer;
 mod forge;

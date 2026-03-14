@@ -214,6 +214,424 @@ fn parse_podman_secret_json(output: &[u8], secret_name: &str) -> Result<String> 
         })
 }
 
+// ---------------------------------------------------------------------------
+// KubeBackend — ContainerBackend implementation for Kubernetes
+// ---------------------------------------------------------------------------
+
+/// Kubernetes implementation of [`ContainerBackend`].
+///
+/// Creates workspace pods as native Kubernetes Pods in the configured
+/// namespace. Init containers, volumes, env vars, and secrets are all
+/// expressed in the Pod manifest. The backend assumes it runs in the same
+/// cluster (in-cluster ServiceAccount or matching kubeconfig).
+#[allow(dead_code)]
+pub struct KubeBackend {
+    client: KubeClient,
+}
+
+#[allow(dead_code)]
+impl KubeBackend {
+    /// Create a new KubeBackend from an established client connection.
+    pub fn new(client: KubeClient) -> Self {
+        Self { client }
+    }
+
+    /// Translate a [`WorkspacePodSpec`] into a Kubernetes Pod manifest.
+    fn build_pod_manifest(
+        &self,
+        spec: &crate::backend::WorkspacePodSpec,
+    ) -> k8s_openapi::api::core::v1::Pod {
+        use k8s_openapi::api::core::v1::{
+            Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
+            PersistentVolumeClaimVolumeSource, Pod, PodSpec, Volume, VolumeMount,
+        };
+        use kube::api::ObjectMeta;
+
+        let labels: std::collections::BTreeMap<String, String> = spec.labels.clone();
+        let annotations: std::collections::BTreeMap<String, String> = spec.annotations.clone();
+
+        // Build volumes
+        let volumes: Vec<Volume> = spec
+            .volumes
+            .iter()
+            .map(|v| {
+                let volume_source = match &v.volume_type {
+                    crate::backend::VolumeType::Persistent => Volume {
+                        name: v.name.clone(),
+                        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                            claim_name: v.name.clone(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    crate::backend::VolumeType::Ephemeral => Volume {
+                        name: v.name.clone(),
+                        empty_dir: Some(EmptyDirVolumeSource::default()),
+                        ..Default::default()
+                    },
+                };
+                volume_source
+            })
+            .collect();
+
+        // Translate container specs
+        let containers: Vec<Container> = spec
+            .containers
+            .iter()
+            .map(|c| {
+                let env: Vec<EnvVar> = c
+                    .env
+                    .iter()
+                    .map(|(k, v)| EnvVar {
+                        name: k.clone(),
+                        value: Some(v.clone()),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                let volume_mounts: Vec<VolumeMount> = c
+                    .volume_mounts
+                    .iter()
+                    .map(|vm| VolumeMount {
+                        name: vm.volume.clone(),
+                        mount_path: vm.mount_path.clone(),
+                        read_only: Some(vm.read_only),
+                        ..Default::default()
+                    })
+                    .collect();
+
+                let ports: Option<Vec<ContainerPort>> = if c.ports.is_empty() {
+                    None
+                } else {
+                    Some(
+                        c.ports
+                            .iter()
+                            .map(|p| ContainerPort {
+                                container_port: p.container_port as i32,
+                                name: p.name.clone(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    )
+                };
+
+                Container {
+                    name: c.name.clone(),
+                    image: Some(c.image.clone()),
+                    image_pull_policy: Some("IfNotPresent".to_string()),
+                    command: c.command.clone(),
+                    env: Some(env),
+                    volume_mounts: Some(volume_mounts),
+                    working_dir: c.workdir.clone(),
+                    ports,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        // Translate init containers
+        let init_containers: Option<Vec<Container>> = if spec.init_containers.is_empty() {
+            None
+        } else {
+            Some(
+                spec.init_containers
+                    .iter()
+                    .map(|ic| {
+                        let env: Vec<EnvVar> = ic
+                            .env
+                            .iter()
+                            .map(|(k, v)| EnvVar {
+                                name: k.clone(),
+                                value: Some(v.clone()),
+                                ..Default::default()
+                            })
+                            .collect();
+
+                        let volume_mounts: Vec<VolumeMount> = ic
+                            .volume_mounts
+                            .iter()
+                            .map(|vm| VolumeMount {
+                                name: vm.volume.clone(),
+                                mount_path: vm.mount_path.clone(),
+                                read_only: Some(vm.read_only),
+                                ..Default::default()
+                            })
+                            .collect();
+
+                        Container {
+                            name: ic.name.clone(),
+                            image: Some(ic.image.clone()),
+                            image_pull_policy: Some("IfNotPresent".to_string()),
+                            command: Some(ic.command.clone()),
+                            env: Some(env),
+                            volume_mounts: Some(volume_mounts),
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
+            )
+        };
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(spec.name.clone()),
+                namespace: Some(self.client.namespace.clone()),
+                labels: Some(labels),
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                init_containers,
+                containers,
+                volumes: Some(volumes),
+                restart_policy: Some("Never".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::backend::ContainerBackend for KubeBackend {
+    async fn create_workspace_pod(
+        &self,
+        spec: &crate::backend::WorkspacePodSpec,
+    ) -> Result<String> {
+        use kube::api::PostParams;
+
+        let pod = self.build_pod_manifest(spec);
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(self.client.client.clone(), &self.client.namespace);
+
+        let created = pods
+            .create(&PostParams::default(), &pod)
+            .await
+            .context("failed to create workspace pod in Kubernetes")?;
+
+        let name = created.metadata.name.unwrap_or_else(|| spec.name.clone());
+        tracing::info!(pod = %name, namespace = %self.client.namespace, "created workspace pod");
+        Ok(name)
+    }
+
+    async fn start_pod(&self, _name: &str) -> Result<()> {
+        // No-op in Kubernetes: pods start on creation
+        Ok(())
+    }
+
+    async fn stop_pod(&self, name: &str) -> Result<()> {
+        // In k8s, stopping = deleting (pods are ephemeral)
+        self.remove_pod(name, true, false).await
+    }
+
+    async fn remove_pod(&self, name: &str, force: bool, _remove_volumes: bool) -> Result<()> {
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(self.client.client.clone(), &self.client.namespace);
+
+        let dp = if force {
+            kube::api::DeleteParams {
+                grace_period_seconds: Some(0),
+                ..Default::default()
+            }
+        } else {
+            kube::api::DeleteParams::default()
+        };
+
+        match pods.delete(name, &dp).await {
+            Ok(_) => {
+                tracing::info!(pod = %name, "deleted workspace pod");
+                Ok(())
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                tracing::debug!(pod = %name, "pod already deleted");
+                Ok(())
+            }
+            Err(e) => Err(e).context(format!("failed to delete pod '{name}'")),
+        }
+    }
+
+    async fn list_pods(&self, labels: Option<&str>) -> Result<Vec<crate::backend::PodInfo>> {
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(self.client.client.clone(), &self.client.namespace);
+
+        let lp = if let Some(selector) = labels {
+            kube::api::ListParams::default().labels(selector)
+        } else {
+            kube::api::ListParams::default()
+        };
+
+        let pod_list = pods.list(&lp).await.context("failed to list pods")?;
+
+        Ok(pod_list
+            .items
+            .into_iter()
+            .map(|p| kube_pod_to_info(&p))
+            .collect())
+    }
+
+    async fn get_pod_info(&self, name: &str) -> Result<crate::backend::PodInfo> {
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(self.client.client.clone(), &self.client.namespace);
+
+        let pod = pods
+            .get(name)
+            .await
+            .with_context(|| format!("pod '{name}' not found"))?;
+
+        Ok(kube_pod_to_info(&pod))
+    }
+
+    async fn exec(
+        &self,
+        pod_name: &str,
+        container: &str,
+        cmd: &[String],
+        _user: Option<&str>,
+        _workdir: Option<&str>,
+    ) -> Result<i64> {
+        let (code, _, _) = self.exec_output(pod_name, container, cmd).await?;
+        Ok(code)
+    }
+
+    async fn exec_output(
+        &self,
+        pod_name: &str,
+        container: &str,
+        cmd: &[String],
+    ) -> Result<(i64, Vec<u8>, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(self.client.client.clone(), &self.client.namespace);
+
+        let ap = kube::api::AttachParams {
+            container: Some(container.to_string()),
+            stdin: false,
+            stdout: true,
+            stderr: true,
+            tty: false,
+            ..Default::default()
+        };
+
+        let mut attached = pods
+            .exec(pod_name, cmd, &ap)
+            .await
+            .with_context(|| format!("exec into {pod_name}/{container} failed"))?;
+
+        // Take status future before consuming streams
+        let status_future = attached
+            .take_status()
+            .ok_or_else(|| color_eyre::eyre::eyre!("no status channel from exec"))?;
+
+        // Collect stdout
+        let mut stdout = Vec::new();
+        if let Some(mut stream) = attached.stdout() {
+            stream.read_to_end(&mut stdout).await.ok();
+        }
+
+        // Collect stderr
+        let mut stderr = Vec::new();
+        if let Some(mut stream) = attached.stderr() {
+            stream.read_to_end(&mut stderr).await.ok();
+        }
+
+        // Wait for status
+        let status = status_future.await;
+        let code = status
+            .and_then(|s| {
+                s.status
+                    .as_deref()
+                    .map(|st| if st == "Success" { 0i64 } else { 1i64 })
+            })
+            .unwrap_or(1);
+
+        Ok((code, stdout, stderr))
+    }
+
+    async fn pod_api_endpoint(&self, pod_name: &str) -> Result<String> {
+        // In k8s, we use the pod's cluster IP with the well-known port.
+        // The pod-api sidecar always listens on 8090.
+        let pod_ip = {
+            let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+                kube::Api::namespaced(self.client.client.clone(), &self.client.namespace);
+            let pod = pods
+                .get(pod_name)
+                .await
+                .with_context(|| format!("failed to get pod '{pod_name}' for endpoint"))?;
+            pod.status
+                .and_then(|s| s.pod_ip)
+                .ok_or_else(|| color_eyre::eyre::eyre!("pod '{pod_name}' has no IP yet"))?
+        };
+        Ok(format!("{pod_ip}:8090"))
+    }
+
+    async fn logs(
+        &self,
+        pod_name: &str,
+        container: &str,
+        follow: bool,
+        tail: Option<u64>,
+    ) -> Result<String> {
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(self.client.client.clone(), &self.client.namespace);
+
+        let mut lp = kube::api::LogParams {
+            container: Some(container.to_string()),
+            follow,
+            ..Default::default()
+        };
+        if let Some(n) = tail {
+            lp.tail_lines = Some(n as i64);
+        }
+
+        pods.logs(pod_name, &lp)
+            .await
+            .with_context(|| format!("failed to get logs for {pod_name}/{container}"))
+    }
+}
+
+/// Convert a k8s Pod object to our backend-agnostic PodInfo.
+fn kube_pod_to_info(pod: &k8s_openapi::api::core::v1::Pod) -> crate::backend::PodInfo {
+    let metadata = &pod.metadata;
+    let status = pod.status.as_ref();
+
+    let phase = status.and_then(|s| s.phase.as_deref()).unwrap_or("Unknown");
+
+    let pod_status = match phase {
+        "Running" => crate::backend::PodStatus::Running,
+        "Succeeded" | "Stopped" => crate::backend::PodStatus::Stopped,
+        "Failed" => crate::backend::PodStatus::Failed,
+        "Pending" => crate::backend::PodStatus::Pending,
+        other => crate::backend::PodStatus::Unknown(other.to_string()),
+    };
+
+    let containers = status
+        .and_then(|s| s.container_statuses.as_ref())
+        .map(|statuses| {
+            statuses
+                .iter()
+                .map(|cs| crate::backend::ContainerInfo {
+                    name: cs.name.clone(),
+                    running: cs
+                        .state
+                        .as_ref()
+                        .map(|s| s.running.is_some())
+                        .unwrap_or(false),
+                    image: cs.image.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    crate::backend::PodInfo {
+        name: metadata.name.clone().unwrap_or_default(),
+        status: pod_status,
+        labels: metadata.labels.clone().unwrap_or_default(),
+        annotations: metadata.annotations.clone().unwrap_or_default(),
+        containers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
