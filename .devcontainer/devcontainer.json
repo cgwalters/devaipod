@@ -12,6 +12,9 @@
     }
   },
   "features": {},
+  // Expose the control plane web UI (default port 8080) to the host
+  // so `devaipod web` is reachable from a browser during development.
+  "forwardPorts": [8080],
   "runArgs": [
     // Minimal security options for nested podman (avoids --privileged):
     // - label=disable: Required for mounting /proc in nested user namespace
