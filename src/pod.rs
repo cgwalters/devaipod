@@ -377,6 +377,8 @@ pub struct DevaipodPod {
     pub repo_url: Option<String>,
     /// Git branch name in the workspace
     pub branch: Option<String>,
+    /// Whether forwardPorts were configured in devcontainer.json
+    pub has_forwarded_ports: bool,
 }
 
 impl DevaipodPod {
@@ -599,7 +601,21 @@ impl DevaipodPod {
         // devaipod control-plane container can reach it via host.containers.internal.
         // The opencode server port (4096) is NOT published — the pod-api sidecar
         // proxies to it internally via localhost within the pod network namespace.
-        let publish_ports = vec![format!("0.0.0.0::{}", POD_API_PORT)];
+        let mut publish_ports = vec![format!("0.0.0.0::{}", POD_API_PORT)];
+
+        // Publish ports declared in devcontainer.json forwardPorts.
+        // These are published at pod creation time so they're available immediately.
+        // All containers in the pod share the network namespace, so forwards work
+        // regardless of which container is listening.
+        let forwarded = config.publish_port_specs();
+        let has_forwarded_ports = !forwarded.is_empty();
+        if has_forwarded_ports {
+            tracing::info!(
+                "Publishing {} forwarded port(s) from devcontainer.json",
+                forwarded.len()
+            );
+            publish_ports.extend(forwarded);
+        }
 
         podman
             .create_pod(pod_name, &labels, &publish_ports)
@@ -1081,6 +1097,7 @@ impl DevaipodPod {
             enable_orchestration,
             repo_url: source.upstream_url(),
             branch: source.branch_name(),
+            has_forwarded_ports,
         })
     }
 
@@ -1092,6 +1109,18 @@ impl DevaipodPod {
             .with_context(|| format!("Failed to start pod: {}", self.pod_name))?;
 
         tracing::debug!("Started pod '{}'", self.pod_name);
+
+        if self.has_forwarded_ports {
+            let short_name = self
+                .pod_name
+                .strip_prefix("devaipod-")
+                .unwrap_or(&self.pod_name);
+            tracing::info!(
+                "Forwarded ports configured — run `devaipod status {}` to see host port mappings",
+                short_name
+            );
+        }
+
         Ok(())
     }
 

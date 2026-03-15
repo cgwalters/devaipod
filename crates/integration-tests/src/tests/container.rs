@@ -1883,3 +1883,58 @@ podman_integration_test!(test_gator_mcp_api_accessible);
 // Approach: Could add a test mode where opencode is replaced with a simple
 // HTTP server that records requests. The `send_message_async` function could
 // be tested by checking the detached process is spawned correctly.
+
+// ---------------------------------------------------------------------------
+// forwardPorts
+// ---------------------------------------------------------------------------
+
+/// Verify that `forwardPorts` in devcontainer.json causes the port to be
+/// published on the pod's infra container.
+fn test_forward_ports_published() -> Result<()> {
+    let image = std::env::var("DEVAIPOD_TEST_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/bootc-dev/devenv-debian:latest".to_string());
+    let devcontainer_json = format!(
+        r#"{{
+            "name": "forward-ports-test",
+            "image": "{}",
+            "forwardPorts": [9876]
+        }}"#,
+        image
+    );
+    let repo = TestRepo::new_with_devcontainer(&devcontainer_json)?;
+    let pod_name = unique_test_name("test-fwd-port");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+    )?;
+    if !output.success() {
+        bail!("devaipod up failed: {}", output.combined());
+    }
+
+    // Port 9876 should be published to a random host port
+    let host_port = get_published_port(&pod_name, 9876)
+        .context("forwardPorts port 9876 should be published")?;
+    assert!(
+        host_port > 0,
+        "Port 9876 should be mapped to a non-zero host port, got {}",
+        host_port
+    );
+
+    // The pod-api port (8090) should still be published too
+    let api_port = get_published_port(&pod_name, 8090)
+        .context("Pod-api port 8090 should still be published")?;
+    assert!(api_port > 0, "Pod-api port should still be published");
+
+    // The two host ports should be different
+    assert_ne!(
+        host_port, api_port,
+        "Forwarded port and pod-api port should be on different host ports"
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_forward_ports_published);

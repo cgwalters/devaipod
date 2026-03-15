@@ -618,6 +618,82 @@ async fn get_pod_api_port(pod_name: &str) -> Result<u16, StatusCode> {
         })
 }
 
+/// Get all published port mappings for a pod, excluding infrastructure ports.
+///
+/// Returns a list of `ForwardedPort` pairs (container_port, host_port).
+/// The pod-api internal port (8090) is excluded since it's infrastructure.
+async fn get_pod_forwarded_ports(pod_name: &str) -> Vec<ForwardedPort> {
+    use bollard::Docker;
+
+    let socket_path = match get_container_socket() {
+        Ok(p) => p,
+        Err(_) => return vec![],
+    };
+
+    let docker = match Docker::connect_with_unix(
+        &format!("unix://{}", socket_path.display()),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    ) {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
+
+    let info = match docker
+        .inspect_container(&format!("{pod_name}-agent"), None)
+        .await
+    {
+        Ok(i) => i,
+        Err(_) => return vec![],
+    };
+
+    let ports = match info
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.ports.as_ref())
+    {
+        Some(p) => p,
+        None => return vec![],
+    };
+
+    let api_port = crate::pod::POD_API_PORT;
+    let mut result = Vec::new();
+
+    for (container_port_key, bindings) in ports {
+        // Parse "8080/tcp" format
+        let container_port: u16 = match container_port_key
+            .split('/')
+            .next()
+            .and_then(|p| p.parse().ok())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Skip the pod-api infrastructure port
+        if container_port == api_port {
+            continue;
+        }
+
+        if let Some(bindings) = bindings {
+            for binding in bindings {
+                if let Some(host_port) = binding
+                    .host_port
+                    .as_ref()
+                    .and_then(|p| p.parse::<u16>().ok())
+                {
+                    result.push(ForwardedPort {
+                        container_port,
+                        host_port,
+                    });
+                }
+            }
+        }
+    }
+
+    result
+}
+
 /// Low-level HTTP proxy: connect to `host:port`, forward `request`,
 /// and return the response with the HTTP version normalized to 1.1.
 ///
@@ -1680,6 +1756,16 @@ struct UnifiedPodInfo {
     agent_status: Option<AgentStatusResponse>,
     /// Whether the pod's sidecar image is outdated
     needs_update: bool,
+    /// Forwarded ports from devcontainer.json `forwardPorts`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    forwarded_ports: Vec<ForwardedPort>,
+}
+
+/// A single forwarded port mapping (container port → host port).
+#[derive(Debug, Clone, Serialize)]
+struct ForwardedPort {
+    container_port: u16,
+    host_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1811,10 +1897,12 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
         let pod_name = pod.name.clone();
 
         let task = tokio::spawn(async move {
-            let agent_status = if is_running {
-                fetch_agent_status_for_pod(&client, &host, &pod_name).await
+            let (agent_status, forwarded_ports) = if is_running {
+                let status = fetch_agent_status_for_pod(&client, &host, &pod_name).await;
+                let ports = get_pod_forwarded_ports(&pod_name).await;
+                (status, ports)
             } else {
-                None
+                (None, vec![])
             };
 
             UnifiedPodInfo {
@@ -1825,6 +1913,7 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
                 containers: pod.containers,
                 agent_status,
                 needs_update: pod.needs_update,
+                forwarded_ports,
             }
         });
 
