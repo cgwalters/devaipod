@@ -369,12 +369,39 @@ container-run: container-build
     SOCKET=""
     if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
         SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
+    elif [ -n "${DOCKER_HOST:-}" ]; then
+        # Honor DOCKER_HOST (e.g. set by auto-spawned podman service)
+        SOCKET="${DOCKER_HOST#unix://}"
+    elif [ -S "/tmp/devaipod-podman-$(id -u)/podman.sock" ]; then
+        # Auto-spawned socket from ensure_podman_socket()
+        SOCKET="/tmp/devaipod-podman-$(id -u)/podman.sock"
     elif command -v podman &>/dev/null; then
         SOCKET=$(podman machine inspect --format '{{_podman_socket_format}}' 2>/dev/null || true)
     fi
+    # Last resort: auto-start podman system service (e.g. in a devcontainer
+    # where no socket is pre-configured). Place the socket at the standard
+    # XDG_RUNTIME_DIR path if available, otherwise under /tmp. The service
+    # runs with --time=0 (no idle timeout) since the container we launch is
+    # long-lived and subsequent just/podman commands should find it too.
     if [ -z "$SOCKET" ] || [ ! -S "$SOCKET" ]; then
-        echo "Could not find podman socket. Linux: set XDG_RUNTIME_DIR. macOS/Windows: run 'podman machine start' and ensure default machine exists."
-        exit 1
+        if command -v podman &>/dev/null; then
+            if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+                SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
+            else
+                SOCKET="/tmp/devaipod-podman-$(id -u)/podman.sock"
+            fi
+            mkdir -p "$(dirname "$SOCKET")"
+            echo "No podman socket found; auto-starting podman system service at $SOCKET..."
+            podman system service --time=0 "unix://$SOCKET" &
+            for i in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.1; done
+            if [ ! -S "$SOCKET" ]; then
+                echo "Failed to start podman socket service"
+                exit 1
+            fi
+        else
+            echo "Could not find podman socket. Linux: set XDG_RUNTIME_DIR. macOS: run 'podman machine start'."
+            exit 1
+        fi
     fi
     echo "Using podman socket: $SOCKET"
     mkdir -p ~/.ssh/config.d/devaipod
@@ -392,14 +419,16 @@ container-run: container-build
     # Target is always /run/docker.sock (well-known path).
     # HOST_SOCKET is passed as DEVAIPOD_HOST_SOCKET so the container can use it as a bind mount
     # source when creating sibling containers (the host podman resolves sources on the host filesystem).
-    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] || [[ "$SOCKET" == /tmp/* ]]; then
+        # Linux (systemd or auto-spawned): use the actual socket path
         HOST_SOCKET="$SOCKET"
         ADD_HOST="--add-host=host.containers.internal:host-gateway"
     else
+        # macOS/podman machine: use the VM-side socket path
         HOST_SOCKET="/run/podman/podman.sock"
         ADD_HOST=""
     fi
-    podman run -d --name devaipod --privileged --replace \
+    podman run -d --name devaipod --security-opt label=disable --replace \
         -p 8080:8080 \
         $ADD_HOST \
         -v "$HOST_SOCKET":/run/docker.sock \
