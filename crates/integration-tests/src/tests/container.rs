@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use xshell::{cmd, Shell};
 
 use crate::{
-    podman_integration_test, readonly_test, run_devaipod, run_devaipod_in, shell, short_name,
-    unique_test_name, PodGuard, SharedFixture, TestRepo,
+    podman_integration_test, readonly_test, run_devaipod, run_devaipod_in,
+    run_devaipod_in_with_env, shell, short_name, unique_test_name, PodGuard, SharedFixture,
+    TestRepo,
 };
 
 /// Host to use when connecting to pod-published ports from the test runner.
@@ -2013,3 +2014,86 @@ fn test_rebuild_reads_workspace_devcontainer() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_rebuild_reads_workspace_devcontainer);
+
+fn test_extra_ca_certs_injected_into_containers() -> Result<()> {
+    let repo = TestRepo::new()?;
+    let pod_name = unique_test_name("test-cacert");
+
+    let mut pods = PodGuard::new();
+    pods.add(&pod_name);
+
+    // Create a fake CA cert PEM file
+    let cert_dir = tempfile::TempDir::new()?;
+    let cert_path = cert_dir.path().join("test-ca.pem");
+    let cert_content = "-----BEGIN CERTIFICATE-----\nTESTCA123\n-----END CERTIFICATE-----\n";
+    std::fs::write(&cert_path, cert_content)?;
+
+    // Create a custom config with the cert
+    let config_dir = tempfile::TempDir::new()?;
+    let config_path = config_dir.path().join("devaipod.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[tls]\nextra_ca_certs = [\"{}\"]\n",
+            cert_path.to_str().unwrap()
+        ),
+    )?;
+
+    // Create pod with custom config
+    let output = run_devaipod_in_with_env(
+        &repo.repo_path,
+        &["up", ".", "--name", short_name(&pod_name)],
+        &[("XDG_CONFIG_HOME", config_dir.path().to_str().unwrap())],
+    )?;
+    if !output.success() {
+        bail!(
+            "devaipod up failed: {}",
+            output.combined()
+        );
+    }
+
+    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
+
+    // Wait for containers to be running
+    crate::wait_for_container_running(&workspace_container, Duration::from_secs(30))?;
+    crate::wait_for_container_running(&agent_container, Duration::from_secs(30))?;
+
+    let sh = shell()?;
+
+    // Check workspace container has SSL_CERT_FILE set
+    let ws_env = cmd!(sh, "podman exec {workspace_container} printenv SSL_CERT_FILE").read()?;
+    assert!(
+        ws_env.contains(".devaipod/ca-bundle.pem"),
+        "workspace SSL_CERT_FILE should point to ca-bundle.pem, got: {}",
+        ws_env
+    );
+
+    // Verify the bundle file exists and contains our cert in the workspace container
+    let ws_bundle = cmd!(sh, "podman exec {workspace_container} cat {ws_env}").read()?;
+    assert!(
+        ws_bundle.contains("TESTCA123"),
+        "workspace CA bundle should contain our test cert, got: {}",
+        ws_bundle
+    );
+
+    // Check agent container has SSL_CERT_FILE set
+    let agent_env = cmd!(sh, "podman exec {agent_container} printenv SSL_CERT_FILE").read()?;
+    assert!(
+        agent_env.contains(".devaipod/ca-bundle.pem"),
+        "agent SSL_CERT_FILE should point to ca-bundle.pem, got: {}",
+        agent_env
+    );
+
+    // Also verify GIT_SSL_CAINFO is set (important for git clone with self-signed certs)
+    let git_env =
+        cmd!(sh, "podman exec {workspace_container} printenv GIT_SSL_CAINFO").read()?;
+    assert!(
+        git_env.contains(".devaipod/ca-bundle.pem"),
+        "workspace GIT_SSL_CAINFO should point to ca-bundle.pem, got: {}",
+        git_env
+    );
+
+    Ok(())
+}
+podman_integration_test!(test_extra_ca_certs_injected_into_containers);
