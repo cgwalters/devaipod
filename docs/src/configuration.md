@@ -110,6 +110,37 @@ This lets you run `devaipod up forgejo.example.com/team/project` without
 typing the full URL. SSH URLs (`git@host:owner/repo.git`) are also
 automatically converted to HTTPS regardless of this setting.
 
+## TLS / Custom CA Certificates
+
+If your git hosting provider uses a self-signed or internal CA certificate
+(e.g., a private GitLab instance), configure extra CA certs so that all pod
+containers trust them:
+
+```toml
+[tls]
+extra_ca_certs = ["/certs/my-corp-ca.pem"]
+```
+
+Each entry is a path to a PEM-encoded certificate file (may contain multiple
+certificates). The certificates are injected into all pod containers
+(workspace, agent, service-gator, worker) via environment variables so that
+git, curl, Python, Node.js, and other tools trust the extra CAs.
+
+When running devaipod as a container, you must bind-mount the certificate
+files into the devaipod container:
+
+```bash
+podman run -d --name devaipod -p 8080:8080 --privileged \
+  -v /etc/pki/ca-trust/source/anchors/my-corp-ca.pem:/certs/my-corp-ca.pem:ro \
+  -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
+  -v $SOCKET:/run/docker.sock \
+  -e DEVAIPOD_HOST_SOCKET=$SOCKET \
+  ghcr.io/cgwalters/devaipod
+```
+
+The `extra_ca_certs` paths in the config must match the container-side mount
+paths (e.g., `/certs/my-corp-ca.pem` in the example above).
+
 ## Per-Project Configuration
 
 Projects use standard `devcontainer.json` with optional devaipod customizations:

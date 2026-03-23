@@ -256,6 +256,44 @@ const GATOR_IMAGE: &str = "ghcr.io/cgwalters/service-gator:latest";
 // (see detect_own_container_image() in main.rs for the pattern).
 const DEVAIPOD_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
 
+/// Relative path (under .devaipod/) where the extra CA bundle is written in workspace volumes.
+const CA_BUNDLE_RELATIVE_PATH: &str = ".devaipod/ca-bundle.pem";
+
+/// Prepend CA certificate setup to a shell script so that git clone works with
+/// self-signed hosts. Writes the PEM bundle to a temp file and sets GIT_SSL_CAINFO.
+fn prepend_ca_cert_setup(script: &str, ca_bundle: &str) -> String {
+    let escaped = ca_bundle.replace('\'', "'\\''");
+    format!(
+        r#"# Set up extra CA certificates for git
+_ca_bundle=$(mktemp)
+cat > "$_ca_bundle" << 'DEVAIPOD_CA_EOF'
+{escaped}
+DEVAIPOD_CA_EOF
+export GIT_SSL_CAINFO="$_ca_bundle"
+export SSL_CERT_FILE="$_ca_bundle"
+
+{script}"#
+    )
+}
+
+/// Inject environment variables for extra CA certificates into a container's env map.
+///
+/// The agent workspace volume is mounted at different paths in different containers,
+/// so `workspace_mount` specifies where the volume containing the CA bundle is mounted.
+/// This sets env vars so that common tools trust the extra CAs:
+///
+/// - `SSL_CERT_FILE` — OpenSSL (used by curl, git, Python, Ruby, etc.)
+/// - `REQUESTS_CA_BUNDLE` — Python `requests` library
+/// - `NODE_EXTRA_CA_CERTS` — Node.js (additive, doesn't replace system CAs)
+/// - `GIT_SSL_CAINFO` — git (overrides default CA bundle for HTTPS remotes)
+fn inject_ca_cert_env(env: &mut std::collections::HashMap<String, String>, workspace_mount: &str) {
+    let bundle_path = format!("{}/{}", workspace_mount, CA_BUNDLE_RELATIVE_PATH);
+    env.insert("SSL_CERT_FILE".to_string(), bundle_path.clone());
+    env.insert("REQUESTS_CA_BUNDLE".to_string(), bundle_path.clone());
+    env.insert("NODE_EXTRA_CA_CERTS".to_string(), bundle_path.clone());
+    env.insert("GIT_SSL_CAINFO".to_string(), bundle_path);
+}
+
 /// Detect the image ID (digest) of the running control plane container.
 /// Returns None when not running inside a container.
 pub(crate) async fn detect_self_image_id() -> Option<String> {
@@ -497,6 +535,9 @@ impl DevaipodPod {
         // Resolve container home based on effective user
         let container_home = Self::resolve_container_home_for_user(effective_user.as_deref());
 
+        // Read extra CA certificates (if configured) for use during git clone
+        let ca_bundle = global_config.tls.read_ca_bundle()?;
+
         // Create workspace volume and clone repo into it
         let volume_name = format!("{}-workspace", pod_name);
         let volume_already_exists = podman.volume_exists(&volume_name).await?;
@@ -549,6 +590,13 @@ impl DevaipodPod {
                     );
                     (script, vec![])
                 }
+            };
+
+            // Wrap clone script with CA cert setup if extra certs are configured
+            let clone_script = if let Some(ref bundle) = ca_bundle {
+                prepend_ca_cert_setup(&clone_script, bundle)
+            } else {
+                clone_script
             };
 
             let exit_code = podman
@@ -726,6 +774,13 @@ impl DevaipodPod {
             // Mount main workspace volume read-only as reference for git --reference clone
             let extra_binds = vec![format!("{}:/mnt/main-workspace:ro", volume_name)];
 
+            // Wrap clone script with CA cert setup if extra certs are configured
+            let clone_script = if let Some(ref bundle) = ca_bundle {
+                prepend_ca_cert_setup(&clone_script, bundle)
+            } else {
+                clone_script
+            };
+
             tracing::debug!("Cloning agent workspace with reference to main workspace...");
             let exit_code = podman
                 .run_init_container(
@@ -762,6 +817,18 @@ impl DevaipodPod {
                 &image,
                 &agent_workspace_volume,
                 &jwt_scopes,
+            )
+            .await?;
+        }
+
+        // Write extra CA certificates to workspace volume (if configured)
+        // These are mounted in all containers so git, curl, etc. trust self-signed hosts
+        if let Some(ref bundle) = ca_bundle {
+            Self::write_ca_bundle_to_volume(
+                podman,
+                &image,
+                &agent_workspace_volume,
+                bundle,
             )
             .await?;
         }
@@ -913,6 +980,13 @@ impl DevaipodPod {
                     format!("{}:/mnt/owner-workspace:ro", agent_workspace_volume),
                     format!("{}:/mnt/main-workspace:ro", volume_name),
                 ];
+
+                // Wrap clone script with CA cert setup if extra certs are configured
+                let clone_script = if let Some(ref bundle) = ca_bundle {
+                    prepend_ca_cert_setup(&clone_script, bundle)
+                } else {
+                    clone_script
+                };
 
                 tracing::debug!(
                     "Cloning worker workspace with reference to task owner workspace..."
@@ -1694,6 +1768,53 @@ chmod 644 '{config_path}'
         Ok(())
     }
 
+    /// Write extra CA certificates to the agent workspace volume.
+    ///
+    /// Reads the configured `[tls] extra_ca_certs` PEM files, concatenates them,
+    /// and writes the bundle to the workspace volume at `.devaipod/ca-bundle.pem`.
+    /// All containers in the pod mount this volume and get env vars pointing to
+    /// the bundle so that git, curl, Python, Node.js, etc. trust the extra CAs.
+    async fn write_ca_bundle_to_volume(
+        podman: &PodmanService,
+        image: &str,
+        workspace_volume: &str,
+        ca_bundle: &str,
+    ) -> Result<()> {
+        let escaped = ca_bundle.replace('\'', "'\\''");
+        let bundle_path = format!("/workspaces/{}", CA_BUNDLE_RELATIVE_PATH);
+
+        let script = format!(
+            r#"set -e
+mkdir -p "$(dirname '{bundle_path}')"
+cat > '{bundle_path}' << 'CA_BUNDLE_EOF'
+{escaped}
+CA_BUNDLE_EOF
+chmod 644 '{bundle_path}'
+"#,
+        );
+
+        tracing::debug!("Writing CA certificate bundle to workspace volume...");
+        let exit_code = podman
+            .run_init_container_as_root(
+                image,
+                workspace_volume,
+                "/workspaces",
+                &["/bin/sh", "-c", &script],
+            )
+            .await
+            .context("Failed to write CA bundle to workspace volume")?;
+
+        if exit_code != 0 {
+            bail!(
+                "Failed to write CA bundle to volume (exit code {})",
+                exit_code
+            );
+        }
+
+        tracing::info!("Extra CA certificates written to {}", bundle_path);
+        Ok(())
+    }
+
     /// Clone dotfiles repository to the agent home volume before containers start
     ///
     /// This uses a one-shot init container with access to GH_TOKEN for private repos.
@@ -2221,6 +2342,11 @@ fi
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
         let file_secrets = global_config.trusted_env.file_secret_mounts();
 
+        // Inject extra CA cert env vars (workspace mounts agent-workspace at /mnt/agent-workspace)
+        if !global_config.tls.extra_ca_certs.is_empty() {
+            inject_ca_cert_env(&mut env, "/mnt/agent-workspace");
+        }
+
         ContainerConfig {
             mounts,
             env,
@@ -2552,6 +2678,11 @@ exec sleep infinity
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
         let file_secrets = global_config.trusted_env.file_secret_mounts();
 
+        // Inject extra CA cert env vars (agent mounts agent-workspace at /workspaces)
+        if !global_config.tls.extra_ca_certs.is_empty() {
+            inject_ca_cert_env(&mut env, "/workspaces");
+        }
+
         let startup_script = format!(
             r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
 
@@ -2697,6 +2828,11 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         // Get file-based secrets (mounted as files, env var points to path)
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
         let file_secrets = global_config.trusted_env.file_secret_mounts();
+
+        // Inject extra CA cert env vars (gator mounts agent-workspace at workspace_folder)
+        if !global_config.tls.extra_ca_certs.is_empty() {
+            inject_ca_cert_env(&mut env, workspace_folder);
+        }
 
         // The scope config file path inside the gator container
         // Config is at /workspaces/.devaipod/gator-config.json (same path as where it's written)
@@ -2983,6 +3119,11 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
                     );
                 }
             }
+        }
+
+        // Inject extra CA cert env vars (worker mounts agent-workspace at /mnt/owner-workspace)
+        if !global_config.tls.extra_ca_certs.is_empty() {
+            inject_ca_cert_env(&mut env, "/mnt/owner-workspace");
         }
 
         // Build MCP config combining service-gator and any additional MCP servers

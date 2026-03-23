@@ -98,6 +98,10 @@ pub struct Config {
     /// Git-related configuration
     #[serde(default)]
     pub git: GitConfig,
+
+    /// TLS configuration (extra CA certificates for self-signed hosts)
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 /// Git-related configuration
@@ -116,6 +120,58 @@ pub struct GitConfig {
     /// ```
     #[serde(default)]
     pub extra_hosts: Vec<String>,
+}
+
+/// TLS configuration for custom CA certificates
+///
+/// Used to trust self-signed or internal CA certificates for git hosting
+/// providers (e.g., a private GitLab instance with a self-signed cert).
+///
+/// The specified PEM files are concatenated into a CA bundle and written
+/// to each pod's workspace volume. Environment variables are set so that
+/// git, curl, Python, Node.js, and other tools trust the extra CAs.
+///
+/// Example configuration:
+/// ```toml
+/// [tls]
+/// extra_ca_certs = ["/etc/pki/ca-trust/source/anchors/my-corp-ca.pem"]
+/// ```
+///
+/// When running devaipod as a container, the cert files must be
+/// bind-mounted into the devaipod container (e.g., `-v /path/to/cert.pem:/certs/cert.pem:ro`)
+/// and the config must reference the container-side path.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Paths to PEM-encoded CA certificate files to trust in pod containers.
+    /// Each file may contain one or more certificates.
+    #[serde(default)]
+    pub extra_ca_certs: Vec<String>,
+}
+
+impl TlsConfig {
+    /// Read and concatenate all configured CA certificate files into a single PEM bundle.
+    ///
+    /// Returns `None` if no extra CA certs are configured.
+    /// Returns an error if any configured file cannot be read.
+    pub fn read_ca_bundle(&self) -> Result<Option<String>> {
+        if self.extra_ca_certs.is_empty() {
+            return Ok(None);
+        }
+
+        let mut bundle = String::new();
+        for path_str in &self.extra_ca_certs {
+            let path = Path::new(path_str);
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read CA certificate file: {}", path_str))?;
+            if !bundle.is_empty() && !bundle.ends_with('\n') {
+                bundle.push('\n');
+            }
+            bundle.push_str(&contents);
+        }
+
+        Ok(Some(bundle))
+    }
 }
 
 /// Configuration for binding paths from host home to container home
@@ -2366,5 +2422,53 @@ extra_hosts = []
         let toml = "";
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.git.extra_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_tls_config_default_empty() {
+        let toml = "";
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.tls.extra_ca_certs.is_empty());
+        assert!(config.tls.read_ca_bundle().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_tls_config_parse() {
+        let toml = r#"
+[tls]
+extra_ca_certs = ["/certs/ca1.pem", "/certs/ca2.pem"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.tls.extra_ca_certs.len(), 2);
+        assert_eq!(config.tls.extra_ca_certs[0], "/certs/ca1.pem");
+    }
+
+    #[test]
+    fn test_tls_read_ca_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert1 = dir.path().join("ca1.pem");
+        let cert2 = dir.path().join("ca2.pem");
+        std::fs::write(&cert1, "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        std::fs::write(&cert2, "-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n")
+            .unwrap();
+
+        let tls = TlsConfig {
+            extra_ca_certs: vec![
+                cert1.to_string_lossy().to_string(),
+                cert2.to_string_lossy().to_string(),
+            ],
+        };
+        let bundle = tls.read_ca_bundle().unwrap().unwrap();
+        assert!(bundle.contains("AAA"));
+        assert!(bundle.contains("BBB"));
+    }
+
+    #[test]
+    fn test_tls_read_ca_bundle_missing_file() {
+        let tls = TlsConfig {
+            extra_ca_certs: vec!["/nonexistent/cert.pem".to_string()],
+        };
+        assert!(tls.read_ca_bundle().is_err());
     }
 }
