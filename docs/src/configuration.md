@@ -47,6 +47,14 @@ port = 8765
 [service-gator.gh.repos]
 "myorg/*" = { read = true }
 "myorg/main-project" = { read = true, create-draft = true }
+
+# GitLab scope configuration (optional)
+[service-gator.gitlab]
+host = "gitlab.example.com"  # omit for gitlab.com
+
+[service-gator.gitlab.projects]
+"mygroup/*" = { read = true }
+"mygroup/main-project" = { read = true, create-draft = true }
 ```
 
 ## Using Without devcontainer.json
@@ -199,6 +207,12 @@ devaipod up https://github.com/org/repo --service-gator=github:readonly-all
 
 # Read + draft PR access to specific repo
 devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo:read,create-draft
+
+# GitLab read + draft MR access
+devaipod up https://gitlab.example.com/group/project --service-gator=gitlab:group/project:read,create-draft
+
+# GitLab read-only access to all projects
+devaipod up https://gitlab.example.com/group/project --service-gator=gitlab:readonly-all
 
 # Custom image
 devaipod up https://github.com/org/repo --service-gator=github:myorg/myrepo --service-gator-image localhost/service-gator:dev

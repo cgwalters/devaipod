@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use color_eyre::eyre::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{GhRepoPermission, ServiceGatorConfig};
+use crate::config::{GhRepoPermission, GlProjectPermission, ServiceGatorConfig};
 
 /// Parse CLI service-gator scope strings into a ServiceGatorConfig
 ///
@@ -38,7 +38,10 @@ pub fn parse_scopes(scopes: &[String]) -> Result<ServiceGatorConfig> {
     }
 
     // If any scopes were parsed, enable service-gator
-    if !config.gh.repos.is_empty() || !config.gh.prs.is_empty() || !config.jira.projects.is_empty()
+    if !config.gh.repos.is_empty()
+        || !config.gh.prs.is_empty()
+        || !config.gitlab.projects.is_empty()
+        || !config.jira.projects.is_empty()
     {
         config.enabled = Some(true);
     }
@@ -58,10 +61,7 @@ fn parse_single_scope(scope: &str, config: &mut ServiceGatorConfig) -> Result<()
 
     match service.to_lowercase().as_str() {
         "github" | "gh" => parse_github_scope(rest, config),
-        "gitlab" | "gl" => {
-            // TODO: Add GitLab support when service-gator has it
-            bail!("GitLab scopes not yet supported in CLI: {}", scope);
-        }
+        "gitlab" | "gl" => parse_gitlab_scope(rest, config),
         "jira" => {
             // TODO: Add JIRA support
             bail!("JIRA scopes not yet supported in CLI: {}", scope);
@@ -129,6 +129,84 @@ fn parse_github_scope(rest: &str, config: &mut ServiceGatorConfig) -> Result<()>
     Ok(())
 }
 
+/// Parse a GitLab scope like `readonly-all`, `group/project`, or `group/project:write`
+fn parse_gitlab_scope(rest: &str, config: &mut ServiceGatorConfig) -> Result<()> {
+    if rest == "readonly-all" || rest == "read-all" {
+        config.gitlab.projects.insert(
+            "*/*".to_string(),
+            GlProjectPermission {
+                read: true,
+                ..Default::default()
+            },
+        );
+        return Ok(());
+    }
+
+    let (target, perms_str) = if let Some((t, p)) = rest.rsplit_once(':') {
+        if is_permission_string(p) {
+            (t, Some(p))
+        } else {
+            (rest, None)
+        }
+    } else {
+        (rest, None)
+    };
+
+    let permission = if let Some(perms) = perms_str {
+        parse_gitlab_permissions(perms)?
+    } else {
+        GlProjectPermission {
+            read: true,
+            ..Default::default()
+        }
+    };
+
+    if !target.contains('/') {
+        bail!(
+            "Invalid GitLab target '{}'. Expected 'group/project' or 'group/*' format",
+            target
+        );
+    }
+
+    config.gitlab.projects.insert(target.to_string(), permission);
+    Ok(())
+}
+
+/// Parse comma-separated permission string into GlProjectPermission
+fn parse_gitlab_permissions(perms: &str) -> Result<GlProjectPermission> {
+    let mut permission = GlProjectPermission::default();
+
+    for perm in perms.split(',') {
+        match perm.trim().to_lowercase().as_str() {
+            "read" => permission.read = true,
+            "write" => {
+                permission.read = true;
+                permission.write = true;
+            }
+            "create-draft" | "draft" => {
+                permission.read = true;
+                permission.create_draft = true;
+            }
+            "approve" => {
+                permission.read = true;
+                permission.approve = true;
+            }
+            "push-new-branch" | "push" => {
+                permission.read = true;
+                permission.push_new_branch = true;
+            }
+            other => {
+                bail!(
+                    "Unknown GitLab permission '{}'. Supported: read, write, create-draft, approve, push-new-branch",
+                    other
+                );
+            }
+        }
+    }
+
+    Ok(permission)
+}
+
 /// Check if a string looks like a permission specification
 fn is_permission_string(s: &str) -> bool {
     let known_perms = [
@@ -140,6 +218,7 @@ fn is_permission_string(s: &str) -> bool {
         "review",
         "push-new-branch",
         "push",
+        "approve",
     ];
     s.split(',')
         .all(|p| known_perms.contains(&p.trim().to_lowercase().as_str()))
@@ -214,6 +293,26 @@ pub fn merge_configs(
         merged.gh.issues.insert(key.clone(), value.clone());
     }
 
+    // Merge GitLab projects
+    for (key, value) in &cli_config.gitlab.projects {
+        merged.gitlab.projects.insert(key.clone(), value.clone());
+    }
+
+    // Merge GitLab MRs
+    for (key, value) in &cli_config.gitlab.mrs {
+        merged.gitlab.mrs.insert(key.clone(), value.clone());
+    }
+
+    // Merge GitLab issues
+    for (key, value) in &cli_config.gitlab.issues {
+        merged.gitlab.issues.insert(key.clone(), value.clone());
+    }
+
+    // Merge GitLab host (CLI wins)
+    if cli_config.gitlab.host.is_some() {
+        merged.gitlab.host = cli_config.gitlab.host.clone();
+    }
+
     // Merge JIRA projects
     for (key, value) in &cli_config.jira.projects {
         merged.jira.projects.insert(key.clone(), value.clone());
@@ -263,6 +362,36 @@ pub fn config_to_cli_args(config: &ServiceGatorConfig) -> Vec<String> {
         }
     }
 
+    // Add GitLab host if configured
+    if let Some(ref host) = config.gitlab.host {
+        args.push("--gitlab-host".to_string());
+        args.push(host.clone());
+    }
+
+    // Add GitLab project scopes
+    for (pattern, perm) in &config.gitlab.projects {
+        let mut perms = Vec::new();
+        if perm.read {
+            perms.push("read");
+        }
+        if perm.push_new_branch {
+            perms.push("push-new-branch");
+        }
+        if perm.create_draft {
+            perms.push("create-draft");
+        }
+        if perm.approve {
+            perms.push("approve");
+        }
+        if perm.write {
+            perms.push("write");
+        }
+        if !perms.is_empty() {
+            args.push("--gitlab-project".to_string());
+            args.push(format!("{}:{}", pattern, perms.join(",")));
+        }
+    }
+
     // Add JIRA project scopes
     for (project, perm) in &config.jira.projects {
         let mut perms = Vec::new();
@@ -300,7 +429,8 @@ pub const DEFAULT_TOKEN_EXPIRES_IN: u64 = 30 * 24 * 3600;
 pub struct JwtScopeConfig {
     #[serde(default, skip_serializing_if = "JwtGithubScope::is_empty")]
     pub gh: JwtGithubScope,
-    // TODO: Add gitlab, forgejo, jira when needed
+    #[serde(default, skip_serializing_if = "JwtGitLabScope::is_empty")]
+    pub gitlab: JwtGitLabScope,
 }
 
 /// GitHub scope for JWT tokens
@@ -343,6 +473,52 @@ impl From<&GhRepoPermission> for JwtGhRepoPermission {
             read: p.read,
             create_draft: p.create_draft,
             pending_review: p.pending_review,
+            push_new_branch: p.push_new_branch,
+            write: p.write,
+        }
+    }
+}
+
+/// GitLab scope for JWT tokens
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct JwtGitLabScope {
+    /// Project permissions
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub projects: std::collections::HashMap<String, JwtGlProjectPermission>,
+    /// Host for self-hosted instances
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl JwtGitLabScope {
+    fn is_empty(&self) -> bool {
+        self.projects.is_empty() && self.host.is_none()
+    }
+}
+
+/// GitLab project permission for JWT tokens
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct JwtGlProjectPermission {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_draft: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approve: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub push_new_branch: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write: bool,
+}
+
+impl From<&GlProjectPermission> for JwtGlProjectPermission {
+    fn from(p: &GlProjectPermission) -> Self {
+        Self {
+            read: p.read,
+            create_draft: p.create_draft,
+            approve: p.approve,
             push_new_branch: p.push_new_branch,
             write: p.write,
         }
@@ -393,7 +569,17 @@ pub fn config_to_jwt_scopes(config: &ServiceGatorConfig) -> JwtScopeConfig {
             .insert(pattern.clone(), JwtGhRepoPermission::from(perm));
     }
 
-    JwtScopeConfig { gh }
+    let mut gitlab = JwtGitLabScope::default();
+
+    // Map GitLab project permissions
+    for (pattern, perm) in &config.gitlab.projects {
+        gitlab
+            .projects
+            .insert(pattern.clone(), JwtGlProjectPermission::from(perm));
+    }
+    gitlab.host = config.gitlab.host.clone();
+
+    JwtScopeConfig { gh, gitlab }
 }
 
 /// Mint a JWT token for service-gator (unused - kept for potential future use)
@@ -838,5 +1024,180 @@ mod tests {
         assert!(scopes.gh.read);
         assert!(scopes.gh.repos.contains_key("myorg/myrepo"));
         assert!(scopes.gh.repos["myorg/myrepo"].write);
+    }
+
+    // =========================================================================
+    // GitLab scope tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_gitlab_scope_readonly_all() {
+        let scopes = vec!["gitlab:readonly-all".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+
+        assert!(config.is_enabled());
+        assert!(config.gitlab.projects.contains_key("*/*"));
+        let perm = &config.gitlab.projects["*/*"];
+        assert!(perm.read);
+        assert!(!perm.write);
+    }
+
+    #[test]
+    fn test_parse_gitlab_scope_specific_project() {
+        let scopes = vec!["gitlab:mygroup/myproject".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+
+        assert!(config.is_enabled());
+        assert!(config.gitlab.projects.contains_key("mygroup/myproject"));
+        let perm = &config.gitlab.projects["mygroup/myproject"];
+        assert!(perm.read);
+        assert!(!perm.write);
+    }
+
+    #[test]
+    fn test_parse_gitlab_scope_gl_alias() {
+        let scopes = vec!["gl:mygroup/myproject".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+        assert!(config.gitlab.projects.contains_key("mygroup/myproject"));
+    }
+
+    #[test]
+    fn test_parse_gitlab_scope_with_permissions() {
+        let scopes = vec!["gitlab:mygroup/myproject:read,create-draft,approve".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+
+        let perm = &config.gitlab.projects["mygroup/myproject"];
+        assert!(perm.read);
+        assert!(perm.create_draft);
+        assert!(perm.approve);
+        assert!(!perm.push_new_branch);
+        assert!(!perm.write);
+    }
+
+    #[test]
+    fn test_parse_gitlab_scope_write() {
+        let scopes = vec!["gitlab:mygroup/myproject:write".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+
+        let perm = &config.gitlab.projects["mygroup/myproject"];
+        assert!(perm.read); // write implies read
+        assert!(perm.write);
+    }
+
+    #[test]
+    fn test_parse_gitlab_scope_wildcard() {
+        let scopes = vec!["gitlab:mygroup/*".to_string()];
+        let config = parse_scopes(&scopes).unwrap();
+        assert!(config.gitlab.projects.contains_key("mygroup/*"));
+        assert!(config.gitlab.projects["mygroup/*"].read);
+    }
+
+    #[test]
+    fn test_parse_gitlab_scope_invalid_target() {
+        let scopes = vec!["gitlab:no_slash".to_string()];
+        assert!(parse_scopes(&scopes).is_err());
+    }
+
+    #[test]
+    fn test_parse_mixed_github_gitlab_scopes() {
+        let scopes = vec![
+            "github:owner/repo:read".to_string(),
+            "gitlab:group/project:read,create-draft".to_string(),
+        ];
+        let config = parse_scopes(&scopes).unwrap();
+
+        assert!(config.gh.repos.contains_key("owner/repo"));
+        assert!(config.gitlab.projects.contains_key("group/project"));
+        assert!(config.gitlab.projects["group/project"].create_draft);
+    }
+
+    #[test]
+    fn test_config_to_cli_args_gitlab_project() {
+        let mut config = ServiceGatorConfig::default();
+        config.gitlab.projects.insert(
+            "mygroup/myproject".to_string(),
+            GlProjectPermission {
+                read: true,
+                create_draft: true,
+                ..Default::default()
+            },
+        );
+
+        let args = config_to_cli_args(&config);
+        assert!(args.contains(&"--gitlab-project".to_string()));
+        let project_arg = args
+            .iter()
+            .find(|a| a.contains("mygroup/myproject"))
+            .unwrap();
+        assert!(project_arg.contains("read"));
+        assert!(project_arg.contains("create-draft"));
+    }
+
+    #[test]
+    fn test_config_to_cli_args_gitlab_host() {
+        let mut config = ServiceGatorConfig::default();
+        config.gitlab.host = Some("gitlab.example.com".to_string());
+        config.gitlab.projects.insert(
+            "group/project".to_string(),
+            GlProjectPermission {
+                read: true,
+                ..Default::default()
+            },
+        );
+
+        let args = config_to_cli_args(&config);
+        assert!(args.contains(&"--gitlab-host".to_string()));
+        assert!(args.contains(&"gitlab.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_merge_configs_gitlab() {
+        let mut file_config = ServiceGatorConfig::default();
+        file_config.gitlab.projects.insert(
+            "file/project".to_string(),
+            GlProjectPermission {
+                read: true,
+                ..Default::default()
+            },
+        );
+
+        let mut cli_config = ServiceGatorConfig::default();
+        cli_config.gitlab.projects.insert(
+            "cli/project".to_string(),
+            GlProjectPermission {
+                read: true,
+                write: true,
+                ..Default::default()
+            },
+        );
+        cli_config.gitlab.host = Some("gitlab.corp.com".to_string());
+
+        let merged = merge_configs(&file_config, &cli_config);
+        assert!(merged.gitlab.projects.contains_key("file/project"));
+        assert!(merged.gitlab.projects.contains_key("cli/project"));
+        assert_eq!(
+            merged.gitlab.host,
+            Some("gitlab.corp.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_config_to_jwt_scopes_gitlab() {
+        let mut config = ServiceGatorConfig::default();
+        config.gitlab.projects.insert(
+            "group/project".to_string(),
+            GlProjectPermission {
+                read: true,
+                create_draft: true,
+                ..Default::default()
+            },
+        );
+        config.gitlab.host = Some("gitlab.example.com".to_string());
+
+        let scopes = config_to_jwt_scopes(&config);
+        assert!(scopes.gitlab.projects.contains_key("group/project"));
+        assert!(scopes.gitlab.projects["group/project"].read);
+        assert!(scopes.gitlab.projects["group/project"].create_draft);
+        assert_eq!(scopes.gitlab.host, Some("gitlab.example.com".to_string()));
     }
 }

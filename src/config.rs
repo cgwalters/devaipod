@@ -605,6 +605,9 @@ pub struct ServiceGatorConfig {
     /// GitHub scope configuration
     #[serde(default)]
     pub gh: GithubScope,
+    /// GitLab scope configuration
+    #[serde(default)]
+    pub gitlab: GitLabScope,
     /// JIRA scope configuration
     #[serde(default)]
     pub jira: JiraScope,
@@ -621,6 +624,7 @@ impl ServiceGatorConfig {
         self.gh.read
             || !self.gh.repos.is_empty()
             || !self.gh.prs.is_empty()
+            || !self.gitlab.projects.is_empty()
             || !self.jira.projects.is_empty()
             || !self.jira.issues.is_empty()
     }
@@ -706,6 +710,60 @@ pub enum GraphQlPermission {
     Read,
     /// Full GraphQL access
     Write,
+}
+
+/// GitLab scope configuration for service-gator
+///
+/// Mirrors the `GitLabScope` in service-gator's scope.rs.
+/// Uses "projects" (not "repos") to match GitLab terminology.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct GitLabScope {
+    /// Project permissions: "group/project" or "group/*" → permission
+    #[serde(default)]
+    pub projects: HashMap<String, GlProjectPermission>,
+    /// MR-specific permissions: "group/project!123" → permission
+    #[serde(default)]
+    pub mrs: HashMap<String, GlResourcePermission>,
+    /// Issue-specific permissions: "group/project#123" → permission
+    #[serde(default)]
+    pub issues: HashMap<String, GlResourcePermission>,
+    /// Host for self-hosted GitLab instances (default: gitlab.com)
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// Fine-grained permissions for a GitLab project
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct GlProjectPermission {
+    /// Can read the project (view MRs, issues, code, etc.)
+    #[serde(default)]
+    pub read: bool,
+    /// Can create draft merge requests
+    #[serde(default)]
+    pub create_draft: bool,
+    /// Can approve merge requests
+    #[serde(default)]
+    pub approve: bool,
+    /// Can create and push to new branches
+    #[serde(default)]
+    pub push_new_branch: bool,
+    /// Full write access (merge, close, create non-draft, etc.)
+    #[serde(default)]
+    pub write: bool,
+}
+
+/// Permissions for a specific GitLab MR or issue
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct GlResourcePermission {
+    /// Can read this resource
+    #[serde(default)]
+    pub read: bool,
+    /// Can write to this resource
+    #[serde(default)]
+    pub write: bool,
 }
 
 /// JIRA scope configuration for service-gator
@@ -1339,6 +1397,36 @@ port = 9000
         let mut config = ServiceGatorConfig::default();
         config.gh.read = true;
         assert!(config.is_enabled());
+
+        // Auto-enable when GitLab projects configured
+        let mut config = ServiceGatorConfig::default();
+        config
+            .gitlab
+            .projects
+            .insert("group/project".to_string(), GlProjectPermission::default());
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_parse_service_gator_gitlab_config() {
+        let toml = r#"
+[service-gator.gitlab]
+host = "gitlab.example.com"
+
+[service-gator.gitlab.projects]
+"mygroup/myproject" = { read = true, create-draft = true }
+"mygroup/*" = { read = true }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.service_gator.gitlab.host,
+            Some("gitlab.example.com".to_string())
+        );
+        assert_eq!(config.service_gator.gitlab.projects.len(), 2);
+        assert!(config.service_gator.gitlab.projects["mygroup/myproject"].read);
+        assert!(config.service_gator.gitlab.projects["mygroup/myproject"].create_draft);
+        assert!(config.service_gator.gitlab.projects["mygroup/*"].read);
+        assert!(config.service_gator.is_enabled());
     }
 
     #[test]

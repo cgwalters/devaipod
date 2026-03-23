@@ -2112,8 +2112,33 @@ async fn create_workspace_from_local(
                         );
                     }
                 }
-                forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
-                    // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
+                forge::ForgeType::GitLab => {
+                    let (create_draft, push_new_branch) = if opts.service_gator_ro {
+                        (false, false)
+                    } else {
+                        (true, true)
+                    };
+                    sg_config.gitlab.projects.insert(
+                        owner_repo.clone(),
+                        config::GlProjectPermission {
+                            read: true,
+                            create_draft,
+                            approve: false,
+                            push_new_branch,
+                            write: false,
+                        },
+                    );
+                    if repo_ref.host != "gitlab.com" {
+                        sg_config.gitlab.host = Some(repo_ref.host.clone());
+                    }
+                    tracing::debug!(
+                        "Auto-enabled service-gator for GitLab {} ({})",
+                        owner_repo,
+                        if opts.service_gator_ro { "read-only" } else { "read + push-new-branch + draft MRs" }
+                    );
+                }
+                forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
+                    // TODO: Add Forgejo/Gitea support to service-gator config
                     tracing::debug!(
                         "Auto service-gator not yet supported for {} ({})",
                         repo_ref.forge_type,
@@ -2288,8 +2313,33 @@ async fn create_workspace_from_remote(
                     );
                 }
             }
-            forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
-                // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
+            forge::ForgeType::GitLab => {
+                let (create_draft, push_new_branch) = if opts.service_gator_ro {
+                    (false, false)
+                } else {
+                    (true, true)
+                };
+                sg_config.gitlab.projects.insert(
+                    owner_repo.clone(),
+                    config::GlProjectPermission {
+                        read: true,
+                        create_draft,
+                        approve: false,
+                        push_new_branch,
+                        write: false,
+                    },
+                );
+                if repo_ref.host != "gitlab.com" {
+                    sg_config.gitlab.host = Some(repo_ref.host.clone());
+                }
+                tracing::debug!(
+                    "Auto-enabled service-gator for GitLab {} ({})",
+                    owner_repo,
+                    if opts.service_gator_ro { "read-only" } else { "read + push-new-branch + draft MRs" }
+                );
+            }
+            forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
+                // TODO: Add Forgejo/Gitea support to service-gator config
                 tracing::debug!(
                     "Auto service-gator not yet supported for {} ({})",
                     repo_ref.forge_type,
@@ -2481,8 +2531,33 @@ async fn create_workspace_from_pr(
                     );
                 }
             }
-            forge::ForgeType::GitLab | forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
-                // TODO: Add GitLab/Forgejo/Gitea support to service-gator config
+            forge::ForgeType::GitLab => {
+                let (create_draft, push_new_branch) = if opts.service_gator_ro {
+                    (false, false)
+                } else {
+                    (true, true)
+                };
+                sg_config.gitlab.projects.insert(
+                    owner_repo.clone(),
+                    config::GlProjectPermission {
+                        read: true,
+                        create_draft,
+                        approve: false,
+                        push_new_branch,
+                        write: false,
+                    },
+                );
+                if pr_ref.host != "gitlab.com" {
+                    sg_config.gitlab.host = Some(pr_ref.host.clone());
+                }
+                tracing::debug!(
+                    "Auto-enabled service-gator for GitLab {} ({})",
+                    owner_repo,
+                    if opts.service_gator_ro { "read-only" } else { "read + push-new-branch + draft MRs" }
+                );
+            }
+            forge::ForgeType::Forgejo | forge::ForgeType::Gitea => {
+                // TODO: Add Forgejo/Gitea support to service-gator config
                 tracing::debug!(
                     "Auto service-gator not yet supported for {} ({})",
                     pr_ref.forge_type,
