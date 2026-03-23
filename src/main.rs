@@ -1300,6 +1300,22 @@ async fn run_host(cli: HostCli) -> Result<()> {
 
     let config = config::load_config(cli.config.as_deref())?;
 
+    // If extra CA certs are configured, write a bundle to a tempfile and set
+    // GIT_SSL_CAINFO + SSL_CERT_FILE so that git clone and HTTPS requests from
+    // the devaipod process itself trust self-signed hosts.
+    let _ca_bundle_file = if let Some(bundle) = config.tls.read_ca_bundle()? {
+        let mut f = tempfile::NamedTempFile::new().context("Failed to create CA bundle tempfile")?;
+        std::io::Write::write_all(&mut f, bundle.as_bytes())
+            .context("Failed to write CA bundle tempfile")?;
+        let path = f.path().to_string_lossy().to_string();
+        std::env::set_var("GIT_SSL_CAINFO", &path);
+        std::env::set_var("SSL_CERT_FILE", &path);
+        tracing::debug!("Set GIT_SSL_CAINFO and SSL_CERT_FILE to {}", path);
+        Some(f) // keep the tempfile alive for the process lifetime
+    } else {
+        None
+    };
+
     match cli.command {
         HostCommand::Up { source, opts } => {
             let source = resolve_source(source.as_deref(), &config)?;
