@@ -4831,4 +4831,186 @@ mod tests {
             .count();
         assert_eq!(gh_token_count, 1);
     }
+
+    #[test]
+    fn test_inject_ca_cert_env() {
+        let mut env = std::collections::HashMap::new();
+        inject_ca_cert_env(&mut env, "/mnt/agent-workspace");
+        assert_eq!(
+            env["SSL_CERT_FILE"],
+            "/mnt/agent-workspace/.devaipod/ca-bundle.pem"
+        );
+        assert_eq!(
+            env["REQUESTS_CA_BUNDLE"],
+            "/mnt/agent-workspace/.devaipod/ca-bundle.pem"
+        );
+        assert_eq!(
+            env["NODE_EXTRA_CA_CERTS"],
+            "/mnt/agent-workspace/.devaipod/ca-bundle.pem"
+        );
+        assert_eq!(
+            env["GIT_SSL_CAINFO"],
+            "/mnt/agent-workspace/.devaipod/ca-bundle.pem"
+        );
+    }
+
+    #[test]
+    fn test_prepend_ca_cert_setup() {
+        let script = "git clone https://example.com/repo.git";
+        let bundle = "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n";
+        let result = prepend_ca_cert_setup(script, bundle);
+        assert!(result.contains("GIT_SSL_CAINFO"));
+        assert!(result.contains("SSL_CERT_FILE"));
+        assert!(result.contains("DEVAIPOD_CA_EOF"));
+        assert!(result.contains("TEST"));
+        // Original script should be at the end
+        assert!(result.ends_with(script));
+    }
+
+    #[test]
+    fn test_workspace_container_config_with_extra_ca_certs() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+
+        let mut global_config = crate::config::Config::default();
+        global_config.tls.extra_ca_certs = vec!["/certs/ca.pem".to_string()];
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            "/home/user",
+            "test-vol",
+            "test-agent-home",
+            "test-agent-ws",
+            &global_config,
+            &[],
+        );
+
+        // Workspace mounts agent-workspace at /mnt/agent-workspace
+        assert_eq!(
+            container_config.env.get("SSL_CERT_FILE").unwrap(),
+            "/mnt/agent-workspace/.devaipod/ca-bundle.pem"
+        );
+        assert_eq!(
+            container_config.env.get("GIT_SSL_CAINFO").unwrap(),
+            "/mnt/agent-workspace/.devaipod/ca-bundle.pem"
+        );
+    }
+
+    #[test]
+    fn test_workspace_container_config_without_extra_ca_certs() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+        let global_config = crate::config::Config::default();
+
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            None,
+            &config,
+            &bind_home,
+            "/home/user",
+            "test-vol",
+            "test-agent-home",
+            "test-agent-ws",
+            &global_config,
+            &[],
+        );
+
+        // No CA cert env vars when not configured
+        assert!(!container_config.env.contains_key("SSL_CERT_FILE"));
+        assert!(!container_config.env.contains_key("GIT_SSL_CAINFO"));
+    }
+
+    #[test]
+    fn test_agent_container_config_with_extra_ca_certs() {
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+
+        let mut global_config = crate::config::Config::default();
+        global_config.tls.extra_ca_certs = vec!["/certs/ca.pem".to_string()];
+
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            "/home/devenv",
+            None,
+            false,
+            false,
+            "test-ws-vol",
+            "test-agent-ws",
+            "test-agent-home",
+            None,
+            &global_config,
+            true,
+        );
+
+        // Agent mounts agent-workspace at /workspaces
+        assert_eq!(
+            container_config.env.get("SSL_CERT_FILE").unwrap(),
+            "/workspaces/.devaipod/ca-bundle.pem"
+        );
+    }
+
+    #[test]
+    fn test_gator_container_config_with_extra_ca_certs() {
+        let mut global_config = crate::config::Config::default();
+        global_config.tls.extra_ca_certs = vec!["/certs/ca.pem".to_string()];
+
+        let container_config = DevaipodPod::gator_container_config(
+            "test-agent-ws",
+            "/workspaces/project",
+            "test-main-ws",
+            &global_config,
+        );
+
+        // Gator mounts agent-workspace at workspace_folder
+        assert_eq!(
+            container_config.env.get("SSL_CERT_FILE").unwrap(),
+            "/workspaces/project/.devaipod/ca-bundle.pem"
+        );
+    }
+
+    #[test]
+    fn test_worker_container_config_with_extra_ca_certs() {
+        use crate::config::WorkerGatorMode;
+
+        let project_path = Path::new("/project");
+        let workspace_folder = "/workspaces/project";
+        let bind_home = BindHomeConfig::default();
+
+        let mut global_config = crate::config::Config::default();
+        global_config.tls.extra_ca_certs = vec!["/certs/ca.pem".to_string()];
+
+        let container_config = DevaipodPod::worker_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            "/home/devenv",
+            None,
+            false,
+            WorkerGatorMode::Readonly,
+            "test-main-ws",
+            "test-owner-ws",
+            "test-worker-ws",
+            "test-worker-home",
+            "test-agent-home",
+            &global_config,
+        );
+
+        // Worker mounts agent-workspace (owner) at /mnt/owner-workspace
+        assert_eq!(
+            container_config.env.get("SSL_CERT_FILE").unwrap(),
+            "/mnt/owner-workspace/.devaipod/ca-bundle.pem"
+        );
+    }
 }
