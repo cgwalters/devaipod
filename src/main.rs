@@ -13,6 +13,8 @@ use color_eyre::eyre::{Context, Result, bail};
 
 #[allow(dead_code)] // MCP server will use these in a follow-up
 mod advisor;
+#[allow(dead_code)] // Preparatory infrastructure for workspace-v2
+mod agent_dir;
 mod config;
 mod devcontainer;
 mod forge;

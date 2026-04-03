@@ -387,6 +387,51 @@ pub fn get_host_socket_path() -> Result<PathBuf> {
     Ok(container_path)
 }
 
+/// Get the host-side base path for agent workspaces.
+///
+/// When creating agent containers, bind mount sources are resolved on the
+/// **host** filesystem. The launcher sets `DEVAIPOD_HOST_WORKDIR` to the
+/// host-side directory where agent workspaces are stored.
+///
+/// If unset, falls back to `$XDG_DATA_HOME/devaipod/workspaces` (typically
+/// `~/.local/share/devaipod/workspaces`), or `/var/lib/devaipod/workspaces`
+/// as a last resort.
+pub fn get_host_workdir_path() -> Result<PathBuf> {
+    if let Ok(val) = std::env::var("DEVAIPOD_HOST_WORKDIR") {
+        let path = PathBuf::from(&val);
+        tracing::debug!(
+            "Using host workdir path from DEVAIPOD_HOST_WORKDIR: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    // XDG_DATA_HOME fallback (typically ~/.local/share)
+    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+        let path = PathBuf::from(xdg_data).join("devaipod/workspaces");
+        tracing::debug!(
+            "Using host workdir path from XDG_DATA_HOME: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    // HOME-based fallback
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(home).join(".local/share/devaipod/workspaces");
+        tracing::debug!("Using host workdir path under HOME: {}", path.display());
+        return Ok(path);
+    }
+
+    // Absolute fallback
+    let path = PathBuf::from("/var/lib/devaipod/workspaces");
+    tracing::debug!(
+        "Using fallback host workdir path: {}",
+        path.display()
+    );
+    Ok(path)
+}
+
 /// Connect to the container socket and return a bollard Docker client
 pub fn connect_to_container_socket() -> Result<Docker> {
     let socket_path = get_container_socket()?;
