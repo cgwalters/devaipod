@@ -1,5 +1,19 @@
 # Lightweight Agent Change Review
 
+**Depends on**: [workspace-v2.md](./workspace-v2.md) (workspace infrastructure
+must be in place first; this doc builds on it to add review, push, and
+credential flows).
+
+**Note**: workspace-v2 replaces podman volumes with host-side directories.
+The dual-workspace trust model described below (main workspace + agent
+workspace on separate volumes) will need to be reworked: in the new model,
+the agent's working tree is a host directory bind-mounted into the
+container, and the human's source repo is bind-mounted read-only alongside
+it. Pod-api operates on the same host filesystem rather than on
+cross-mounted volumes. The security properties (agent can't write to the
+human's repo, pod-api owns push with GH_TOKEN) are preserved, but the
+mechanics change.
+
 Right now the agent is sandboxed by default with read-only
 credentials - getting changes out of its git repository
 is a bit painful, and reviewing in the opencode UI is
