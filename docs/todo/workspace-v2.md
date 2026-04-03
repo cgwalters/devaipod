@@ -117,16 +117,40 @@ to the user's local machine, devaipod periodically fetches from the
 remote agent directory (via SSH or a pod-api proxy endpoint) into a local
 tracking branch.
 
+## Controlplane mount strategy
+
+Devaipod itself runs as a container. To create agent directories on the
+host filesystem, the controlplane container needs `~/.var/lib/devaipod/`
+bind-mounted in from the host. This follows the same pattern as
+`DEVAIPOD_HOST_SOCKET` for the podman socket:
+
+- The Justfile's `container-run` recipe adds
+  `-v "$HOME/.var/lib/devaipod":/var/lib/devaipod-workspaces`
+- `DEVAIPOD_HOST_WORKDIR="$HOME/.var/lib/devaipod"` tells the
+  controlplane the host-side path to use in `-v` args for agent
+  containers
+- The controlplane creates directories under the container-side mount
+  (`/var/lib/devaipod-workspaces/<pod-id>/`), but uses
+  `$DEVAIPOD_HOST_WORKDIR/<pod-id>/` as the volume source when creating
+  agent containers -- the host podman daemon resolves paths on the host
+
+This is the minimal mount. We do not bind-mount `~` entirely.
+
 ## Implementation
 
-- Create `~/.var/lib/devaipod/<pod-id>/` on the host at pod creation
-  time (configurable via `--agent-dir` or `devaipod.toml`)
-- Replace volume mounts with bind mounts (source RO, agent dir RW)
+- Add `DEVAIPOD_HOST_WORKDIR` env var and `get_host_workdir_path()`
+  helper (same pattern as `DEVAIPOD_HOST_SOCKET`)
+- Create `<pod-id>/` under the workdir at pod creation time
+- Replace `{pod}-agent-workspace` volume with a bind mount of the
+  host agent dir at `/workspaces/`
+- Bind-mount source repo RO at `/mnt/source/`
+- Update agent, pod-api, and gator container configs for bind mounts
 - UID mapping: follow devcontainer spec (`updateRemoteUserUID` or
   equivalent), same as VS Code / other IDE devcontainer implementations
 - Provide `checkout` and `fetch-source` as agent skill/MCP tool
 - `devaipod delete` removes the agent directory
 - `devaipod clean` garbage-collects orphaned agent dirs
+- Update Justfile `container-run` with the new bind mount
 - For remote pods, add periodic `git fetch` from remote to local
 
 ## Resolved Questions
