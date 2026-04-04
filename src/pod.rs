@@ -707,7 +707,6 @@ impl DevaipodPod {
             WorkspaceSource::LocalRepo(_) => {
                 crate::agent_dir::create_agent_dir(pod_name)?;
                 let host_path = crate::agent_dir::agent_dir_host_path(pod_name)?;
-                // Check if the directory already has content (a previous clone)
                 let has_content = crate::agent_dir::agent_dir_container_path(pod_name)
                     .map(|p| p.join(".git").exists())
                     .unwrap_or(false);
@@ -745,12 +744,16 @@ impl DevaipodPod {
                 .unwrap_or(&workspace_folder);
             let reference_repo_path = format!("/mnt/main-workspace/{}", project_name);
 
+            // Derive slug from pod name for devaipod/<slug> branch naming
+            let slug = pod_name.strip_prefix("devaipod-").unwrap_or(pod_name);
+
             let clone_script = match source {
                 WorkspaceSource::LocalRepo(git_info) => crate::git::clone_agent_workspace_script(
                     &workspace_folder,
                     &reference_repo_path,
                     git_info,
                     effective_user.as_deref(),
+                    Some(slug),
                 ),
                 WorkspaceSource::RemoteRepo(remote_info) => {
                     // Create a GitRepoInfo from the remote info for clone_agent_workspace_script
@@ -768,6 +771,7 @@ impl DevaipodPod {
                         &reference_repo_path,
                         &git_info,
                         effective_user.as_deref(),
+                        Some(slug),
                     )
                 }
                 WorkspaceSource::PullRequest(pr_info) => {
@@ -793,6 +797,7 @@ impl DevaipodPod {
                         &reference_repo_path,
                         &git_info,
                         effective_user.as_deref(),
+                        Some(slug),
                     )
                 }
             };
