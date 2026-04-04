@@ -80,6 +80,15 @@ export interface RecentSource {
   last_used: string
 }
 
+/** Pod info from the devcontainer list endpoint. */
+export interface DevcontainerPod {
+  name: string
+  status: string
+  created: string
+  labels?: Record<string, string>
+  containers?: { Names: string; Status: string }[]
+}
+
 /** GitHub repo permission flags from the gator config */
 export interface GhRepoPermission {
   read?: boolean
@@ -182,6 +191,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       enrichment: {} as Record<string, { needs_update: boolean }>,
       proposals: [] as Proposal[],
       recentSources: [] as RecentSource[],
+      devcontainers: [] as DevcontainerPod[],
       connected: undefined as boolean | undefined,
       error: undefined as string | undefined,
     })
@@ -281,6 +291,17 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       }
     }
 
+    // -- Devcontainer list ---------------------------------------------------
+
+    async function fetchDevcontainers() {
+      try {
+        const list = await apiFetch<DevcontainerPod[]>("/api/devaipod/devcontainer/list")
+        setStore("devcontainers", reconcile(list, { key: "name", merge: true }))
+      } catch {
+        // Ignore — endpoint may not exist on older backends
+      }
+    }
+
     // -- Polling setup ------------------------------------------------------
     // Use self-scheduling setTimeout loops instead of setInterval so the next
     // poll is only queued after the current one finishes.  This makes request
@@ -324,6 +345,17 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     scheduleProposalPoll()
     onCleanup(() => clearTimeout(proposalTimer))
 
+    let devcontainerTimer: ReturnType<typeof setTimeout> | undefined
+    function scheduleDevcontainerPoll() {
+      if (disposed) return
+      devcontainerTimer = setTimeout(async () => {
+        await fetchDevcontainers()
+        scheduleDevcontainerPoll()
+      }, POD_POLL_MS)
+    }
+    scheduleDevcontainerPoll()
+    onCleanup(() => clearTimeout(devcontainerTimer))
+
     // Initial fetch — the effect tracks only refreshCounter; the async bodies
     // read store state (e.g. store.pods, store.launches) which must NOT be tracked
     // here or we'd create a feedback loop (fetch updates store → effect re-fires).
@@ -334,6 +366,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         fetchLaunches()
         fetchProposals()
         fetchRecentSources()
+        fetchDevcontainers()
       })
     })
 
@@ -436,6 +469,42 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       fetchProposals()
     }
 
+    async function launchDevcontainer(source: string, opts?: { name?: string; image?: string }) {
+      const body: Record<string, string> = { source }
+      if (opts?.name) body.name = opts.name
+      if (opts?.image) body.image = opts.image
+      const result = await apiFetch<{ success: boolean; message?: string }>(
+        "/api/devaipod/devcontainer/run",
+        { method: "POST", body: JSON.stringify(body) },
+      )
+      if (!result.success) {
+        throw new Error(result.message ?? "Devcontainer launch failed")
+      }
+      fetchDevcontainers()
+      return result
+    }
+
+    async function deleteDevcontainer(name: string) {
+      await apiFetch<void>(`/api/devaipod/devcontainer/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+      })
+      fetchDevcontainers()
+    }
+
+    async function stopDevcontainer(name: string) {
+      await apiFetch<void>(`${PODMAN_PODS}/${encodeURIComponent(name)}/stop`, {
+        method: "POST",
+      })
+      fetchDevcontainers()
+    }
+
+    async function startDevcontainer(name: string) {
+      await apiFetch<void>(`${PODMAN_PODS}/${encodeURIComponent(name)}/start`, {
+        method: "POST",
+      })
+      fetchDevcontainers()
+    }
+
     async function getTitle(fullName: string): Promise<{ title: string | null }> {
       return apiFetch<{ title: string | null }>(
         `/api/devaipod/pods/${encodeURIComponent(fullName)}/pod-api/title`,
@@ -506,6 +575,9 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       get recentSources() {
         return store.recentSources
       },
+      get devcontainers() {
+        return store.devcontainers
+      },
       get connected() {
         return store.connected
       },
@@ -524,6 +596,10 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       launchAdvisor,
       dismissLaunch,
       dismissProposal,
+      launchDevcontainer,
+      deleteDevcontainer,
+      stopDevcontainer,
+      startDevcontainer,
       getTitle,
       updateTitle,
       getGatorScopes,

@@ -24,6 +24,7 @@ import {
   DevaipodProvider,
   useDevaipod,
   type PodInfo,
+  type DevcontainerPod,
   type Proposal,
   type LaunchWorkspaceParams,
   type GatorScopeConfig,
@@ -458,9 +459,192 @@ function PodsPageContent() {
             </For>
           </div>
         </Show>
+        </Show>
+
+      {/* Devcontainers section */}
+      <DevcontainerSection />
+    </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Devcontainer section
+// ---------------------------------------------------------------------------
+
+function DevcontainerSection() {
+  const ctx = useDevaipod()
+  const [source, setSource] = createSignal("")
+  const [launching, setLaunching] = createSignal(false)
+  const [error, setError] = createSignal("")
+
+  const isRunning = (dc: DevcontainerPod) =>
+    (dc.status ?? "").toLowerCase() === "running"
+
+  async function handleLaunch(e: Event) {
+    e.preventDefault()
+    const src = source().trim()
+    if (!src) return
+    setLaunching(true)
+    setError("")
+    try {
+      await ctx.launchDevcontainer(src)
+      setSource("")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLaunching(false)
+    }
+  }
+
+  return (
+    <div class="mt-10 pt-6 border-t border-border-base">
+      {/* Section header */}
+      <div class="flex items-center gap-3 mb-4">
+        <h2 class="text-16-medium text-text-strong">Devcontainers</h2>
+        <span class="text-11-regular text-text-weak bg-fill-element-base px-2 py-0.5 rounded-full">
+          {ctx.devcontainers.length}
+        </span>
+      </div>
+
+      {/* Launch form */}
+      <form onSubmit={handleLaunch} class="flex gap-2 mb-4">
+        <input
+          type="text"
+          placeholder="Path or URL"
+          class="flex-1 text-12-regular bg-background-base border border-border-base rounded px-3 py-2 text-text-strong placeholder:text-text-weak focus:outline-none focus:border-border-active-base"
+          value={source()}
+          onInput={(e) => setSource(e.currentTarget.value)}
+          disabled={launching()}
+        />
+        <Button variant="primary" size="small" type="submit" disabled={launching() || !source().trim()}>
+          {launching() ? "Launching..." : "Launch"}
+        </Button>
+      </form>
+
+      <Show when={error()}>
+        <Card variant="error" class="mb-4 p-3">
+          <span class="text-12-regular">{error()}</span>
+        </Card>
+      </Show>
+
+      {/* Devcontainer list */}
+      <Show
+        when={ctx.devcontainers.length > 0}
+        fallback={
+          <div class="flex flex-col items-center justify-center py-8 text-text-weak">
+            <p class="text-12-regular">No devcontainers</p>
+          </div>
+        }
+      >
+        <div class="flex flex-col gap-3">
+          <For each={ctx.devcontainers}>
+            {(dc) => <DevcontainerCard dc={dc} />}
+          </For>
+        </div>
       </Show>
     </div>
-    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Devcontainer card
+// ---------------------------------------------------------------------------
+
+function DevcontainerCard(props: { dc: DevcontainerPod }) {
+  const ctx = useDevaipod()
+  const [actionError, setActionError] = createSignal("")
+
+  const shortName = () => props.dc.name.replace("devaipod-", "")
+  const isRunning = () => (props.dc.status ?? "").toLowerCase() === "running"
+  const repo = () => props.dc.labels?.["io.devaipod.repo"] ?? ""
+
+  async function withErrorHandling(fn: () => Promise<void>) {
+    setActionError("")
+    try {
+      await fn()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  return (
+    <Card class="p-4">
+      {/* Header row */}
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="text-14-medium text-text-strong truncate">{shortName()}</span>
+        </div>
+        <span
+          class="text-10-regular uppercase px-1.5 py-0.5 rounded"
+          classList={{
+            "bg-icon-success-base/20 text-icon-success-base": isRunning(),
+            "bg-icon-critical-base/20 text-icon-critical-base": !isRunning(),
+          }}
+        >
+          {isRunning() ? "Running" : "Stopped"}
+        </span>
+      </div>
+
+      {/* Metadata */}
+      <div class="text-12-regular text-text-weak flex flex-col gap-0.5 mb-3">
+        <Show when={repo()}>
+          <div>
+            <span class="text-text-weak">Repo: </span>
+            <span class="text-text-secondary-base">{repo()}</span>
+          </div>
+        </Show>
+        <div>
+          <span class="text-text-weak">Created: </span>
+          <span class="text-text-secondary-base">{formatDate(props.dc.created)}</span>
+        </div>
+      </div>
+
+      {/* Actions */}
+      <div class="flex gap-2 pt-2 border-t border-border-base">
+        <Show when={isRunning()}>
+          <Button
+            variant="secondary"
+            size="small"
+            onClick={() => withErrorHandling(() => ctx.stopDevcontainer(props.dc.name))}
+          >
+            Stop
+          </Button>
+        </Show>
+        <Show when={!isRunning()}>
+          <Button
+            variant="secondary"
+            size="small"
+            onClick={() => withErrorHandling(() => ctx.startDevcontainer(props.dc.name))}
+          >
+            Start
+          </Button>
+        </Show>
+        <Button
+          variant="ghost"
+          size="small"
+          class="text-text-critical-base"
+          onClick={() => {
+            if (confirm(`Delete devcontainer "${shortName()}"? This cannot be undone.`))
+              withErrorHandling(() => ctx.deleteDevcontainer(props.dc.name))
+          }}
+        >
+          Delete
+        </Button>
+        <Show when={isRunning()}>
+          <span class="ml-auto text-11-regular text-text-weak font-mono self-center" title="SSH into this devcontainer">
+            ssh {shortName()}
+          </span>
+        </Show>
+      </div>
+
+      {/* Action error */}
+      <Show when={actionError()}>
+        <Card variant="error" class="mt-3 p-2">
+          <span class="text-12-regular">{actionError()}</span>
+        </Card>
+      </Show>
+    </Card>
   )
 }
 
