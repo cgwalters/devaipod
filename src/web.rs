@@ -2304,6 +2304,26 @@ async fn refresh_pod_cache(
     let mut pods: Vec<CachedPodInfo> = all_pods
         .into_iter()
         .filter(|p| p.name.starts_with("devaipod-"))
+        .filter(|p| {
+            // Filter by DEVAIPOD_INSTANCE if set
+            match crate::get_instance_id() {
+                Some(ref instance_id) => {
+                    // When instance is set, only show pods with matching label
+                    p.labels
+                        .as_ref()
+                        .and_then(|l| l.get(crate::INSTANCE_LABEL_KEY))
+                        == Some(instance_id)
+                }
+                None => {
+                    // When no instance is set (production), exclude pods that carry
+                    // any instance label (they belong to test/isolated instances)
+                    p.labels
+                        .as_ref()
+                        .and_then(|l| l.get(crate::INSTANCE_LABEL_KEY))
+                        .is_none()
+                }
+            }
+        })
         .map(|pod| {
             let needs_update = enrichment_map.get(&pod.name).copied().unwrap_or(false);
             let containers = pod.containers.as_ref().map(|cs| {
