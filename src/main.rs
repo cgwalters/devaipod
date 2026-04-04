@@ -1003,6 +1003,22 @@ enum HostCommand {
         title: Option<String>,
     },
 
+    /// Manage standalone devcontainers (human dev environment, no AI agent)
+    ///
+    /// Creates and manages devcontainer pods with a workspace container
+    /// and API sidecar, but no AI agent or service-gator.
+    ///
+    /// Examples:
+    ///   devaipod devcontainer run .                              # Local repo
+    ///   devaipod devcontainer run https://github.com/user/repo   # Remote repo
+    ///   devaipod devcontainer list                               # List devcontainers
+    ///   devaipod devcontainer rm my-workspace                    # Remove a devcontainer
+    #[command(alias = "dc")]
+    Devcontainer {
+        #[command(subcommand)]
+        action: DevcontainerAction,
+    },
+
     /// Internal helper commands (not for direct user use)
     ///
     /// These commands are used internally for remote development integration.
@@ -1135,6 +1151,58 @@ enum GatorAction {
         /// Scope to add (format: github:owner/repo[:permissions])
         #[arg(required = true)]
         scopes: Vec<String>,
+    },
+}
+
+/// Devcontainer management actions
+#[derive(Debug, Parser)]
+enum DevcontainerAction {
+    /// Create a standalone devcontainer (no AI agent)
+    ///
+    /// Creates a pod with a workspace container and API sidecar.
+    /// The workspace gets trusted credentials, devcontainer lifecycle
+    /// commands, dotfiles, and SSH access.
+    ///
+    /// Examples:
+    ///   devaipod devcontainer run .
+    ///   devaipod devcontainer run https://github.com/user/repo
+    ///   devaipod devcontainer run . --image mcr.microsoft.com/devcontainers/rust:1
+    Run {
+        /// Source: local path or git URL
+        source: Option<String>,
+        /// Use a specific container image instead of building from devcontainer.json
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+        /// Explicit pod name (default: derived from source with unique suffix)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Use this devcontainer JSON instead of the repo's devcontainer.json
+        #[arg(long, value_name = "JSON")]
+        devcontainer_json: Option<String>,
+        /// Use the devcontainer.json from your dotfiles repo instead of the project's
+        #[arg(long)]
+        use_default_devcontainer: bool,
+    },
+    /// List running devcontainer pods
+    ///
+    /// Shows only devcontainer pods (not agent pods).
+    List {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a devcontainer pod and its volumes
+    ///
+    /// Examples:
+    ///   devaipod devcontainer rm my-workspace
+    ///   devaipod devcontainer rm my-workspace --force
+    Rm {
+        /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// Force deletion (stop running containers first)
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
@@ -1554,9 +1622,504 @@ async fn run_host(cli: HostCli) -> Result<()> {
             proposals,
             name,
         } => cmd_advisor(&config, task.as_deref(), status, proposals, name.as_deref()).await,
+        HostCommand::Devcontainer { action } => cmd_devcontainer(&config, action).await,
         HostCommand::Helper { action } => run_helper_async(action).await,
         HostCommand::Internals { action } => run_internals(action),
     }
+}
+
+/// Dispatch devcontainer subcommands
+async fn cmd_devcontainer(config: &config::Config, action: DevcontainerAction) -> Result<()> {
+    match action {
+        DevcontainerAction::Run {
+            source,
+            image,
+            name,
+            devcontainer_json,
+            use_default_devcontainer,
+        } => {
+            let source = resolve_source(source.as_deref(), config)?;
+            cmd_devcontainer_run(
+                config,
+                source,
+                image.as_deref(),
+                name.as_deref(),
+                devcontainer_json.as_deref(),
+                use_default_devcontainer,
+            )
+            .await
+        }
+        DevcontainerAction::List { json } => cmd_devcontainer_list(json),
+        DevcontainerAction::Rm { name, force } => cmd_delete(&normalize_pod_name(&name), force),
+    }
+}
+
+/// Create a standalone devcontainer pod
+async fn cmd_devcontainer_run(
+    config: &config::Config,
+    source: &str,
+    image: Option<&str>,
+    explicit_name: Option<&str>,
+    devcontainer_json: Option<&str>,
+    use_default_devcontainer: bool,
+) -> Result<()> {
+    let source = normalize_source(source, &config.git.extra_hosts);
+    let source = source.as_ref();
+
+    // Build CreateOptions-like state for devcontainer config resolution
+    let create_opts = CreateOptions {
+        task: None,
+        title: None,
+        image: image.map(|s| s.to_string()),
+        name: explicit_name.map(|s| s.to_string()),
+        service_gator_scopes: vec![],
+        service_gator_image: None,
+        mode: WorkspaceMode::Up, // doesn't matter, we use our own label
+        service_gator_ro: false,
+        mcp_servers: vec![],
+        devcontainer_json: devcontainer_json.map(|s| s.to_string()),
+        use_default_devcontainer,
+        auto_approve: false,
+        source_dirs: vec![],
+    };
+
+    // Resolve the source (local vs remote)
+    let result = if source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("git@")
+    {
+        cmd_devcontainer_run_remote(config, source, &create_opts).await?
+    } else {
+        cmd_devcontainer_run_local(config, source, &create_opts).await?
+    };
+
+    // Auto-create SSH config entry
+    if config.ssh.auto_config
+        && let Some(config_path) = write_ssh_config_devcontainer(&result.pod_name)
+    {
+        tracing::info!("Created SSH config: {}", config_path.display());
+        if !is_using_container_ssh_export() && !ssh_config_has_include() {
+            tracing::warn!(
+                "Add 'Include ~/.ssh/config.d/*' to the top of ~/.ssh/config for SSH integration"
+            );
+        }
+    }
+
+    let short_name = strip_pod_prefix(&result.pod_name);
+    tracing::info!("Devcontainer ready ({})", short_name);
+    tracing::info!("  SSH: ssh {}.devaipod", result.pod_name);
+    tracing::info!("  Shell: devaipod exec {} -W", short_name);
+
+    Ok(())
+}
+
+/// Create a devcontainer from a local path
+async fn cmd_devcontainer_run_local(
+    config: &config::Config,
+    source: &str,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    let source_path = std::path::Path::new(source).canonicalize().ok();
+    let project_path = match source_path {
+        Some(ref p) => p,
+        None => bail!("Path '{}' does not exist or is not accessible.", source),
+    };
+
+    let git_info =
+        git::detect_git_info(project_path).context("Failed to detect git repository info")?;
+
+    if git_info.remote_url.is_none() {
+        bail!(
+            "No git remote configured for {}.\n\
+             devaipod clones the repository into containers and requires a git remote.\n\
+             Configure with: git remote add origin <url>",
+            project_path.display()
+        );
+    }
+
+    let (devcontainer_config, effective_image) = resolve_devcontainer_config(
+        config,
+        project_path,
+        opts,
+        &project_path.display().to_string(),
+    )
+    .await?;
+
+    let project_name = project_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+    let pod_name = if let Some(ref name) = opts.name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name(&project_name)
+    };
+
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    let ws_source = pod::WorkspaceSource::LocalRepo(git_info);
+
+    let mut extra_labels = vec![("io.devaipod.mode".to_string(), "devcontainer".to_string())];
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
+    }
+
+    let devaipod_pod = pod::DevaipodPod::create_devcontainer(
+        &podman,
+        project_path,
+        &devcontainer_config,
+        &pod_name,
+        config,
+        &ws_source,
+        &extra_labels,
+        effective_image.as_deref(),
+    )
+    .await
+    .context("Failed to create devcontainer pod")?;
+
+    finalize_devcontainer_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    drop(podman);
+    Ok(CreateResult { pod_name })
+}
+
+/// Create a devcontainer from a remote URL
+async fn cmd_devcontainer_run_remote(
+    config: &config::Config,
+    remote_url: &str,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    tracing::info!("Setting up {}...", remote_url);
+
+    let repo_name = git::extract_repo_name(remote_url).unwrap_or_else(|| "project".to_string());
+
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_path = temp_dir.path();
+
+    let gh_token = git::get_github_token_with_secret(config);
+    let clone_url = git::authenticated_clone_url(remote_url, gh_token.as_deref());
+
+    let clone_output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &clone_url,
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to clone repository")?;
+
+    if !clone_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_output.stderr);
+        bail!("Failed to clone repository: {}", stderr);
+    }
+
+    let branch_output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(temp_path)
+        .output()
+        .await
+        .context("Failed to get default branch")?;
+
+    let default_branch = if branch_output.status.success() {
+        String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string()
+    } else {
+        "main".to_string()
+    };
+
+    let (devcontainer_config, effective_image) =
+        resolve_devcontainer_config(config, temp_path, opts, remote_url).await?;
+
+    let pod_name = if let Some(ref name) = opts.name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name(&repo_name)
+    };
+
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    let remote_info = git::RemoteRepoInfo {
+        remote_url: remote_url.to_string(),
+        default_branch,
+        repo_name,
+        fork_url: None,
+    };
+    let ws_source = pod::WorkspaceSource::RemoteRepo(remote_info);
+
+    let mut extra_labels = vec![("io.devaipod.mode".to_string(), "devcontainer".to_string())];
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
+    }
+
+    let devaipod_pod = pod::DevaipodPod::create_devcontainer(
+        &podman,
+        temp_path,
+        &devcontainer_config,
+        &pod_name,
+        config,
+        &ws_source,
+        &extra_labels,
+        effective_image.as_deref(),
+    )
+    .await
+    .context("Failed to create devcontainer pod")?;
+
+    finalize_devcontainer_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    drop(podman);
+    Ok(CreateResult { pod_name })
+}
+
+/// Post-creation steps for devcontainer pods
+async fn finalize_devcontainer_pod(
+    podman: &podman::PodmanService,
+    devaipod_pod: &pod::DevaipodPod,
+    devcontainer_config: &devcontainer::DevcontainerConfig,
+    config: &config::Config,
+) -> Result<()> {
+    devaipod_pod
+        .start(podman)
+        .await
+        .context("Failed to start pod")?;
+
+    // Copy bind_home files into workspace container
+    devaipod_pod
+        .copy_bind_home_files_workspace(
+            podman,
+            &devaipod_pod.workspace_bind_home,
+            &devaipod_pod.container_home,
+            devcontainer_config.effective_user(),
+        )
+        .await
+        .context("Failed to copy bind_home files")?;
+
+    // Install dotfiles in workspace container
+    if let Some(ref dotfiles) = config.dotfiles {
+        devaipod_pod
+            .install_dotfiles_workspace(podman, dotfiles, devcontainer_config.effective_user())
+            .await
+            .context("Failed to install dotfiles")?;
+    }
+
+    // Run lifecycle commands in workspace container
+    devaipod_pod
+        .run_lifecycle_commands_workspace(podman, devcontainer_config)
+        .await
+        .context("Failed to run lifecycle commands")?;
+
+    Ok(())
+}
+
+/// Write SSH config for a devcontainer pod
+///
+/// The SSH ProxyCommand uses `-W` to target the workspace container.
+fn write_ssh_config_devcontainer(pod_name: &str) -> Option<std::path::PathBuf> {
+    let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+
+    let devaipod_cmd = if is_using_container_ssh_export() {
+        "podman exec -i devaipod devaipod".to_string()
+    } else {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "devaipod".to_string())
+    };
+
+    let config_content = format!(
+        r#"# Generated by devaipod devcontainer
+Host {pod}.devaipod
+    ProxyCommand {devaipod} exec -W --stdio {pod}
+    User {user}
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+"#,
+        pod = pod_name,
+        devaipod = devaipod_cmd,
+        user = username,
+    );
+
+    let config_dir = get_ssh_config_dir().ok()?;
+    std::fs::create_dir_all(&config_dir).ok()?;
+
+    use cap_std_ext::cap_primitives::fs::PermissionsExt;
+    use cap_std_ext::cap_std;
+    use cap_std_ext::dirext::CapStdExtDirExt;
+
+    let dir = cap_std::fs::Dir::open_ambient_dir(&config_dir, cap_std::ambient_authority()).ok()?;
+    let config_path = get_ssh_config_path(pod_name).ok()?;
+    let filename = config_path.file_name()?;
+
+    dir.atomic_write_with_perms(
+        filename,
+        config_content.as_bytes(),
+        cap_std::fs::Permissions::from_mode(0o600),
+    )
+    .ok()?;
+
+    Some(config_path)
+}
+
+/// List devcontainer pods (those with io.devaipod.mode=devcontainer)
+fn cmd_devcontainer_list(json_output: bool) -> Result<()> {
+    let name_filter = format!("name={}*", POD_NAME_PREFIX);
+    let mut args = vec!["pod", "ps", "--filter", &name_filter];
+
+    let label_filter;
+    if let Some(instance_id) = get_instance_id() {
+        label_filter = format!("label={INSTANCE_LABEL_KEY}={instance_id}");
+        args.extend(["--filter", &label_filter]);
+    }
+    args.push("--format=json");
+
+    let output = podman_command()
+        .args(&args)
+        .output()
+        .context("Failed to run podman pod ps")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("podman pod ps failed: {}", stderr.trim());
+    }
+
+    let pods: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| Vec::new());
+
+    // Filter to only devcontainer pods
+    let mut devcontainer_pods = Vec::new();
+    for pod in &pods {
+        let full_name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+        let labels = get_pod_labels(full_name);
+        if !pod_labels_match_instance(labels.as_ref()) {
+            continue;
+        }
+        let mode = labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .and_then(|v| v.as_str());
+        if mode != Some("devcontainer") {
+            continue;
+        }
+        devcontainer_pods.push((pod, labels));
+    }
+
+    if json_output {
+        let enriched: Vec<serde_json::Value> = devcontainer_pods
+            .iter()
+            .map(|(pod, labels)| {
+                let mut enriched = (*pod).clone();
+                if let Some(labels) = labels {
+                    enriched["Labels"] = labels.clone();
+                }
+                enriched
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&enriched)?);
+        return Ok(());
+    }
+
+    if devcontainer_pods.is_empty() {
+        println!("No devcontainer pods found.");
+        println!("Use 'devaipod devcontainer run <path>' to create one.");
+        return Ok(());
+    }
+
+    // Calculate column widths
+    let name_width = devcontainer_pods
+        .iter()
+        .filter_map(|(pod, _)| pod.get("Name").and_then(|v| v.as_str()))
+        .map(|n| strip_pod_prefix(n).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let repo_width = devcontainer_pods
+        .iter()
+        .filter_map(|(_, labels)| {
+            labels
+                .as_ref()
+                .and_then(|l| l.get("io.devaipod.repo"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let has_repo = devcontainer_pods.iter().any(|(_, labels)| {
+        labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.repo"))
+            .is_some()
+    });
+
+    if has_repo {
+        println!(
+            "{:<name_width$}  {:<10}  {:<repo_width$}  CREATED",
+            "NAME",
+            "STATUS",
+            "REPO",
+            name_width = name_width,
+            repo_width = repo_width
+        );
+    } else {
+        println!(
+            "{:<name_width$}  {:<10}  CREATED",
+            "NAME",
+            "STATUS",
+            name_width = name_width
+        );
+    }
+
+    for (pod, labels) in &devcontainer_pods {
+        let full_name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("-");
+        let name = strip_pod_prefix(full_name);
+        let status = pod.get("Status").and_then(|v| v.as_str()).unwrap_or("-");
+        let created = pod.get("Created").and_then(|v| v.as_str()).unwrap_or("-");
+        let created_display = format_created_time(created);
+
+        let base_status = match status.to_lowercase().as_str() {
+            "running" => "Running",
+            "stopped" => "Stopped",
+            "exited" => "Exited",
+            "degraded" => "Degraded",
+            _ => status,
+        };
+
+        if has_repo {
+            let repo = labels
+                .as_ref()
+                .and_then(|l| l.get("io.devaipod.repo"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            println!(
+                "{:<name_width$}  {:<10}  {:<repo_width$}  {}",
+                name,
+                base_status,
+                repo,
+                created_display,
+                name_width = name_width,
+                repo_width = repo_width
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:<10}  {}",
+                name,
+                base_status,
+                created_display,
+                name_width = name_width
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn run_container(cli: ContainerCli) -> Result<()> {
@@ -4455,6 +5018,15 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 if !pod_labels_match_instance(labels.as_ref()) {
                     continue;
                 }
+                // Skip devcontainer pods (they have their own list command)
+                if labels
+                    .as_ref()
+                    .and_then(|l| l.get("io.devaipod.mode"))
+                    .and_then(|v| v.as_str())
+                    == Some("devcontainer")
+                {
+                    continue;
+                }
                 if let Some(labels) = labels {
                     enriched["Labels"] = labels;
                 }
@@ -4507,9 +5079,17 @@ fn cmd_list(json_output: bool) -> Result<()> {
             .to_string();
 
         // Get labels from pod inspect (use full name for podman commands)
-        // and filter by instance
+        // and filter by instance + skip devcontainer pods (they have their own list command)
         let labels = get_pod_labels(full_name);
         if !pod_labels_match_instance(labels.as_ref()) {
+            continue;
+        }
+        if labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .and_then(|v| v.as_str())
+            == Some("devcontainer")
+        {
             continue;
         }
         let (repo, pr, task, mode, title) = if let Some(labels) = labels {

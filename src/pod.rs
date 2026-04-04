@@ -263,7 +263,6 @@ const WORKER_CTL_SCRIPT: &str = include_str!("../scripts/devaipod-workerctl.py")
 
 /// Default PATH for containers when we need to synthesize one.
 /// This covers the standard locations where utilities are typically found.
-#[allow(dead_code)] // Used by workspace_container_config, retained for future devcontainer mode
 const DEFAULT_CONTAINER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Attempt to resolve environment variable values containing devcontainer variable syntax.
@@ -277,7 +276,6 @@ const DEFAULT_CONTAINER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// - Returns `None` if the value cannot be meaningfully resolved
 ///
 /// Returns `Some(resolved_value)` if resolved, or `None` if the variable should be skipped.
-#[allow(dead_code)] // Used by workspace_container_config, retained for future devcontainer mode
 fn resolve_env_value(value: &str, var_name: &str) -> Option<String> {
     if !value.contains("${") {
         return Some(value.to_string());
@@ -402,8 +400,7 @@ fn get_host_home() -> Option<PathBuf> {
 pub struct DevaipodPod {
     /// Name of the pod
     pub pod_name: String,
-    /// Name of the workspace container (not created for agent pods; retained for future devcontainer mode)
-    #[allow(dead_code)]
+    /// Name of the workspace container (used in standalone devcontainer mode)
     pub workspace_container: String,
     /// Name of the agent container (task owner in orchestration mode)
     pub agent_container: String,
@@ -1257,6 +1254,402 @@ impl DevaipodPod {
         })
     }
 
+    /// Create a standalone devcontainer pod (workspace + API sidecar, no agent).
+    ///
+    /// This is a simplified version of `create()` for human dev environments:
+    /// - A workspace container with trusted credentials, lifecycle commands, and SSH
+    /// - An API sidecar for future web UI integration
+    /// - No agent, no gator, no worker
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_devcontainer(
+        podman: &PodmanService,
+        project_path: &std::path::Path,
+        devcontainer_config: &DevcontainerConfig,
+        pod_name: &str,
+        global_config: &Config,
+        source: &WorkspaceSource,
+        extra_labels: &[(String, String)],
+        image_override: Option<&str>,
+    ) -> Result<Self> {
+        // Build workspace bind_home: global bind_home + workspace-specific
+        let mut workspace_paths = global_config.bind_home.paths.clone();
+        if let Some(ref ws_config) = global_config.bind_home_workspace {
+            workspace_paths.extend(ws_config.paths.clone());
+        }
+        let workspace_bind_home = BindHomeConfig {
+            paths: workspace_paths,
+            readonly: false,
+        };
+
+        // Agent bind_home is unused in devcontainer mode but needed by the struct
+        let agent_bind_home = BindHomeConfig {
+            paths: global_config.bind_home.paths.clone(),
+            readonly: true,
+        };
+
+        let config = devcontainer_config;
+        let project_name = source.project_name(project_path);
+        let workspace_folder = config.workspace_folder_for_project(&project_name);
+
+        // Determine image
+        let image = if let Some(override_image) = image_override {
+            tracing::info!("Using image override: {}", override_image);
+            override_image.to_string()
+        } else {
+            let devcontainer_json = crate::devcontainer::find_devcontainer_json(project_path)?;
+            let devcontainer_dir = devcontainer_json.parent().unwrap_or(project_path);
+            let image_source = config.image_source(devcontainer_dir)?;
+            let image_tag = format!("devaipod-{}", pod_name);
+            podman
+                .ensure_image(
+                    &image_source,
+                    &image_tag,
+                    config.has_features(),
+                    Some(project_path),
+                )
+                .await
+                .context("Failed to ensure container image")?
+        };
+
+        match podman.get_image_info(&image).await {
+            Ok(info) => tracing::info!("Using image: {}", info),
+            Err(e) => {
+                tracing::debug!("Could not get image details: {}", e);
+                tracing::info!("Using image: {}", image);
+            }
+        }
+
+        let effective_user = if let Some(user) = devcontainer_config.effective_user() {
+            Some(user.to_string())
+        } else {
+            podman.get_image_user(&image).await.unwrap_or(None)
+        };
+
+        let container_home = Self::resolve_container_home_for_user(effective_user.as_deref());
+
+        // Create workspace volume and clone repo
+        let volume_name = format!("{}-workspace", pod_name);
+        let volume_already_exists = podman.volume_exists(&volume_name).await?;
+
+        if !volume_already_exists {
+            tracing::debug!(
+                "Creating workspace volume and cloning {}...",
+                source.description()
+            );
+            podman
+                .create_volume(&volume_name)
+                .await
+                .context("Failed to create workspace volume")?;
+
+            let (clone_script, extra_binds) = match source {
+                WorkspaceSource::LocalRepo(git_info) => {
+                    let script = crate::git::clone_from_local_script(
+                        git_info,
+                        &workspace_folder,
+                        effective_user.as_deref(),
+                    );
+                    let git_dir = git_info.local_path.join(".git");
+                    let bind = format!("{}:/mnt/host-git:ro", git_dir.display());
+                    (script, vec![bind])
+                }
+                WorkspaceSource::RemoteRepo(remote_info) => {
+                    let gh_token = crate::git::get_github_token_with_secret(global_config);
+                    let script = crate::git::clone_remote_script(
+                        remote_info,
+                        &workspace_folder,
+                        effective_user.as_deref(),
+                        gh_token.as_deref(),
+                    );
+                    (script, vec![])
+                }
+                WorkspaceSource::PullRequest(pr_info) => {
+                    let gh_token = crate::git::get_github_token_with_secret(global_config);
+                    let script = crate::git::clone_pr_script(
+                        pr_info,
+                        &workspace_folder,
+                        gh_token.as_deref(),
+                    );
+                    (script, vec![])
+                }
+            };
+
+            let exit_code = podman
+                .run_init_container(
+                    &image,
+                    &volume_name,
+                    "/workspaces",
+                    &["/bin/sh", "-c", &clone_script],
+                    &extra_binds,
+                )
+                .await
+                .context("Failed to run init container for git clone")?;
+
+            if exit_code != 0 {
+                let _ = podman.remove_volume(&volume_name, true).await;
+                bail!(
+                    "Failed to clone into workspace volume (exit code {})",
+                    exit_code
+                );
+            }
+            tracing::debug!("Cloned {}", source.description());
+        } else {
+            tracing::debug!("Using existing workspace volume '{}'", volume_name);
+        }
+
+        // Create an agent-home volume for dotfiles (shared with workspace container)
+        let agent_home_volume = format!("{}-agent-home", pod_name);
+        if !podman.volume_exists(&agent_home_volume).await? {
+            podman
+                .create_volume(&agent_home_volume)
+                .await
+                .context("Failed to create agent-home volume")?;
+        }
+
+        // Clone dotfiles to the agent-home volume if configured
+        if let Some(ref dotfiles) = global_config.dotfiles {
+            Self::clone_dotfiles_to_volume(
+                podman,
+                &image,
+                &agent_home_volume,
+                dotfiles,
+                global_config,
+            )
+            .await?;
+        }
+
+        // Create the pod with metadata labels
+        let mut labels = source.to_labels();
+        labels.extend(extra_labels.iter().cloned());
+        labels.push((
+            "io.devaipod.version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ));
+
+        // Publish the pod-api port to a random host port
+        let mut publish_ports = vec![format!("0.0.0.0::{}", POD_API_PORT)];
+        let forwarded = config.publish_port_specs();
+        let has_forwarded_ports = !forwarded.is_empty();
+        if has_forwarded_ports {
+            tracing::info!(
+                "Publishing {} forwarded port(s) from devcontainer.json",
+                forwarded.len()
+            );
+            publish_ports.extend(forwarded);
+        }
+
+        podman
+            .create_pod(pod_name, &labels, &publish_ports)
+            .await
+            .context("Failed to create pod")?;
+
+        // Container names
+        let workspace_container = format!("{}-workspace", pod_name);
+        let agent_container = format!("{}-agent", pod_name);
+
+        // The agent workspace source is the main workspace volume (no separate agent workspace)
+        let agent_workspace_source = AgentWorkspaceSource::Volume(volume_name.clone());
+
+        // Create the workspace container
+        let workspace_config = Self::workspace_container_config(
+            project_path,
+            &workspace_folder,
+            effective_user.as_deref(),
+            config,
+            &workspace_bind_home,
+            &container_home,
+            &volume_name,
+            &agent_home_volume,
+            &volume_name, // agent_workspace_mount_source = same as workspace volume
+            &agent_workspace_source,
+            global_config,
+            &[], // no labels on workspace container
+        );
+        podman
+            .create_container(&workspace_container, &image, pod_name, workspace_config)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create workspace container: {}",
+                    workspace_container
+                )
+            })?;
+
+        // Create API sidecar container
+        let api_container_name = format!("{}-api", pod_name);
+        let self_image = detect_self_image();
+        let socket_path = crate::podman::get_host_socket_path()
+            .context("Cannot create API sidecar without container socket")?;
+        let api_password = generate_api_password();
+        let api_config = Self::api_container_config(
+            &volume_name,
+            &agent_workspace_source,
+            &volume_name,
+            &workspace_container,
+            &workspace_container, // agent_container_name points to workspace for devcontainer mode
+            &socket_path,
+            &api_password,
+            &workspace_folder,
+        );
+        podman
+            .create_container(&api_container_name, &self_image, pod_name, api_config)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create API sidecar container: {}",
+                    api_container_name
+                )
+            })?;
+
+        tracing::debug!("Created devcontainer pod '{}' with 2 containers", pod_name);
+
+        Ok(Self {
+            pod_name: pod_name.to_string(),
+            workspace_container,
+            agent_container,
+            gator_container: None,
+            api_container: Some(api_container_name),
+            worker_container: None,
+            image,
+            workspace_folder,
+            workspace_bind_home,
+            agent_bind_home,
+            container_home,
+            task: None,
+            enable_gator: false,
+            enable_orchestration: false,
+            repo_url: source.upstream_url(),
+            branch: source.branch_name(),
+            has_forwarded_ports,
+        })
+    }
+
+    /// Install dotfiles in the workspace container (devcontainer mode)
+    ///
+    /// In standalone devcontainer mode, dotfiles are installed in the
+    /// workspace container for the human user.
+    pub async fn install_dotfiles_workspace(
+        &self,
+        podman: &PodmanService,
+        dotfiles: &DotfilesConfig,
+        user: Option<&str>,
+    ) -> Result<()> {
+        self.install_dotfiles_in_container(
+            podman,
+            dotfiles,
+            &self.workspace_container,
+            user,
+            None, // use default home (no override)
+        )
+        .await
+    }
+
+    /// Run lifecycle commands in the workspace container (devcontainer mode)
+    pub async fn run_lifecycle_commands_workspace(
+        &self,
+        podman: &PodmanService,
+        config: &DevcontainerConfig,
+    ) -> Result<()> {
+        let user = config.effective_user();
+        let workdir = Some(self.workspace_folder.as_str());
+
+        if let Some(cmd) = &config.on_create_command {
+            let shell_cmd = cmd.to_shell_command();
+            tracing::debug!("Running onCreateCommand in {}...", self.workspace_container);
+            self.run_shell_command_in(&self.workspace_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| {
+                    format!("onCreateCommand failed in {}", self.workspace_container)
+                })?;
+        }
+
+        if let Some(cmd) = &config.post_create_command {
+            let shell_cmd = cmd.to_shell_command();
+            tracing::debug!(
+                "Running postCreateCommand in {}...",
+                self.workspace_container
+            );
+            self.run_shell_command_in(&self.workspace_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| {
+                    format!("postCreateCommand failed in {}", self.workspace_container)
+                })?;
+        }
+
+        if let Some(cmd) = &config.post_start_command {
+            let shell_cmd = cmd.to_shell_command();
+            tracing::debug!(
+                "Running postStartCommand in {}...",
+                self.workspace_container
+            );
+            self.run_shell_command_in(&self.workspace_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| {
+                    format!("postStartCommand failed in {}", self.workspace_container)
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Copy bind_home files into the workspace container (devcontainer mode)
+    pub async fn copy_bind_home_files_workspace(
+        &self,
+        podman: &PodmanService,
+        workspace_bind_home: &BindHomeConfig,
+        container_home: &str,
+        container_user: Option<&str>,
+    ) -> Result<()> {
+        if crate::podman::is_container_mode() {
+            if !workspace_bind_home.paths.is_empty() {
+                bail!(
+                    "Container mode: bind_home is not supported ({} paths configured). \
+                     Use [trusted.secrets] in your config instead.",
+                    workspace_bind_home.paths.len()
+                );
+            }
+            return Ok(());
+        }
+
+        let Some(host_home) = get_host_home() else {
+            tracing::warn!("HOME environment variable not set, skipping bind_home file copy");
+            return Ok(());
+        };
+
+        for relative_path in &workspace_bind_home.paths {
+            let source = host_home.join(relative_path);
+            let target = format!("{}/{}", container_home, relative_path);
+
+            if !source.exists() {
+                tracing::warn!(
+                    "bind_home: skipping '{}' for workspace (not found at {})",
+                    relative_path,
+                    source.display()
+                );
+                continue;
+            }
+
+            tracing::debug!(
+                "bind_home: copying {} -> {}:{} for workspace",
+                source.display(),
+                self.workspace_container,
+                target
+            );
+
+            if let Err(e) = podman
+                .copy_to_container(&self.workspace_container, &source, &target, container_user)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to copy {} to workspace container: {}",
+                    relative_path,
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Start the pod (starts all containers)
     pub async fn start(&self, podman: &PodmanService) -> Result<()> {
         podman
@@ -1280,10 +1673,10 @@ impl DevaipodPod {
         Ok(())
     }
 
-    /// Install dotfiles in the workspace container
+    /// Install dotfiles in the workspace container (agent pod mode)
     ///
-    /// Note: This is currently a no-op because agent pods no longer have a
-    /// workspace container. Kept for future standalone devcontainer mode.
+    /// No-op for agent pods since they don't have a workspace container.
+    /// For standalone devcontainer mode, use `install_dotfiles_workspace()`.
     pub async fn install_dotfiles(
         &self,
         _podman: &PodmanService,
@@ -2149,9 +2542,8 @@ fi
 
     /// Create container config for the workspace container.
     ///
-    /// Not currently used in agent pods (which no longer include a workspace
-    /// container), but retained for future standalone devcontainer mode.
-    #[allow(dead_code)]
+    /// Used by standalone devcontainer mode (`devaipod devcontainer run`).
+    /// Not included in agent pods.
     #[allow(clippy::too_many_arguments)]
     fn workspace_container_config(
         _project_path: &Path,

@@ -2088,6 +2088,17 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
     let mut tasks = Vec::with_capacity(cached_pods.len());
 
     for pod in cached_pods {
+        // Skip devcontainer pods (they have their own management path)
+        if pod
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .map(|m| m == "devcontainer")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
         let is_running = pod.status.eq_ignore_ascii_case("running");
         let host = host.clone();
         let client = client.clone();
