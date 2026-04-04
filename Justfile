@@ -249,11 +249,19 @@ test-integration image=default_test_image: container-build build-integration
     if ! podman run --rm --privileged alpine true 2>/dev/null; then
         PRIV_FLAG="--security-opt label=disable"
     fi
+    # Create the workspaces directory for workspace-v2 bind mounts.
+    # Same pattern as container-run: the host dir is bind-mounted into
+    # the runner at /var/lib/devaipod-workspaces, and DEVAIPOD_HOST_WORKDIR
+    # tells devaipod the host-side path for creating sibling container mounts.
+    WORKSPACES_DIR="$HOME/.local/share/devaipod/workspaces"
+    mkdir -p "$WORKSPACES_DIR"
     podman run --rm $PRIV_FLAG --pids-limit=-1 \
         -v "$HOST_SOCKET":/run/docker.sock \
         -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
         -v /tmp:/tmp \
         -v "$CONFIG":/root/.config/devaipod.toml:ro \
+        -v "$WORKSPACES_DIR":/var/lib/devaipod-workspaces \
+        -e DEVAIPOD_HOST_WORKDIR="$WORKSPACES_DIR" \
         -e DEVAIPOD_TEST_IMAGE={{image}} \
         -e DEVAIPOD_CONTAINER_IMAGE={{ CONTAINER_IMAGE }}:latest \
         {{ CONTAINER_IMAGE }}-integration:latest
