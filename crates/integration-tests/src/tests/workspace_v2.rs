@@ -3,13 +3,13 @@
 //! These tests verify that workspace-v2 correctly uses host bind mounts
 //! (rather than named volumes) for agent workspaces from local repos.
 
-use color_eyre::eyre::bail;
 use color_eyre::Result;
+use color_eyre::eyre::bail;
 use std::process::Command;
 use std::time::Duration;
 
 use crate::{
-    podman_integration_test, run_devaipod_in, short_name, unique_test_name, PodGuard, TestRepo,
+    PodGuard, TestRepo, podman_integration_test, run_devaipod_in, short_name, unique_test_name,
 };
 
 /// Verify that the agent container's /workspaces is a bind mount, not a volume.

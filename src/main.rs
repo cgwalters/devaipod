@@ -413,6 +413,18 @@ struct UpOptions {
     /// interactive approval for tool usage.
     #[arg(long)]
     no_auto_approve: bool,
+    /// Additional source directories to mount read-only in the agent container.
+    ///
+    /// Each directory is bind-mounted at /mnt/source/<dirname>/ (read-only).
+    /// Can be specified multiple times.
+    /// If the directory is a git repository, it will be automatically cloned
+    /// into the agent workspace for convenience.
+    ///
+    /// Examples:
+    ///   --source-dir ~/src/api --source-dir ~/docs
+    ///   --source-dir .   # Current directory as read-only source
+    #[arg(long = "source-dir", value_name = "DIR")]
+    source_dirs: Vec<PathBuf>,
 }
 
 /// Internal options for workspace creation (like `podman create` vs `podman run`)
@@ -446,6 +458,8 @@ struct CreateOptions {
     use_default_devcontainer: bool,
     /// Whether to auto-approve all tool permissions (default: true)
     auto_approve: bool,
+    /// Additional source directories to mount read-only
+    source_dirs: Vec<PathBuf>,
 }
 
 impl CreateOptions {
@@ -465,6 +479,7 @@ impl CreateOptions {
             devcontainer_json: opts.devcontainer_json.clone(),
             use_default_devcontainer: opts.use_default_devcontainer,
             auto_approve: !opts.no_auto_approve,
+            source_dirs: opts.source_dirs.clone(),
         }
     }
 }
@@ -808,6 +823,9 @@ enum HostCommand {
         /// interactive approval for tool usage.
         #[arg(long)]
         no_auto_approve: bool,
+        /// Additional source directories to mount read-only in the agent container
+        #[arg(long = "source-dir", value_name = "DIR")]
+        source_dirs: Vec<PathBuf>,
     },
     /// Generate shell completions
     ///
@@ -1403,6 +1421,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             devcontainer_json,
             use_default_devcontainer,
             no_auto_approve,
+            source_dirs,
         } => {
             let source = resolve_source(source.as_deref(), &config)?;
 
@@ -1479,6 +1498,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 devcontainer_json.as_deref(),
                 use_default_devcontainer,
                 !no_auto_approve,
+                &source_dirs,
             )
             .await?;
 
@@ -1777,6 +1797,62 @@ fn merge_cli_mcp_into_config(
 
 /// Create a workspace from a source (local path, remote URL, or PR)
 ///
+/// Canonicalize a list of `--source-dir` paths, warning and skipping any that
+/// don't resolve (e.g. non-existent directories).
+fn canonicalize_source_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        .filter_map(|d| match d.canonicalize() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("Skipping --source-dir {}: {}", d.display(), e);
+                None
+            }
+        })
+        .collect()
+}
+
+/// Write the workspace state file for a host-dir workspace.
+///
+/// Best-effort: logs a warning on failure rather than propagating errors,
+/// since the pod is already created and running at this point.
+fn write_workspace_state(
+    pod_name: &str,
+    source: String,
+    source_dirs: &[PathBuf],
+    task: Option<&str>,
+    title: Option<&str>,
+) {
+    let ws_dir = match agent_dir::agent_dir_container_path(pod_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Cannot resolve workspace dir for state file: {e:#}");
+            return;
+        }
+    };
+    if !ws_dir.exists() {
+        // Not a host-dir workspace (remote/PR with volumes) — skip.
+        return;
+    }
+
+    let state = agent_dir::WorkspaceState {
+        pod_name: pod_name.to_string(),
+        source,
+        source_dirs: source_dirs.to_vec(),
+        created: chrono::Utc::now().to_rfc3339(),
+        last_active: None,
+        task: task.map(|s| s.to_string()),
+        title: title.map(|s| s.to_string()),
+        completion_status: None,
+    };
+
+    if let Err(e) = state.save(&ws_dir) {
+        tracing::warn!("Failed to write workspace state for {pod_name}: {e:#}");
+    }
+
+    // Record in recent sources for the launcher
+    agent_dir::record_recent_source(&state.source);
+}
+
 /// This is the inner "create" operation that handles all the common pod setup
 /// logic without any SSH or other post-setup behavior. Both `cmd_up` and `cmd_run`
 /// use this function internally.
@@ -2147,6 +2223,8 @@ async fn create_workspace_from_local(
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         project_path,
@@ -2163,11 +2241,21 @@ async fn create_workspace_from_local(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
+        &source_dirs,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
     finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    // Write workspace state file for host-dir workspaces
+    write_workspace_state(
+        &pod_name,
+        project_path.display().to_string(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
 
     drop(podman);
 
@@ -2336,6 +2424,8 @@ async fn create_workspace_from_remote(
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -2354,11 +2444,22 @@ async fn create_workspace_from_remote(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
+        &source_dirs,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
     finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    // Write workspace state file (best-effort; remote workspaces may not
+    // have a host-dir yet, in which case this is a no-op).
+    write_workspace_state(
+        &pod_name,
+        remote_url.to_string(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
 
     drop(podman);
 
@@ -2503,6 +2604,8 @@ async fn create_workspace_from_pr(
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -2521,11 +2624,21 @@ async fn create_workspace_from_pr(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
+        &source_dirs,
     )
     .await
     .context("Failed to create devaipod pod")?;
 
     finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    // Write workspace state file for PR workspaces (best-effort).
+    write_workspace_state(
+        &pod_name,
+        pr_ref.pr_url(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
 
     drop(podman);
 
@@ -2595,6 +2708,7 @@ async fn cmd_run(
     devcontainer_json: Option<&str>,
     use_default_devcontainer: bool,
     auto_approve: bool,
+    source_dirs: &[PathBuf],
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
@@ -2610,6 +2724,7 @@ async fn cmd_run(
         devcontainer_json: devcontainer_json.map(|s| s.to_string()),
         use_default_devcontainer,
         auto_approve,
+        source_dirs: source_dirs.to_vec(),
     };
 
     // Create the workspace - no SSH by default (async execution)
@@ -3572,6 +3687,7 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         None,  // no devcontainer override
         false, // don't override project devcontainer
         true,  // auto_approve
+        &[],   // no source_dirs
     )
     .await?;
 
@@ -4995,6 +5111,7 @@ async fn cmd_rebuild(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         true, // auto_approve: rebuilds keep default behavior
+        &[],  // source_dirs: not supported for rebuild yet
     )
     .await
     .context("Failed to recreate pod")?;

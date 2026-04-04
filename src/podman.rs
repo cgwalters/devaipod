@@ -1054,7 +1054,14 @@ impl PodmanService {
         extra_binds: &[String],
         user: Option<&str>,
     ) -> Result<i32> {
-        let container_name = format!("{}-init", volume_name);
+        // Sanitize the container name: when volume_name is a host path
+        // (e.g. for HostDir bind mounts), replace slashes and use only
+        // the last path component so the name is valid for podman.
+        let base = std::path::Path::new(volume_name)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| volume_name.replace('/', "-"));
+        let container_name = format!("{}-init", base);
 
         // Remove any existing init container
         let _ = self

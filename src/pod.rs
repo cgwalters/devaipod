@@ -162,6 +162,16 @@ fn extract_repo_from_url(url: &str) -> Option<String> {
     None
 }
 
+/// Extract a short directory name from a path for use as a mount point basename.
+///
+/// Returns the final component of the path, or "source" if the path has no
+/// final component (e.g. `/`).
+fn source_dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "source".to_string())
+}
+
 /// Common device paths that should be auto-passed to development containers if they exist on the host.
 ///
 /// These devices are commonly needed for:
@@ -468,6 +478,7 @@ impl DevaipodPod {
         enable_orchestration: bool,
         worker_gator_mode: WorkerGatorMode,
         auto_approve: bool,
+        source_dirs: &[PathBuf],
     ) -> Result<Self> {
         // Note: container_home is resolved after we determine the image, since
         // we need to query the image for the user if devcontainer doesn't specify one
@@ -818,6 +829,91 @@ impl DevaipodPod {
         // Write scripts to agent home volume (workerctl for orchestration)
         Self::write_scripts_to_volume(podman, &image, &agent_home_volume).await?;
 
+        // Build source directory mounts for the agent container.
+        // For LocalRepo, the repo itself is mounted at /mnt/source/<repo-dirname>.
+        // Additional --source-dir paths are mounted at /mnt/source/<dirname>.
+        let mut source_mounts: Vec<(PathBuf, String)> = Vec::new();
+
+        // Add the local repo as a source mount (replaces old source_repo_host_path)
+        if let WorkspaceSource::LocalRepo(git_info) = source {
+            let dirname = source_dir_name(&git_info.local_path);
+            source_mounts.push((
+                git_info.local_path.clone(),
+                format!("/mnt/source/{}", dirname),
+            ));
+        }
+
+        // Add --source-dir paths
+        for dir in source_dirs {
+            let dirname = source_dir_name(dir);
+            let target = format!("/mnt/source/{}", dirname);
+            // Avoid duplicate mount targets (e.g., --source-dir . when . is the local repo)
+            if source_mounts.iter().any(|(_, t)| t == &target) {
+                tracing::warn!(
+                    "Skipping --source-dir {}: mount target {} already in use",
+                    dir.display(),
+                    target
+                );
+            } else {
+                source_mounts.push((dir.clone(), target));
+            }
+        }
+
+        // Convenience: for each --source-dir that is a git repo, clone it into
+        // the agent workspace so the agent can work on it immediately.
+        for (host_path, container_target) in &source_mounts {
+            // Skip the main repo source (already cloned above for LocalRepo)
+            if let WorkspaceSource::LocalRepo(git_info) = source
+                && git_info.local_path == *host_path
+            {
+                continue;
+            }
+            // Check if this source dir is a git repo
+            let git_dir = host_path.join(".git");
+            if git_dir.exists() {
+                let dirname = source_dir_name(host_path);
+                let clone_target = format!("/workspaces/{}", dirname);
+                let clone_script = format!(
+                    "git clone {} {} && {}",
+                    container_target,
+                    &clone_target,
+                    if let Some(ref user) = effective_user {
+                        format!("chown -R {} {}", user, &clone_target)
+                    } else {
+                        "true".to_string()
+                    }
+                );
+                tracing::debug!(
+                    "Cloning source-dir git repo {} into agent workspace...",
+                    dirname
+                );
+                let extra_binds = vec![format!("{}:{}:ro", host_path.display(), container_target)];
+                let exit_code = podman
+                    .run_init_container(
+                        &image,
+                        &agent_workspace_mount_source,
+                        "/workspaces",
+                        &["/bin/sh", "-c", &clone_script],
+                        &extra_binds,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to clone source-dir {} into agent workspace",
+                            dirname
+                        )
+                    })?;
+                if exit_code != 0 {
+                    tracing::warn!(
+                        "Failed to clone source-dir {} into agent workspace (exit code {})",
+                        dirname,
+                        exit_code
+                    );
+                    // Don't fail the whole pod creation for a convenience clone
+                }
+            }
+        }
+
         // Write gator config to workspace volume (if gator is enabled)
         // Gator watches this file via inotify for live scope updates
         if enable_gator {
@@ -1010,13 +1106,6 @@ impl DevaipodPod {
             (None, None)
         };
 
-        // Determine source repo host path for LocalRepo bind mount.
-        // This is the whole source repo directory mounted read-only at /mnt/source/.
-        let source_repo_host_path = match source {
-            WorkspaceSource::LocalRepo(git_info) => Some(git_info.local_path.clone()),
-            _ => None,
-        };
-
         let agent_config = Self::agent_container_config(
             project_path,
             &workspace_folder,
@@ -1032,7 +1121,7 @@ impl DevaipodPod {
             worker_workspace_volume_name.as_deref(),
             global_config,
             auto_approve,
-            source_repo_host_path.as_deref(),
+            &source_mounts,
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -2462,7 +2551,7 @@ exec sleep infinity
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
         auto_approve: bool,
-        source_repo_host_path: Option<&Path>,
+        source_mounts: &[(PathBuf, String)],
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
@@ -2539,17 +2628,19 @@ exec sleep infinity
             });
         }
 
-        // For LocalRepo, bind-mount the whole source repo read-only at /mnt/source/.
-        // Note: `source_repo_host_path` comes from `git_info.local_path`, which is the
-        // path as seen by the controlplane process. In host mode this is the real host
-        // path and podman resolves it correctly. In container mode the path is
-        // container-internal, which only works if the source repo directory is also
-        // accessible to the host podman daemon (e.g. via a shared bind mount). This is
-        // the same limitation that affects the existing `.git` init-container mount.
-        if let Some(repo_path) = source_repo_host_path {
+        // Mount source directories read-only.
+        // Each entry is (host_path, container_target). For LocalRepo, this includes
+        // the repo itself at /mnt/source/<repo-dirname>. Additional --source-dir
+        // paths are also included.
+        //
+        // Note: host paths come from the controlplane process. In host mode they are
+        // real host paths and podman resolves them correctly. In container mode the
+        // path is container-internal, which only works if the directory is also
+        // accessible to the host podman daemon (e.g. via a shared bind mount).
+        for (host_path, container_target) in source_mounts {
             mounts.push(crate::podman::MountConfig {
-                source: repo_path.to_string_lossy().to_string(),
-                target: "/mnt/source".to_string(),
+                source: host_path.to_string_lossy().to_string(),
+                target: container_target.clone(),
                 readonly: true,
             });
         }
@@ -3460,7 +3551,7 @@ mod tests {
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             true, // auto_approve
-            None, // source_repo_host_path
+            &[],  // source_mounts
         );
 
         // Volume mounts: agent workspace, main workspace (readonly), and agent home
@@ -3526,7 +3617,7 @@ mod tests {
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             false, // auto_approve disabled
-            None,  // source_repo_host_path
+            &[],   // source_mounts
         );
 
         assert!(
@@ -3559,7 +3650,7 @@ mod tests {
             Some("test-worker-workspace"), // worker_workspace_volume
             &global_config,
             true, // auto_approve
-            None, // source_repo_host_path
+            &[],  // source_mounts
         );
 
         // With orchestration enabled, should have 4 volume mounts:
@@ -3622,7 +3713,7 @@ mod tests {
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
-            None, // source_repo_host_path
+            &[],  // source_mounts
         );
 
         // No bind mounts when using volumes
@@ -3660,7 +3751,7 @@ mod tests {
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             true, // auto_approve
-            None, // source_repo_host_path
+            &[],  // source_mounts
         );
 
         // Verify file_secrets are included for agent container
@@ -4113,7 +4204,7 @@ mod tests {
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
-            None, // source_repo_host_path
+            &[],  // source_mounts
         );
 
         // Agent should have no secrets
@@ -4791,7 +4882,7 @@ mod tests {
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
-            None, // source_repo_host_path
+            &[],  // source_mounts
         );
 
         // Should have devcontainer secrets (LLM keys go to agent)
@@ -4946,28 +5037,28 @@ mod tests {
         let workspace_folder = "/workspaces/myproject";
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
-        let host_path =
-            PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
+        let host_path = PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
 
         let global_config = crate::config::Config::default();
-        let agent_workspace_source =
-            AgentWorkspaceSource::HostDir { host_path: host_path.clone() };
+        let agent_workspace_source = AgentWorkspaceSource::HostDir {
+            host_path: host_path.clone(),
+        };
         let container_config = DevaipodPod::agent_container_config(
             project_path,
             workspace_folder,
             &bind_home,
             container_home,
             None,
-            false,                  // enable_gator
-            false,                  // enable_orchestration
-            "test-main-workspace",  // main workspace (read-only reference)
+            false,                        // enable_gator
+            false,                        // enable_orchestration
+            "test-main-workspace",        // main workspace (read-only reference)
             &host_path.to_string_lossy(), // agent workspace mount source is the host path
             &agent_workspace_source,
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             true, // auto_approve
-            None, // source_repo_host_path
+            &[],  // source_mounts
         );
 
         // With HostDir, the agent workspace is a bind mount, not a volume mount.
@@ -4976,8 +5067,7 @@ mod tests {
             container_config
                 .mounts
                 .iter()
-                .any(|m| m.source == host_path.to_string_lossy()
-                    && m.target == "/workspaces"),
+                .any(|m| m.source == host_path.to_string_lossy() && m.target == "/workspaces"),
             "mounts should contain a bind mount for /workspaces with host path as source"
         );
 
@@ -5009,11 +5099,72 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_container_config_with_source_mounts() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+
+        let global_config = crate::config::Config::default();
+        let source_mounts: Vec<(PathBuf, String)> = vec![
+            (
+                PathBuf::from("/home/user/src/api"),
+                "/mnt/source/api".to_string(),
+            ),
+            (
+                PathBuf::from("/home/user/docs"),
+                "/mnt/source/docs".to_string(),
+            ),
+        ];
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false,                  // enable_gator
+            false,                  // enable_orchestration
+            "test-main-workspace",  // main workspace
+            "test-agent-workspace", // agent workspace
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
+            "test-agent-home",
+            None,
+            &global_config,
+            true,
+            &source_mounts,
+        );
+
+        // Source mounts should appear as read-only bind mounts
+        assert_eq!(
+            container_config.mounts.len(),
+            2,
+            "should have 2 source mount bind mounts"
+        );
+        assert_eq!(container_config.mounts[0].source, "/home/user/src/api");
+        assert_eq!(container_config.mounts[0].target, "/mnt/source/api");
+        assert!(container_config.mounts[0].readonly);
+        assert_eq!(container_config.mounts[1].source, "/home/user/docs");
+        assert_eq!(container_config.mounts[1].target, "/mnt/source/docs");
+        assert!(container_config.mounts[1].readonly);
+    }
+
+    #[test]
+    fn test_source_dir_name_helper() {
+        assert_eq!(source_dir_name(Path::new("/home/user/myrepo")), "myrepo");
+        assert_eq!(source_dir_name(Path::new("/tmp")), "tmp");
+        assert_eq!(source_dir_name(Path::new("/")), "source");
+        assert_eq!(
+            source_dir_name(Path::new("/home/user/my-project")),
+            "my-project"
+        );
+    }
+
+    #[test]
     fn test_api_container_config_hostdir() {
-        let host_path =
-            PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
-        let agent_workspace_source =
-            AgentWorkspaceSource::HostDir { host_path: host_path.clone() };
+        let host_path = PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
+        let agent_workspace_source = AgentWorkspaceSource::HostDir {
+            host_path: host_path.clone(),
+        };
         let main_workspace_volume = "test-main-workspace";
         let workspace_container = "devaipod-test-workspace";
         let agent_container = "devaipod-test-agent";
@@ -5036,8 +5187,7 @@ mod tests {
             container_config
                 .mounts
                 .iter()
-                .any(|m| m.source == host_path.to_string_lossy()
-                    && m.target == "/workspaces"),
+                .any(|m| m.source == host_path.to_string_lossy() && m.target == "/workspaces"),
             "mounts should contain a bind mount for /workspaces with host path as source"
         );
 
@@ -5077,13 +5227,13 @@ mod tests {
         let config = DevcontainerConfig::default();
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
-        let host_path =
-            PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
+        let host_path = PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
 
         let volume_name = "test-volume";
         let global_config = crate::config::Config::default();
-        let agent_workspace_source =
-            AgentWorkspaceSource::HostDir { host_path: host_path.clone() };
+        let agent_workspace_source = AgentWorkspaceSource::HostDir {
+            host_path: host_path.clone(),
+        };
         let container_config = DevaipodPod::workspace_container_config(
             project_path,
             workspace_folder,
@@ -5132,16 +5282,14 @@ mod tests {
             container_config
                 .volume_mounts
                 .iter()
-                .any(|(vol, target)| vol == "test-volume"
-                    && target == "/mnt/main-workspace:ro"),
+                .any(|(vol, target)| vol == "test-volume" && target == "/mnt/main-workspace:ro"),
             "volume_mounts should still contain main workspace at /mnt/main-workspace:ro"
         );
         assert!(
             container_config
                 .volume_mounts
                 .iter()
-                .any(|(vol, target)| vol == "test-agent-home"
-                    && target == "/opt/devaipod:ro"),
+                .any(|(vol, target)| vol == "test-agent-home" && target == "/opt/devaipod:ro"),
             "volume_mounts should still contain agent home"
         );
     }
