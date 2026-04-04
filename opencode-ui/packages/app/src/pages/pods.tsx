@@ -37,6 +37,26 @@ import {
   timeSection,
   type TimeSection,
 } from "@/context/devaipod"
+import { apiFetch } from "@/utils/devaipod-api"
+
+// ---------------------------------------------------------------------------
+// Diff types (from GET /api/devaipod/pods/{name}/diff)
+// ---------------------------------------------------------------------------
+
+interface DiffCommit {
+  sha: string
+  message: string
+  author: string
+  timestamp: string
+}
+
+interface DiffResponse {
+  branch: string
+  commit_count: number
+  commits: DiffCommit[]
+  diff: string
+  is_stat: boolean
+}
 
 // ---------------------------------------------------------------------------
 // Page wrapper — provides context
@@ -162,6 +182,10 @@ function PodsPageContent() {
   const [showForm, setShowForm] = createSignal(false)
   const [focusedIdx, setFocusedIdx] = createSignal(-1)
   const [searchText, setSearchText] = createSignal("")
+  const [prefillSource, setPrefillSource] = createSignal("")
+
+  // Ref for the launch form area so we can scroll to it
+  let launchRef: HTMLDivElement | undefined
 
   // Derive completion status for a pod from agent status
   const podCompletionStatus = (podName: string) =>
@@ -321,6 +345,18 @@ function PodsPageContent() {
     return offset
   }
 
+  // Quick-launch from a repo section: scroll to and open the launch form
+  function quickLaunchForRepo(repoLabel: string) {
+    // Try to find a recent source matching this repo label
+    const match = ctx.recentSources.find((rs) =>
+      rs.source.toLowerCase().includes(repoLabel.toLowerCase()),
+    )
+    setPrefillSource(match?.source ?? repoLabel)
+    setShowForm(true)
+    // Scroll to the launch form
+    setTimeout(() => launchRef?.scrollIntoView({ behavior: "smooth", block: "start" }), 50)
+  }
+
   return (
     <div class="h-full overflow-y-auto">
     <div class="mx-auto mt-8 w-full max-w-3xl px-4 pb-16">
@@ -355,11 +391,8 @@ function PodsPageContent() {
         </Card>
       </Show>
 
-      {/* Control plane repo-grouped view */}
-      <ControlPlaneView />
-
       {/* Launch form section */}
-      <div class="mb-6">
+      <div class="mb-6" ref={launchRef}>
         <Show
           when={showForm()}
           fallback={
@@ -368,43 +401,9 @@ function PodsPageContent() {
             </Button>
           }
         >
-          <LaunchForm onClose={() => setShowForm(false)} />
+          <LaunchForm onClose={() => setShowForm(false)} prefillSource={prefillSource()} />
         </Show>
       </div>
-
-      {/* Search bar and filter chips */}
-      <Show when={ctx.pods.length > 0}>
-        <div class="mb-4 flex flex-col gap-2">
-          <input
-            type="text"
-            placeholder="Search pods... (repo:name, task:text, status:running)"
-            class="w-full text-12-regular bg-background-base border border-border-base rounded px-3 py-2 text-text-strong placeholder:text-text-weak focus:outline-none focus:border-border-active-base"
-            value={searchText()}
-            onInput={(e) => setSearchText(e.currentTarget.value)}
-          />
-          <div class="flex gap-1">
-            <For each={["all", "running", "stopped", "done"] as PodFilter[]}>
-              {(f) => {
-                const count = () => filterCounts()[f]
-                return (
-                  <button
-                    type="button"
-                    class="px-2.5 py-1 rounded text-12-regular transition-colors cursor-pointer"
-                    classList={{
-                      "bg-fill-element-active text-text-strong": activeStatusFilter() === f,
-                      "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base": activeStatusFilter() !== f,
-                    }}
-                    onClick={() => applyStatusFilter(f)}
-                  >
-                    {f.charAt(0).toUpperCase() + f.slice(1)}
-                    <span class="ml-1 opacity-60">{count()}</span>
-                  </button>
-                )
-              }}
-            </For>
-          </div>
-        </div>
-      </Show>
 
       {/* Advisor placeholder when no advisor pod exists */}
       <Show when={!ctx.hasAdvisor()}>
@@ -416,56 +415,101 @@ function PodsPageContent() {
         {([podName, info]) => <LaunchCard podName={podName} state={info} />}
       </For>
 
-      {/* Pod list */}
-      <Show
-        when={ctx.pods.length > 0 || pendingLaunches().length > 0}
-        fallback={
-          <Show when={ctx.connected !== undefined}>
-            <div class="flex flex-col items-center justify-center py-12 text-text-weak">
-              <div class="mb-3 opacity-30">
-                <Icon name="server" size="large" />
-              </div>
-              <p class="text-14-medium mb-1">No workspaces found</p>
-              <p class="text-12-regular">Launch one with the button above</p>
+      {/* Control plane repo-grouped view — primary content */}
+      <ControlPlaneView onQuickLaunch={quickLaunchForRepo} />
+
+      {/* Empty state when no data at all */}
+      <Show when={ctx.pods.length === 0 && ctx.controlPlane.length === 0 && pendingLaunches().length === 0}>
+        <Show when={ctx.connected !== undefined}>
+          <div class="flex flex-col items-center justify-center py-12 text-text-weak">
+            <div class="mb-3 opacity-30">
+              <Icon name="server" size="large" />
             </div>
-          </Show>
-        }
-      >
-        <Show
-          when={filteredPods().length > 0}
-          fallback={
-            <div class="flex flex-col items-center justify-center py-8 text-text-weak">
-              <p class="text-12-regular">
-                {searchText().trim() ? "No matching workspaces" : "No workspaces"}
-              </p>
-            </div>
-          }
-        >
-          <div class="flex flex-col gap-3">
-            <For each={sectionedPods()}>
-              {(section, sectionIdx) => {
-                const offset = () => flatIndexOffset(sectionIdx())
-                return (
-                  <>
-                    <Show when={showDividers()}>
-                      <SectionDivider label={section.section} />
-                    </Show>
-                    <For each={section.pods}>
-                      {(pod, podIdx) => (
-                        <PodCard
-                          pod={pod}
-                          focused={focusedIdx() === offset() + podIdx()}
-                          onFocus={() => setFocusedIdx(offset() + podIdx())}
-                        />
-                      )}
-                    </For>
-                  </>
-                )
-              }}
-            </For>
+            <p class="text-14-medium mb-1">No workspaces found</p>
+            <p class="text-12-regular">Launch one with the button above</p>
           </div>
         </Show>
-        </Show>
+      </Show>
+
+      {/* All Pods — collapsible flat list for power users */}
+      <Show when={ctx.pods.length > 0}>
+        <div class="mt-8">
+          <Collapsible variant="ghost">
+            <Collapsible.Trigger class="flex items-center gap-2 text-13-regular text-text-weak cursor-pointer hover:text-text-secondary-base transition-colors">
+              <Collapsible.Arrow />
+              All Pods ({ctx.pods.length})
+            </Collapsible.Trigger>
+            <Collapsible.Content class="mt-3">
+              {/* Search bar and filter chips */}
+              <div class="mb-4 flex flex-col gap-2">
+                <input
+                  type="text"
+                  placeholder="Search pods... (repo:name, task:text, status:running)"
+                  class="w-full text-12-regular bg-background-base border border-border-base rounded px-3 py-2 text-text-strong placeholder:text-text-weak focus:outline-none focus:border-border-active-base"
+                  value={searchText()}
+                  onInput={(e) => setSearchText(e.currentTarget.value)}
+                />
+                <div class="flex gap-1">
+                  <For each={["all", "running", "stopped", "done"] as PodFilter[]}>
+                    {(f) => {
+                      const count = () => filterCounts()[f]
+                      return (
+                        <button
+                          type="button"
+                          class="px-2.5 py-1 rounded text-12-regular transition-colors cursor-pointer"
+                          classList={{
+                            "bg-fill-element-active text-text-strong": activeStatusFilter() === f,
+                            "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base": activeStatusFilter() !== f,
+                          }}
+                          onClick={() => applyStatusFilter(f)}
+                        >
+                          {f.charAt(0).toUpperCase() + f.slice(1)}
+                          <span class="ml-1 opacity-60">{count()}</span>
+                        </button>
+                      )
+                    }}
+                  </For>
+                </div>
+              </div>
+
+              <Show
+                when={filteredPods().length > 0}
+                fallback={
+                  <div class="flex flex-col items-center justify-center py-8 text-text-weak">
+                    <p class="text-12-regular">
+                      {searchText().trim() ? "No matching workspaces" : "No workspaces"}
+                    </p>
+                  </div>
+                }
+              >
+                <div class="flex flex-col gap-3">
+                  <For each={sectionedPods()}>
+                    {(section, sectionIdx) => {
+                      const offset = () => flatIndexOffset(sectionIdx())
+                      return (
+                        <>
+                          <Show when={showDividers()}>
+                            <SectionDivider label={section.section} />
+                          </Show>
+                          <For each={section.pods}>
+                            {(pod, podIdx) => (
+                              <PodCard
+                                pod={pod}
+                                focused={focusedIdx() === offset() + podIdx()}
+                                onFocus={() => setFocusedIdx(offset() + podIdx())}
+                              />
+                            )}
+                          </For>
+                        </>
+                      )
+                    }}
+                  </For>
+                </div>
+              </Show>
+            </Collapsible.Content>
+          </Collapsible>
+        </div>
+      </Show>
 
       {/* Devcontainers section */}
       <DevcontainerSection />
@@ -493,7 +537,7 @@ function timeAgo(iso: string): string {
   return `${days}d ago`
 }
 
-function ControlPlaneView() {
+function ControlPlaneView(props: { onQuickLaunch: (repoLabel: string) => void }) {
   const ctx = useDevaipod()
   const [showInactive, setShowInactive] = createSignal(false)
 
@@ -510,7 +554,7 @@ function ControlPlaneView() {
         <h2 class="text-16-medium text-text-strong mb-4">Repos</h2>
         <div class="flex flex-col gap-3">
           <For each={activeRepos()}>
-            {(repo) => <RepoSection repo={repo} defaultOpen={true} />}
+            {(repo) => <RepoSection repo={repo} defaultOpen={true} onQuickLaunch={props.onQuickLaunch} />}
           </For>
 
           <Show when={inactiveRepos().length > 0}>
@@ -524,7 +568,7 @@ function ControlPlaneView() {
             </button>
             <Show when={showInactive()}>
               <For each={inactiveRepos()}>
-                {(repo) => <RepoSection repo={repo} defaultOpen={false} />}
+                {(repo) => <RepoSection repo={repo} defaultOpen={false} onQuickLaunch={props.onQuickLaunch} />}
               </For>
             </Show>
           </Show>
@@ -534,7 +578,7 @@ function ControlPlaneView() {
   )
 }
 
-function RepoSection(props: { repo: ControlPlaneRepo; defaultOpen: boolean }) {
+function RepoSection(props: { repo: ControlPlaneRepo; defaultOpen: boolean; onQuickLaunch: (repoLabel: string) => void }) {
   const [open, setOpen] = createSignal(props.defaultOpen)
 
   // Show last path component for short display, full for title
@@ -546,21 +590,34 @@ function RepoSection(props: { repo: ControlPlaneRepo; defaultOpen: boolean }) {
   return (
     <div class="border border-border-base rounded">
       {/* Repo header */}
-      <button
-        type="button"
-        class="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-secondary transition-colors cursor-pointer"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <div class="flex items-center gap-2 min-w-0">
-          <span class="text-text-weak text-11-regular">{open() ? "\u25BC" : "\u25B6"}</span>
-          <span class="text-13-regular text-text-strong truncate">{shortRepoName()}</span>
-        </div>
-        <Show when={props.repo.active_count > 0}>
-          <span class="text-11-regular text-text-weak bg-fill-element-base px-2 py-0.5 rounded-full">
-            {props.repo.active_count} active
-          </span>
-        </Show>
-      </button>
+      <div class="flex items-center">
+        <button
+          type="button"
+          class="flex-1 flex items-center justify-between px-4 py-2.5 hover:bg-surface-secondary transition-colors cursor-pointer min-w-0"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="text-text-weak text-11-regular">{open() ? "\u25BC" : "\u25B6"}</span>
+            <span class="text-13-regular text-text-strong truncate">{shortRepoName()}</span>
+          </div>
+          <Show when={props.repo.active_count > 0}>
+            <span class="text-11-regular text-text-weak bg-fill-element-base px-2 py-0.5 rounded-full">
+              {props.repo.active_count} active
+            </span>
+          </Show>
+        </button>
+        <button
+          type="button"
+          class="px-2.5 py-2.5 text-text-weak hover:text-text-strong hover:bg-surface-secondary transition-colors cursor-pointer text-12-regular"
+          title={`Launch new workspace for ${shortRepoName()}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            props.onQuickLaunch(props.repo.repo)
+          }}
+        >
+          +
+        </button>
+      </div>
 
       {/* Repo body */}
       <Show when={open()}>
@@ -581,7 +638,9 @@ function RepoSection(props: { repo: ControlPlaneRepo; defaultOpen: boolean }) {
 }
 
 function AgentRow(props: { agent: ControlPlaneAgent }) {
+  const ctx = useDevaipod()
   const a = () => props.agent
+  const [showDiff, setShowDiff] = createSignal(false)
 
   const statusDot = createMemo(() => {
     if (a().completion_status === "done") return { char: "\u25C9", cls: "text-violet-400" }
@@ -590,7 +649,7 @@ function AgentRow(props: { agent: ControlPlaneAgent }) {
   })
 
   const displayName = () => a().title || a().short_name
-  const subtitle = () => {
+  const statusLabel = () => {
     if (a().title) return a().short_name
     if (a().completion_status === "done") return "Done"
     return a().status
@@ -601,32 +660,179 @@ function AgentRow(props: { agent: ControlPlaneAgent }) {
     return timeAgo(a().created)
   }
 
+  // Cross-reference with pod-level agent status for activity info
+  const podAgentStatus = () => ctx.agentStatus[a().name]
+  const activityText = createMemo(() => {
+    const s = podAgentStatus()
+    if (!s) return null
+    if (s.current_tool) return `\u2192 ${s.current_tool}`
+    if (s.status_line) return s.status_line
+    return s.activity !== "Unknown" ? s.activity : null
+  })
+
+  const isDone = () => a().completion_status === "done"
+
   function navigate() {
     window.location.href = `/_devaipod/agent/${encodeURIComponent(a().name)}`
   }
 
   return (
-    <button
-      type="button"
-      class="w-full flex items-center gap-3 px-4 py-2 hover:bg-surface-secondary transition-colors cursor-pointer text-left border-t border-border-base first:border-t-0"
-      onClick={navigate}
-    >
-      <span classList={{ [statusDot().cls]: true, "text-11-regular": true }}>{statusDot().char}</span>
-      <span
-        class="text-12-regular truncate min-w-0 flex-1"
-        classList={{
-          "text-text-strong": a().is_running && a().completion_status !== "done",
-          "text-text-weak": !a().is_running || a().completion_status === "done",
-        }}
-      >
-        {displayName()}
-      </span>
-      <span class="text-11-regular text-text-weak truncate shrink-0 max-w-[120px]">{subtitle()}</span>
-      <span class="text-11-regular text-text-weak shrink-0">{lastActive()}</span>
-      <Show when={a().is_running}>
-        <span class="text-text-weak text-11-regular shrink-0">{"\u2192"}</span>
+    <div class="border-t border-border-base first:border-t-0">
+      <div class="flex items-center gap-3 px-4 py-2 hover:bg-surface-secondary transition-colors">
+        {/* Status dot */}
+        <span classList={{ [statusDot().cls]: true, "text-11-regular": true }}>{statusDot().char}</span>
+
+        {/* Name + task subtitle */}
+        <button
+          type="button"
+          class="flex-1 min-w-0 text-left cursor-pointer"
+          onClick={navigate}
+        >
+          <div class="flex items-center gap-2">
+            <span
+              class="text-12-regular truncate"
+              classList={{
+                "text-text-strong": a().is_running && !isDone(),
+                "text-text-weak": !a().is_running || isDone(),
+              }}
+            >
+              {displayName()}
+            </span>
+            <span class="text-11-regular text-text-weak truncate shrink-0 max-w-[120px]">{statusLabel()}</span>
+          </div>
+          <Show when={a().task}>
+            <div class="text-11-regular text-text-weak truncate mt-0.5">{a().task}</div>
+          </Show>
+        </button>
+
+        {/* Activity status from pod data */}
+        <Show when={activityText() && a().is_running && !isDone()}>
+          <span class="text-11-regular text-text-weak truncate shrink-0 max-w-[140px]">{activityText()}</span>
+        </Show>
+
+        {/* Time ago */}
+        <span class="text-11-regular text-text-weak shrink-0">{lastActive()}</span>
+
+        {/* Diff button for done agents */}
+        <Show when={isDone()}>
+          <button
+            type="button"
+            class="text-11-regular text-text-link hover:underline cursor-pointer shrink-0"
+            onClick={(e) => {
+              e.stopPropagation()
+              setShowDiff((v) => !v)
+            }}
+          >
+            {showDiff() ? "hide diff" : "diff"}
+          </button>
+        </Show>
+
+        {/* Navigate arrow for running agents */}
+        <Show when={a().is_running}>
+          <span class="text-text-weak text-11-regular shrink-0">{"\u2192"}</span>
+        </Show>
+      </div>
+
+      {/* Inline diff panel */}
+      <Show when={showDiff()}>
+        <DiffPanel podName={a().name} />
       </Show>
-    </button>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Diff panel — inline expandable diff viewer
+// ---------------------------------------------------------------------------
+
+function DiffPanel(props: { podName: string }) {
+  const [diffData, setDiffData] = createSignal<DiffResponse | null>(null)
+  const [loading, setLoading] = createSignal(true)
+  const [error, setError] = createSignal("")
+  const [showFull, setShowFull] = createSignal(false)
+
+  // Fetch diff data. Re-fetch when showFull changes.
+  createEffect(() => {
+    const stat = !showFull()
+    setLoading(true)
+    setError("")
+    apiFetch<DiffResponse>(
+      `/api/devaipod/pods/${encodeURIComponent(props.podName)}/diff?stat=${stat}`,
+    )
+      .then((data) => setDiffData(data))
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        // Gracefully handle 404 (endpoint may not exist yet)
+        if (msg.includes("404")) {
+          setError("Diff not available for this agent")
+        } else {
+          setError(msg)
+        }
+        setDiffData(null)
+      })
+      .finally(() => setLoading(false))
+  })
+
+  return (
+    <div class="pl-10 pr-4 py-3 border-l-2 border-border-base ml-4 bg-surface-secondary/30">
+      <Show when={loading()}>
+        <div class="flex items-center gap-2 text-12-regular text-text-weak">
+          <Spinner class="size-3.5" />
+          Loading diff...
+        </div>
+      </Show>
+
+      <Show when={!loading() && error()}>
+        <span class="text-11-regular text-text-weak">{error()}</span>
+      </Show>
+
+      <Show when={!loading() && diffData()}>
+        {(data) => (
+          <>
+            <div class="text-11-regular text-text-secondary-base mb-1">
+              <span class="font-mono">{data().branch}</span>
+              <span class="text-text-weak"> — {data().commit_count} commit{data().commit_count !== 1 ? "s" : ""}</span>
+            </div>
+            <Show when={data().commits.length > 0}>
+              <div class="flex flex-col gap-0.5 mb-2">
+                <For each={data().commits}>
+                  {(commit) => (
+                    <div class="text-11-regular text-text-weak">
+                      <span class="font-mono text-text-secondary-base">{commit.sha.slice(0, 7)}</span>
+                      {" "}{commit.message}
+                      <span class="ml-2 opacity-60">{timeAgo(commit.timestamp)}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
+            <Show when={data().diff}>
+              <pre class="text-11-regular mt-1 overflow-x-auto max-h-96 overflow-y-auto bg-surface-secondary p-2 rounded border border-border-base font-mono whitespace-pre-wrap break-all">
+                {data().diff}
+              </pre>
+            </Show>
+            <Show when={data().is_stat}>
+              <button
+                type="button"
+                class="text-11-regular text-text-link mt-2 cursor-pointer hover:underline"
+                onClick={() => setShowFull(true)}
+              >
+                Show full diff
+              </button>
+            </Show>
+            <Show when={!data().is_stat && showFull()}>
+              <button
+                type="button"
+                class="text-11-regular text-text-link mt-2 cursor-pointer hover:underline"
+                onClick={() => setShowFull(false)}
+              >
+                Show summary
+              </button>
+            </Show>
+          </>
+        )}
+      </Show>
+    </div>
   )
 }
 
@@ -839,10 +1045,10 @@ function DevcontainerCard(props: { dc: DevcontainerPod }) {
 // Launch form
 // ---------------------------------------------------------------------------
 
-function LaunchForm(props: { onClose: () => void }) {
+function LaunchForm(props: { onClose: () => void; prefillSource?: string }) {
   const ctx = useDevaipod()
 
-  const [repoUrl, setRepoUrl] = createSignal("")
+  const [repoUrl, setRepoUrl] = createSignal(props.prefillSource ?? "")
   const [task, setTask] = createSignal("")
   const [podName, setPodName] = createSignal("")
   const [imageOverride, setImageOverride] = createSignal("")
