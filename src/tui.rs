@@ -78,7 +78,7 @@ struct ApiAgentStatus {
 }
 
 /// Read the web auth token from the state directory.
-fn read_api_token() -> Result<String> {
+pub(crate) fn read_api_token() -> Result<String> {
     let state_dir =
         std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
     let token_path = std::path::PathBuf::from(state_dir).join("web-token");
@@ -88,7 +88,7 @@ fn read_api_token() -> Result<String> {
 }
 
 /// Determine the web API port from environment or default.
-fn api_port() -> u16 {
+pub(crate) fn api_port() -> u16 {
     std::env::var("DEVAIPOD_WEB_PORT")
         .ok()
         .and_then(|s| s.parse().ok())

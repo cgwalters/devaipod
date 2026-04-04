@@ -26,6 +26,7 @@ mod pod;
 mod pod_api;
 mod podman;
 mod prompt;
+mod review_tui;
 mod secrets;
 mod service_gator;
 mod ssh_server;
@@ -1033,6 +1034,20 @@ enum HostCommand {
         stat: bool,
     },
 
+    /// Interactive review of agent changes
+    ///
+    /// Opens a TUI showing the agent's commits and diff. Navigate the diff,
+    /// add inline comments, and submit them back to the agent as review
+    /// feedback. The agent receives the comments and iterates on its work.
+    ///
+    /// Examples:
+    ///   devaipod review                            # Review latest workspace
+    ///   devaipod review myworkspace                # Review named workspace
+    Review {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+    },
+
     /// Get or set the session title for a pod
     ///
     /// The title is human-readable metadata for the session, separate from
@@ -1375,6 +1390,7 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
             | HostCommand::Internals { .. }
             | HostCommand::Fetch { .. }
             | HostCommand::Diff { .. }
+            | HostCommand::Review { .. }
     )
 }
 
@@ -1389,6 +1405,7 @@ fn command_allowed_on_host(cmd: &HostCommand) -> bool {
             | HostCommand::Internals { .. }
             | HostCommand::Fetch { .. }
             | HostCommand::Diff { .. }
+            | HostCommand::Review { .. }
     )
 }
 
@@ -1670,6 +1687,10 @@ async fn run_host(cli: HostCli) -> Result<()> {
         } => {
             let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
             cmd_diff(&pod_name, stat)
+        }
+        HostCommand::Review { workspace } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            crate::review_tui::run(&pod_name).await
         }
         HostCommand::Title { name, title } => {
             cmd_title(&normalize_pod_name(&name), title.as_deref()).await
