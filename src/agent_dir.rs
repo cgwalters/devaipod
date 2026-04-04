@@ -48,12 +48,14 @@ pub fn agent_dir_container_path(pod_name: &str) -> Result<PathBuf> {
 /// This is what gets passed as the `-v` source to podman when creating
 /// agent containers. The host podman daemon resolves paths on the host
 /// filesystem, so this must be the real host path.
+#[allow(dead_code)] // Used by workspace-v2 creation (upcoming)
 pub fn agent_dir_host_path(pod_name: &str) -> Result<PathBuf> {
     let base = podman::get_host_workdir_path()?;
     Ok(base.join(pod_name))
 }
 
 /// Create the agent directory on disk. Returns the container-side path.
+#[allow(dead_code)] // Used by workspace-v2 creation (upcoming)
 pub fn create_agent_dir(pod_name: &str) -> Result<PathBuf> {
     let path = agent_dir_container_path(pod_name)?;
     std::fs::create_dir_all(&path)

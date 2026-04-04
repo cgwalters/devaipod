@@ -13,7 +13,6 @@ use color_eyre::eyre::{Context, Result, bail};
 
 #[allow(dead_code)] // MCP server will use these in a follow-up
 mod advisor;
-#[allow(dead_code)] // Preparatory infrastructure for workspace-v2
 mod agent_dir;
 mod config;
 mod devcontainer;
@@ -4774,6 +4773,11 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
                 tracing::warn!("Failed to remove volume '{}': {}", volume, stderr.trim());
             }
         }
+    }
+
+    // Clean up agent directory if it exists
+    if let Err(e) = crate::agent_dir::remove_agent_dir(pod_name) {
+        tracing::warn!("Failed to remove agent directory for {pod_name}: {e}");
     }
 
     // Clean up SSH config file if it exists
