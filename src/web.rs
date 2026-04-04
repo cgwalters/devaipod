@@ -3048,6 +3048,237 @@ async fn agent_diff(
 }
 
 // =============================================================================
+// Review endpoint — send diff feedback to the agent
+// =============================================================================
+
+/// A single inline comment on a file/line in the diff.
+#[derive(Debug, Deserialize)]
+struct ReviewComment {
+    /// File path the comment refers to.
+    file: String,
+    /// Optional line number in the diff.
+    line: Option<usize>,
+    /// The review comment body.
+    body: String,
+}
+
+/// Request body for `POST /api/devaipod/pods/{name}/review`.
+#[derive(Debug, Deserialize)]
+struct ReviewRequest {
+    /// Overall review message (e.g. "Please fix the error handling").
+    #[serde(default)]
+    message: Option<String>,
+    /// Inline comments on specific files/lines.
+    #[serde(default)]
+    comments: Vec<ReviewComment>,
+}
+
+/// Response for the review endpoint.
+#[derive(Debug, Serialize)]
+struct ReviewResponse {
+    success: bool,
+    message: String,
+}
+
+/// Format review comments into a structured message the agent can act on.
+fn format_review_message(req: &ReviewRequest) -> String {
+    let mut parts = Vec::new();
+
+    parts.push("## Code Review Feedback\n".to_string());
+    parts.push(
+        "The following review comments have been left on your changes. \
+         Please address each one and commit the fixes.\n"
+            .to_string(),
+    );
+
+    if let Some(ref msg) = req.message {
+        parts.push(format!("### Overall\n\n{msg}\n"));
+    }
+
+    if !req.comments.is_empty() {
+        parts.push("### Inline Comments\n".to_string());
+        for (i, comment) in req.comments.iter().enumerate() {
+            let location = match comment.line {
+                Some(line) => format!("`{}:{}`", comment.file, line),
+                None => format!("`{}`", comment.file),
+            };
+            parts.push(format!("{}. **{}**: {}\n", i + 1, location, comment.body));
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// `POST /api/devaipod/pods/{name}/review`
+///
+/// Sends code review feedback to a running agent. Formats the review
+/// comments into a structured message, sends it to the agent's opencode
+/// session via the pod-api proxy, and resets completion_status to "active"
+/// so the agent resumes work.
+async fn submit_review(
+    Path(name): Path<String>,
+    Json(req): Json<ReviewRequest>,
+) -> Result<Json<ReviewResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+
+    // Validate: must have at least a message or comments.
+    if req.message.is_none() && req.comments.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorBody {
+                error: "Review must contain a message or at least one comment".to_string(),
+            }),
+        ));
+    }
+
+    let review_text = format_review_message(&req);
+
+    // Get the pod-api port and admin token.
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        (
+            code,
+            Json(ApiErrorBody {
+                error: format!("Pod '{pod_name}' not reachable"),
+            }),
+        )
+    })?;
+    let admin_token = get_pod_api_admin_token(&pod_name).await.map_err(|code| {
+        (
+            code,
+            Json(ApiErrorBody {
+                error: "Failed to get pod admin token".to_string(),
+            }),
+        )
+    })?;
+    let host = host_for_pod_services();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: "HTTP client error".to_string(),
+                }),
+            )
+        })?;
+
+    // Find the root session ID by listing sessions.
+    let sessions_resp = client
+        .get(format!("http://{host}:{port}/session"))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to list sessions for {pod_name}: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiErrorBody {
+                    error: "Failed to reach agent".to_string(),
+                }),
+            )
+        })?;
+
+    let sessions: Vec<serde_json::Value> = sessions_resp.json().await.map_err(|e| {
+        tracing::error!("Failed to parse sessions for {pod_name}: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                error: "Failed to parse agent sessions".to_string(),
+            }),
+        )
+    })?;
+
+    let session_id = sessions
+        .iter()
+        .find(|s| crate::session_is_root(s))
+        .and_then(|s| s.get("id"))
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorBody {
+                    error: "No active agent session found".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+
+    // Send the review as a message using the async prompt endpoint
+    // (fire-and-forget so we don't block on the LLM response).
+    let message_body = serde_json::json!({
+        "parts": [{"type": "text", "text": review_text}]
+    });
+
+    let send_resp = client
+        .post(format!(
+            "http://{host}:{port}/session/{session_id}/prompt_async"
+        ))
+        .header("Content-Type", "application/json")
+        .json(&message_body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to send review to {pod_name}: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiErrorBody {
+                    error: "Failed to send review to agent".to_string(),
+                }),
+            )
+        })?;
+
+    if !send_resp.status().is_success() {
+        let status = send_resp.status();
+        let body = send_resp.text().await.unwrap_or_default();
+        tracing::error!("Agent rejected review message ({}): {}", status, body);
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiErrorBody {
+                error: format!("Agent rejected review message: {status}"),
+            }),
+        ));
+    }
+
+    // Reset completion_status to Active so the agent shows as working again.
+    let reset_body = serde_json::json!({"status": "active"});
+    let reset_resp = client
+        .put(format!("http://{host}:{port}/completion-status"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {admin_token}"))
+        .json(&reset_body)
+        .send()
+        .await;
+
+    match reset_resp {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!("Reset completion status to active for {pod_name}");
+        }
+        Ok(r) => {
+            tracing::warn!(
+                "Failed to reset completion status for {pod_name}: {}",
+                r.status()
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to reset completion status for {pod_name}: {e}");
+        }
+    }
+
+    let comment_count = req.comments.len();
+    let summary = if comment_count > 0 {
+        format!("Sent review with {comment_count} inline comment(s) to agent")
+    } else {
+        "Sent review feedback to agent".to_string()
+    };
+
+    Ok(Json(ReviewResponse {
+        success: true,
+        message: summary,
+    }))
+}
+
+// =============================================================================
 // Service-gator scope management (proxy to pod-api)
 // =============================================================================
 
@@ -3858,6 +4089,7 @@ fn build_app_with_cache(
             get(get_pod_completion_status).put(update_pod_completion_status),
         )
         .route("/devaipod/pods/{name}/diff", get(agent_diff))
+        .route("/devaipod/pods/{name}/review", post(submit_review))
         // Lightweight endpoint for frontend cookie refresh (every 4h).
         // The auth_middleware already re-issues the cookie on every
         // authenticated request, so this handler is a no-op — its only
