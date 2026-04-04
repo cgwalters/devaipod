@@ -1580,7 +1580,19 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let (activity, status_line, current_tool, recent_output, last_message_ts) =
         derive_agent_status_from_messages(&messages);
 
-    let completion_status = read_completion_status(&state.workspace).await;
+    let mut completion_status = read_completion_status(&state.workspace).await;
+
+    // Auto-detect completion: when the agent is idle after doing work,
+    // automatically transition to Done. This avoids requiring the user
+    // to manually click "Done" or run `devaipod done`.
+    if activity == "Idle" && completion_status == CompletionStatus::Active && !messages.is_empty() {
+        if let Err(e) = write_completion_status(&state.workspace, CompletionStatus::Done).await {
+            tracing::warn!("Failed to auto-set completion status: {e}");
+        } else {
+            tracing::info!("Auto-detected agent completion (idle after work)");
+            completion_status = CompletionStatus::Done;
+        }
+    }
 
     Json(PodSummaryResponse {
         activity,
@@ -2193,6 +2205,23 @@ async fn read_completion_status(workspace: &std::path::Path) -> CompletionStatus
     }
 }
 
+/// Write the completion status to disk atomically (write-to-temp then rename).
+async fn write_completion_status(
+    workspace: &std::path::Path,
+    status: CompletionStatus,
+) -> Result<(), String> {
+    let file = CompletionStatusFile { status };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| format!("serialize: {e}"))?;
+    let path = completion_status_path(workspace);
+    let temp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, &json)
+        .await
+        .map_err(|e| format!("write {temp_path:?}: {e}"))?;
+    tokio::fs::rename(&temp_path, &path)
+        .await
+        .map_err(|e| format!("rename {temp_path:?} -> {path:?}: {e}"))
+}
+
 /// `GET /gator/scopes` — read current service-gator scopes.
 ///
 /// Reads the config file directly from the workspace volume. Returns
@@ -2343,41 +2372,16 @@ async fn update_completion_status(
     let req: CompletionStatusUpdateRequest =
         serde_json::from_slice(&body).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
-    let file = CompletionStatusFile {
-        status: req.status.clone(),
-    };
-    let json = serde_json::to_string_pretty(&file).map_err(|e| {
-        tracing::error!("Failed to serialize completion status: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    write_completion_status(&state.workspace, req.status.clone())
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to update completion status: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    let path = completion_status_path(&state.workspace);
-    // The state directory (/var/lib/devaipod/) is pre-created in the
-    // container image and also by load_or_generate_admin_token() at startup.
-    // We skip create_dir_all here because tokio::fs::create_dir_all triggers
-    // a capability check (mkdir syscall) that fails with EPERM when all
-    // capabilities are dropped, even when the directory already exists in
-    // some overlayfs configurations.
+    tracing::info!("Updated completion status to {:?}", req.status);
 
-    let temp_path = path.with_extension("json.tmp");
-    tokio::fs::write(&temp_path, &json).await.map_err(|e| {
-        tracing::error!(
-            "Failed to write completion status to {:?}: {}",
-            temp_path,
-            e
-        );
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    tokio::fs::rename(&temp_path, &path).await.map_err(|e| {
-        tracing::error!("Failed to rename {:?} -> {:?}: {}", temp_path, path, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    tracing::info!("Updated completion status to {:?}", file.status);
-
-    Ok(Json(CompletionStatusResponse {
-        status: file.status,
-    }))
+    Ok(Json(CompletionStatusResponse { status: req.status }))
 }
 
 // ---------------------------------------------------------------------------
