@@ -137,21 +137,28 @@ bind-mounted in from the host. This follows the same pattern as
 
 This is the minimal mount. We do not bind-mount `~` entirely.
 
-## Implementation
+## Implementation status
 
-- Add `DEVAIPOD_HOST_WORKDIR` env var and `get_host_workdir_path()`
-  helper (same pattern as `DEVAIPOD_HOST_SOCKET`)
-- Create `<pod-id>/` under the workdir at pod creation time
-- Replace `{pod}-agent-workspace` volume with a bind mount of the
-  host agent dir at `/workspaces/`
-- Bind-mount source repo RO at `/mnt/source/`
-- Update agent, pod-api, and gator container configs for bind mounts
-- UID mapping: follow devcontainer spec (`updateRemoteUserUID` or
-  equivalent), same as VS Code / other IDE devcontainer implementations
-- Provide `checkout` and `fetch-source` as agent skill/MCP tool
+### Done
+
+- `DEVAIPOD_HOST_WORKDIR` env var and `get_host_workdir_path()` helper
+- `<pod-id>/` directory creation at pod creation time
+- `{pod}-agent-workspace` volume replaced with host bind mount at
+  `/workspaces/` for LocalRepo
+- Source repo bind-mounted RO at `/mnt/source/<dirname>/`
+- `--source-dir` CLI flag: mounts additional read-only directories at
+  `/mnt/source/<dirname>/` with automatic git clone into agent workspace
+  for convenience
+- Agent, pod-api, and gator container configs updated for bind mounts
 - `devaipod delete` removes the agent directory
+- Justfile `container-run` updated with workspaces bind mount
+- Init container name sanitization for host-path volume sources
+
+### Remaining
+
+- UID mapping: see [rootless-uidmapping.md](./rootless-uidmapping.md)
+- UI/model rework: workspace-anchored design (see below)
 - `devaipod clean` garbage-collects orphaned agent dirs
-- Update Justfile `container-run` with the new bind mount
 - For remote pods, add periodic `git fetch` from remote to local
 
 ## Resolved Questions
@@ -176,3 +183,202 @@ This is the minimal mount. We do not bind-mount `~` entirely.
    to periodically fetch agent work back to the user's local machine?
    SSH, pod-api proxy, or git bundle? Defer to when remote support
    is implemented.
+
+## Phase 2: Workspace-anchored UI/model rework
+
+The changes above are infrastructure — volumes replaced with host dirs,
+source dirs mounted read-only. But the UI and data model still treat
+pods as the primary object. This section describes the shift to
+workspaces as the anchor.
+
+### The conceptual shift
+
+**Current model (pod-centric)**:
+- Podman is the registry. Discovery = `podman pod ps`.
+- A "workspace" is whatever is inside the pod's volumes.
+- Delete the pod, everything is gone.
+- The launcher asks for a git URL. That's the only entry point.
+
+**New model (workspace-centric)**:
+- The host directory (`~/.local/share/devaipod/workspaces/<name>/`) is
+  the durable object. It persists across pod lifecycles.
+- A pod is transient compute attached to a workspace. Start, stop,
+  replace — the workspace directory survives.
+- Discovery is the union of: (a) running pods (from podman), and
+  (b) workspace directories on disk (from the filesystem).
+- The launcher is an IDE-like source picker, not just a URL field.
+
+This aligns with how IDEs work: you "open a project" (a directory),
+and the IDE attaches compute/services to it. The project directory
+is the anchor. You close the IDE, the directory remains.
+
+### What changes in the data model
+
+**Workspace state file**: Each workspace directory gets a
+`<workspace>/.devaipod/state.json` (or similar) that records:
+
+```json
+{
+  "name": "devaipod-myproject-abc123",
+  "source": "https://github.com/org/myproject",
+  "source_dirs": ["/home/user/src/myproject"],
+  "created": "2026-04-04T12:00:00Z",
+  "last_active": "2026-04-04T14:30:00Z",
+  "task": "fix the auth bug",
+  "title": "Auth bug fix",
+  "pod_name": "devaipod-myproject-abc123",
+  "completion_status": "done"
+}
+```
+
+This replaces the current split across podman labels (immutable),
+web pod-state-cache (ephemeral), and TUI state.json (versioned).
+One file per workspace, human-readable, version-controlled by the
+workspace itself.
+
+**Discovery**: `list_workspaces()` scans the workspaces base directory
+and reads each state file. For each workspace, it checks whether
+a matching pod is running (via podman). Result:
+
+| Workspace state | Pod state | UI display |
+|---|---|---|
+| Has state file | Running | "Running" — show agent status |
+| Has state file | Stopped/missing | "Stopped" — show last-known state |
+| No state file | Running (legacy) | Legacy pod — show as today |
+| Directory exists, empty | — | Orphaned — candidate for cleanup |
+
+**Recent sources cache**: A separate file at
+`~/.local/share/devaipod/recent-sources.json` tracks recently-used
+source directories:
+
+```json
+[
+  {"path": "/home/user/src/myproject", "last_used": "2026-04-04T14:30:00Z"},
+  {"path": "/home/user/src/api", "last_used": "2026-04-03T09:15:00Z"},
+  {"path": "/home/user/src/docs", "last_used": "2026-03-28T16:45:00Z"}
+]
+```
+
+Updated every time a workspace is created from a local source.
+Capped at ~50 entries, sorted by last_used descending.
+
+### What changes in the launcher UI
+
+The current launcher has a single text field: "Repository URL".
+The new launcher has two entry points:
+
+**1. Local directory picker** (primary for local development):
+
+```
+┌─ New Workspace ──────────────────────────────────┐
+│                                                   │
+│  Source                                           │
+│  ┌───────────────────────────────────────────┐    │
+│  │ ~/src/myproject                        [Browse]│
+│  └───────────────────────────────────────────┘    │
+│                                                   │
+│  Recent:                                          │
+│   ~/src/api              3 hours ago              │
+│   ~/src/docs             yesterday                │
+│   ~/src/infra            last week                │
+│                                                   │
+│  Task (optional)                                  │
+│  ┌───────────────────────────────────────────┐    │
+│  │ fix the auth bug                          │    │
+│  └───────────────────────────────────────────┘    │
+│                                                   │
+│  [Launch]                                         │
+└───────────────────────────────────────────────────┘
+```
+
+Clicking a recent source fills in the field. The recent list is
+populated from `recent-sources.json`. When the source is a local
+path, it's passed to `devaipod run --source-dir <path>`.
+
+**2. Remote URL** (unchanged, for remote repos / PRs / issues):
+
+The existing URL field still works. Typing a URL (https://, git@)
+bypasses the local picker and uses the current remote clone flow.
+
+The two modes can coexist in the same form — the source field accepts
+both paths and URLs. The "Recent" section only shows local paths.
+
+**Key UX principle**: the common case (local development) should be
+as fast as possible. Click a recent project, optionally type a task,
+hit Launch. No URLs, no configuration.
+
+### What changes in the pod list
+
+The pod list becomes a **workspace list**. Each card shows:
+
+- **Title** (from state file or agent status)
+- **Source** (local path or remote URL)
+- **Status**: Running (green), Stopped (gray), Done (purple)
+- **Last active** (from state file, not from podman)
+- **Actions**: Open, Start (if stopped), Stop, Delete
+
+Stopped workspaces appear in the list (they're directories on disk).
+The user can re-launch compute against a stopped workspace without
+re-cloning — just `devaipod up --workspace <existing-dir>`.
+
+Sorting: same frecency sort (running first, then by last_active).
+
+### What changes in the CLI
+
+New commands and flags:
+
+```bash
+# List workspaces (not just running pods)
+devaipod ls              # shows workspaces + pod status
+devaipod ls --running    # only running (current behavior)
+
+# Re-attach to existing workspace directory
+devaipod up --workspace ~/.local/share/devaipod/workspaces/myproject-abc123
+
+# Clean up orphaned workspace dirs (no matching pod, old)
+devaipod clean --older-than 30d
+
+# Open workspace directory in host shell
+devaipod cd myproject    # prints or cd's to workspace dir
+```
+
+### What changes in the backend
+
+**`src/main.rs`**: `cmd_list` gains a `--all` mode (default) that
+scans workspace directories AND running pods, merging the results.
+`--running` gives the current behavior.
+
+**`src/web.rs`**: `GET /api/devaipod/pods` becomes
+`GET /api/devaipod/workspaces` (or an alias). Returns the merged
+workspace+pod list. New endpoint `GET /api/devaipod/recent-sources`
+returns the recent sources list.
+
+**`src/agent_dir.rs`**: Gains `list_workspaces()` that scans the
+base directory and reads state files. The state file is written at
+workspace creation time and updated on status changes.
+
+**`POST /api/devaipod/run`**: Gains `source_dirs` field. When the
+source is a local path, it's treated as a `--source-dir`.
+
+### Migration
+
+No migration needed. Existing pods without workspace directories
+appear as "legacy" entries in the workspace list (podman-only, no
+state file). New workspaces get state files. Legacy pods can be
+recreated to get a workspace directory.
+
+### Implementation order
+
+1. **State file**: write `.devaipod/state.json` in workspace dir at
+   creation time, update on status changes.
+2. **Workspace listing**: `list_workspaces()` in agent_dir.rs,
+   merged with podman pod list.
+3. **Recent sources**: read/write `recent-sources.json`, populate on
+   workspace creation from local source.
+4. **CLI**: `devaipod ls` shows workspaces, `--running` for compat.
+5. **Web API**: `GET /api/devaipod/workspaces` returns merged list.
+   `GET /api/devaipod/recent-sources` for the launcher.
+6. **Frontend**: update pods.tsx to show workspaces, update launcher
+   form to show recent sources and accept local paths.
+7. **Re-attach**: `devaipod up --workspace <dir>` re-launches compute
+   against an existing workspace directory.
