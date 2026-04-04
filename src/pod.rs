@@ -2539,7 +2539,13 @@ exec sleep infinity
             });
         }
 
-        // For LocalRepo, bind-mount the whole source repo read-only at /mnt/source/
+        // For LocalRepo, bind-mount the whole source repo read-only at /mnt/source/.
+        // Note: `source_repo_host_path` comes from `git_info.local_path`, which is the
+        // path as seen by the controlplane process. In host mode this is the real host
+        // path and podman resolves it correctly. In container mode the path is
+        // container-internal, which only works if the source repo directory is also
+        // accessible to the host podman daemon (e.g. via a shared bind mount). This is
+        // the same limitation that affects the existing `.git` init-container mount.
         if let Some(repo_path) = source_repo_host_path {
             mounts.push(crate::podman::MountConfig {
                 source: repo_path.to_string_lossy().to_string(),
@@ -4932,5 +4938,211 @@ mod tests {
             .filter(|(env_var, _)| env_var == "GH_TOKEN")
             .count();
         assert_eq!(gh_token_count, 1);
+    }
+
+    #[test]
+    fn test_agent_container_config_hostdir() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+        let host_path =
+            PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
+
+        let global_config = crate::config::Config::default();
+        let agent_workspace_source =
+            AgentWorkspaceSource::HostDir { host_path: host_path.clone() };
+        let container_config = DevaipodPod::agent_container_config(
+            project_path,
+            workspace_folder,
+            &bind_home,
+            container_home,
+            None,
+            false,                  // enable_gator
+            false,                  // enable_orchestration
+            "test-main-workspace",  // main workspace (read-only reference)
+            &host_path.to_string_lossy(), // agent workspace mount source is the host path
+            &agent_workspace_source,
+            "test-agent-home",
+            None, // worker_workspace_volume (no orchestration)
+            &global_config,
+            true, // auto_approve
+            None, // source_repo_host_path
+        );
+
+        // With HostDir, the agent workspace is a bind mount, not a volume mount.
+        // The /workspaces bind mount should appear in mounts, not volume_mounts.
+        assert!(
+            container_config
+                .mounts
+                .iter()
+                .any(|m| m.source == host_path.to_string_lossy()
+                    && m.target == "/workspaces"),
+            "mounts should contain a bind mount for /workspaces with host path as source"
+        );
+
+        // volume_mounts should NOT contain a /workspaces entry
+        assert!(
+            !container_config
+                .volume_mounts
+                .iter()
+                .any(|(_vol, target)| target == "/workspaces"),
+            "volume_mounts should not contain /workspaces when using HostDir"
+        );
+
+        // volume_mounts should still contain main workspace and agent home
+        assert!(
+            container_config
+                .volume_mounts
+                .iter()
+                .any(|(vol, target)| vol == "test-main-workspace"
+                    && target == "/mnt/main-workspace:ro"),
+            "volume_mounts should still contain main workspace"
+        );
+        assert!(
+            container_config
+                .volume_mounts
+                .iter()
+                .any(|(vol, target)| vol == "test-agent-home" && target == AGENT_HOME_PATH),
+            "volume_mounts should still contain agent home"
+        );
+    }
+
+    #[test]
+    fn test_api_container_config_hostdir() {
+        let host_path =
+            PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
+        let agent_workspace_source =
+            AgentWorkspaceSource::HostDir { host_path: host_path.clone() };
+        let main_workspace_volume = "test-main-workspace";
+        let workspace_container = "devaipod-test-workspace";
+        let agent_container = "devaipod-test-agent";
+        let socket_path = std::path::Path::new("/run/user/1000/podman/podman.sock");
+
+        let container_config = DevaipodPod::api_container_config(
+            &host_path.to_string_lossy(),
+            &agent_workspace_source,
+            main_workspace_volume,
+            workspace_container,
+            agent_container,
+            socket_path,
+            "test-password-123",
+            "/workspaces/bootc",
+        );
+
+        // With HostDir, the agent workspace should be a bind mount, not a volume mount.
+        // mounts should contain both the socket and the workspace bind mount.
+        assert!(
+            container_config
+                .mounts
+                .iter()
+                .any(|m| m.source == host_path.to_string_lossy()
+                    && m.target == "/workspaces"),
+            "mounts should contain a bind mount for /workspaces with host path as source"
+        );
+
+        // volume_mounts should NOT contain a /workspaces entry
+        assert!(
+            !container_config
+                .volume_mounts
+                .iter()
+                .any(|(_vol, target)| target == "/workspaces"),
+            "volume_mounts should not contain /workspaces when using HostDir"
+        );
+
+        // volume_mounts should still have main workspace
+        assert!(
+            container_config
+                .volume_mounts
+                .iter()
+                .any(|(vol, target)| vol == "test-main-workspace"
+                    && target == "/mnt/main-workspace:ro"),
+            "volume_mounts should still contain main workspace"
+        );
+
+        // Socket bind mount should still be present
+        assert!(
+            container_config
+                .mounts
+                .iter()
+                .any(|m| m.target == "/run/docker.sock"),
+            "socket bind mount should still be present"
+        );
+    }
+
+    #[test]
+    fn test_workspace_container_config_hostdir() {
+        let project_path = Path::new("/home/user/myproject");
+        let workspace_folder = "/workspaces/myproject";
+        let config = DevcontainerConfig::default();
+        let bind_home = BindHomeConfig::default();
+        let container_home = "/home/vscode";
+        let host_path =
+            PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
+
+        let volume_name = "test-volume";
+        let global_config = crate::config::Config::default();
+        let agent_workspace_source =
+            AgentWorkspaceSource::HostDir { host_path: host_path.clone() };
+        let container_config = DevaipodPod::workspace_container_config(
+            project_path,
+            workspace_folder,
+            Some("vscode"),
+            &config,
+            &bind_home,
+            container_home,
+            volume_name,
+            "test-agent-home",
+            &host_path.to_string_lossy(),
+            &agent_workspace_source,
+            &global_config,
+            &[], // labels
+        );
+
+        // With HostDir, the agent workspace should be a bind mount at /mnt/agent-workspace,
+        // not a volume mount.
+        assert!(
+            container_config
+                .mounts
+                .iter()
+                .any(|m| m.source == host_path.to_string_lossy()
+                    && m.target == "/mnt/agent-workspace"
+                    && m.readonly),
+            "mounts should contain a read-only bind mount for /mnt/agent-workspace"
+        );
+
+        // volume_mounts should NOT contain an agent workspace entry for /mnt/agent-workspace
+        assert!(
+            !container_config
+                .volume_mounts
+                .iter()
+                .any(|(_vol, target)| target == "/mnt/agent-workspace:ro"),
+            "volume_mounts should not contain /mnt/agent-workspace:ro when using HostDir"
+        );
+
+        // volume_mounts should still contain: workspace volume (2x) and agent home
+        assert!(
+            container_config
+                .volume_mounts
+                .iter()
+                .any(|(vol, target)| vol == "test-volume" && target == "/workspaces"),
+            "volume_mounts should still contain main workspace at /workspaces"
+        );
+        assert!(
+            container_config
+                .volume_mounts
+                .iter()
+                .any(|(vol, target)| vol == "test-volume"
+                    && target == "/mnt/main-workspace:ro"),
+            "volume_mounts should still contain main workspace at /mnt/main-workspace:ro"
+        );
+        assert!(
+            container_config
+                .volume_mounts
+                .iter()
+                .any(|(vol, target)| vol == "test-agent-home"
+                    && target == "/opt/devaipod:ro"),
+            "volume_mounts should still contain agent home"
+        );
     }
 }
