@@ -582,49 +582,40 @@ plane can show a "Review changes" button per agent that runs
 fetch+diff and shows the three-dot diff inline or opens the
 host-side repo with the fetched remote.
 
-### Git worktrees as the agent workspace
+### Why not git worktrees
 
-The fundamental shift: agent workspaces are **git worktrees** of the
-user's repo, not independent clones in a scratch directory.
+Git worktrees were considered but rejected for agent workspaces.
+The fundamental problem: worktrees require write access to the
+parent repo's `.git` directory (for the shared object store,
+worktree metadata, and HEAD/index). Since agents produce untrusted
+output that must be reviewed before acceptance, giving them write
+access to the user's source repo violates the security model.
 
-Currently, `devaipod run ~/src/myrepo` creates a fresh clone inside
-`~/.local/share/devaipod/workspaces/<pod-id>/myrepo/` using
-`--shared` alternates. This works but creates a parallel universe:
-the agent's repo is a separate clone with its own refs, and the user
-needs `devaipod fetch` to bridge the gap.
+The clone-based approach is correct: agents get an isolated clone,
+produce commits on a `devaipod/<slug>` branch, and the human
+explicitly fetches and reviews before merging. The security
+boundary is clean — the agent never writes to the user's repo.
 
-With worktrees, the agent works directly on a branch of the user's
-repo:
+### Branch naming convention (implemented)
+
+Instead of worktrees, agent clones use a `devaipod/<slug>` branch
+naming convention. The flow:
 
 ```bash
 devaipod run ~/src/myrepo "fix the auth bug"
+# Agent clone checks out branch: devaipod/fix-auth-abc123
 
-# Under the hood:
-git -C ~/src/myrepo worktree add \
-    ~/.local/share/devaipod/workspaces/fix-auth-abc123 \
-    -b devaipod/fix-auth-abc123
+devaipod fetch          # Adds remote, fetches agent branches
+devaipod diff           # Shows three-dot diff of agent changes
+
+# Human reviews, then:
+git cherry-pick devaipod/myworkspace/devaipod/fix-auth-abc123
 ```
 
-Consequences:
-- `git branch --list 'devaipod/*'` shows all agent branches in
-  the user's repo. No fetch needed.
-- `git log devaipod/fix-auth` and `git diff main...devaipod/fix-auth`
-  work immediately from the user's repo.
-- `git merge devaipod/fix-auth` or `git cherry-pick` to accept work.
-- `git worktree remove` + `git branch -d` for cleanup.
-- The agent state directory is a git worktree, not an opaque scratch
-  dir. If the state metadata is lost, the branch and commits survive.
-
-The `devaipod/` branch namespace provides clear provenance. `git
-branch --list 'devaipod/*'` is the ground truth for "what have agents
-been working on in this repo" -- no sidecar database needed.
-
-**Agent state is ephemeral, git state is durable.** The workspace
-state file (task description, session history, agent model) is
-useful but not critical. If it's lost, you still have the branch
-with all the commits and can pick up from there. This inverts the
-current model where losing the workspace directory means losing
-everything.
+After `devaipod fetch`, the agent's branches are visible under
+`devaipod/<remote-name>/devaipod/<slug>`. The `devaipod/` namespace
+in the branch name provides clear provenance regardless of which
+remote or clone context you're viewing it from.
 
 **Git notes for summaries.** Compact per-commit summaries ("47 tool
 calls, fixed auth middleware, model: Opus 4.6") can be stored as
@@ -633,159 +624,29 @@ git notes. Notes are local-only by default (`git push` ignores
 into upstream repos. The control plane UI can display them as
 context alongside the branch view.
 
-**What about `devaipod fetch`?** For local repos, it becomes
-unnecessary -- the branch is already there. For remote-only repos
-(launched from a URL without a local clone), the current fetch
-behavior is still needed. `devaipod fetch` can detect which case
-applies: if the workspace is a worktree of a local repo, it's a
-no-op; if it's a standalone clone, it adds a remote and fetches.
+### The control plane UI (implemented)
 
-**What about multiple agents on the same repo?** Each gets its own
-worktree on its own branch: `devaipod/fix-auth-abc123`,
-`devaipod/add-metrics-def456`. Git worktrees handle this natively --
-they share objects but have independent working trees and indexes.
+The UI groups pods by `io.devaipod.repo` label via
+`GET /api/devaipod/control-plane`. Each repo is a collapsible
+section with agent rows (status dot, title, time) and devcontainer
+rows. Active repos are expanded by default; inactive repos collapse
+into a summary.
 
-**Container bind-mount changes.** The worktree directory is bind-
-mounted RW at `/workspaces/` inside the container (same as today).
-The main repo is still bind-mounted RO at `/mnt/source/`. The
-difference is that the worktree's `.git` file points back to the
-main repo's `.git/worktrees/<name>/`, so `git` commands inside the
-container work correctly with the shared object store.
+### Future: MCP upcall for agent-initiated git operations
 
-### The control plane UI
+Per-pod tokens and MCP tooling for agents to request git operations
+(branch creation, status queries) from the control plane is a
+natural next step. The agent would call through pod-api (localhost),
+which forwards to the control plane with per-pod auth. This is
+independent of the worktree question — it works with the clone-based
+model too. See `docs/todo/advisor-v2.md` for the MCP architecture.
 
-The UI reads from two sources:
-1. **Podman**: running pods, their labels (`io.devaipod.repo`, etc.)
-2. **Git**: `devaipod/*` branches in each known repo, worktree status
+### Remaining implementation
 
-The repo-grouped layout:
-
-```
-┌─ Control Plane ─────────────────────────────────────────┐
-│                                                          │
-│  [+ New Agent]  [Search...]                              │
-│                                                          │
-│  ▼ cgwalters/devaipod                            3 agents│
-│  ┌──────────────────────────────────────────────────┐    │
-│  │ ● devaipod/fix-auth       Running  2m ago   [→]  │    │
-│  │ ● devaipod/add-metrics    Running  5m ago   [→]  │    │
-│  │ ◉ devaipod/refactor-pod   Done  +3 commits  [diff]│   │
-│  │ ▸ devcontainer            Running            ssh  │   │
-│  └──────────────────────────────────────────────────┘    │
-│                                                          │
-│  ▼ journal                                       1 agent │
-│  ┌──────────────────────────────────────────────────┐    │
-│  │ ● devaipod/wasm-research  Running  3m ago   [→]  │    │
-│  └──────────────────────────────────────────────────┘    │
-│                                                          │
-│  ▸ Inactive repos (2)                                    │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
-
-Each agent row shows the **branch name** (not the task description),
-because the branch is the durable identifier. The task description
-is secondary (tooltip or detail view). Clicking [→] opens the agent
-UI; clicking [diff] shows the three-dot diff.
-
-Done agents with no running pod show their commit count on the
-branch. The user can review the diff, merge, and clean up the
-branch -- all from the control plane.
-
-### MCP upcall: agent-initiated worktree creation
-
-Worktree creation should be an **upcall from agent to control
-plane**, not a top-down decision at pod creation time. The agent
-knows what branch name makes sense, when to create additional
-worktrees (for subagents), when to switch — the control plane
-shouldn't guess.
-
-The flow:
-
-```
-Agent (in container)
-  │
-  │  MCP tool call: worktree_create(branch: "fix-auth")
-  ▼
-Pod-API sidecar (localhost:3001 in pod)
-  │
-  │  POST /api/devaipod/pods/{pod}/worktree (with per-pod token)
-  ▼
-Control plane (devaipod container)
-  │
-  │  git worktree add ... -b devaipod/fix-auth
-  │  (on host filesystem via bind mount)
-  ▼
-Worktree appears at /workspaces/fix-auth/ in agent container
-  (already bind-mounted)
-```
-
-**Auth model.** Each agent pod gets a per-pod token at creation
-time (a random secret injected as an env var). The control plane
-maps token → pod identity and restricts operations to that pod's
-worktrees. This is distinct from the advisor's `mcp_token` (which
-grants broader privileges like `list_pods`, `propose_agent`).
-
-**Pod-api as intermediary.** The agent talks to pod-api on
-localhost (already the pattern for file access, terminal, git).
-Pod-api forwards worktree requests to the control plane, adding
-the per-pod token. The agent never talks directly to the control
-plane — it doesn't know the control plane URL or token.
-
-**MCP tools exposed to agents:**
-
-| Tool | Description |
-|---|---|
-| `worktree_create` | Create a worktree on `devaipod/<branch>` |
-| `worktree_list` | List agent's worktrees with status |
-| `worktree_delete` | Remove a worktree (but keep branch) |
-| `worktree_status` | Commit count, dirty state, ahead/behind |
-
-These are implemented in pod-api (the sidecar), which calls up to
-the control plane for the actual `git worktree add` since it needs
-host filesystem access.
-
-**Host filesystem constraint.** The control plane container has
-the workspaces directory bind-mounted, but `git worktree add`
-needs access to the **user's source repo** (the worktree's parent).
-Solutions:
-
-1. **Mount source repos into the control plane.** The control plane
-   already knows the host paths (from workspace state files). Add
-   them as bind mounts at control plane start, or lazily.
-2. **Host-side helper.** `devaipod internals worktree-create` runs
-   on the host (via `podman exec` into the control plane, which
-   then execs back out — ugly).
-3. **Pre-create at launch time.** When `devaipod run` is invoked
-   from the host (CLI), the host process creates the worktree
-   before the pod starts. The MCP upcall is for *additional*
-   worktrees during the agent's lifecycle. This is probably the
-   pragmatic first step.
-
-Option 3 is the right starting point: the initial worktree is
-created by the CLI (which runs on the host and has full filesystem
-access). The MCP upcall is a follow-up for agent-initiated
-worktrees (subagent spawning, multi-branch work).
-
-### Implementation order
-
-1. **Initial worktree at launch**: Change `devaipod run` (local
-   repo, host CLI) to use `git worktree add` instead of
-   `git clone --shared`. Branch name `devaipod/<slug>`. This
-   requires no container changes — the CLI runs on the host.
-2. **Per-pod token**: Generate and inject a per-pod secret at pod
-   creation. Store in workspace state for the control plane to
-   verify.
-3. **Pod-api worktree endpoints**: Add `/worktree/create`,
-   `/worktree/list`, `/worktree/status` to pod-api. Forward to
-   control plane with per-pod auth.
-4. **Control plane MCP for worktrees**: Extend `src/mcp.rs` (or a
-   new per-pod MCP handler) with worktree tools. Requires source
-   repo access — initially via pre-mounted paths.
-5. **Backend**: Add repo-grouped endpoint that reads from podman +
-   `git branch --list 'devaipod/*'` on known repos.
-6. **Frontend**: Replace flat pod list with repo-grouped layout.
-7. **Journal config**: Add `[journal]` section to config.
-8. **Git notes**: Optional per-commit summaries.
-9. **Cleanup CLI**: `devaipod clean` for merged branches + stale
-   worktrees.
+1. **Journal config**: Add `[journal]` section to `devaipod.toml`.
+   Default `devaipod run` (no source) to use journal repo.
+2. **Git notes**: Optional per-commit summaries via git notes.
+3. **Per-pod token**: Generate and inject a per-pod secret at pod
+   creation for MCP auth.
+4. **Cleanup CLI**: `devaipod clean` removes stale workspaces and
+   their clone directories.
