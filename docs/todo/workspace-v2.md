@@ -44,7 +44,7 @@ devaipod up --source-dir ~/docs ./api "update docs to match code"
 ### Layout
 
 The agent's writable scratch directory defaults to
-`~/.var/lib/devaipod/<pod-id>/`, configurable via `--agent-dir` or
+`~/.local/share/devaipod/workspaces/<pod-id>/`, configurable via `--agent-dir` or
 `devaipod.toml`. This keeps agent state completely out of the user's
 source tree.
 
@@ -56,14 +56,15 @@ Host                                     Container
   ├── sdk/
   └── docs/
 
-~/.var/lib/devaipod/<pod-id>/        →   /workspaces/         (RW)
+~/.local/share/devaipod/             →   /workspaces/         (RW)
+  workspaces/<pod-id>/
   └── (initially empty -- agent
        populates via tools)
 ```
 
 On pod creation, devaipod:
 
-1. Creates `~/.var/lib/devaipod/<pod-id>/` on the host
+1. Creates `~/.local/share/devaipod/workspaces/<pod-id>/` on the host
 2. Bind-mounts source directory RO at `/mnt/source/`
 3. Bind-mounts agent directory RW at `/workspaces/`
 4. Starts the container with the devcontainer image
@@ -94,8 +95,8 @@ For non-git content (docs, images, data), the agent simply reads from
 Because everything is on the host filesystem, bidirectional handoff is
 just ordinary filesystem operations:
 
-- **Human sees agent work**: `cd ~/.var/lib/devaipod/<id>/api && git log`
-- **Human fetches agent commits**: `git fetch ~/.var/lib/devaipod/<id>/api`
+- **Human sees agent work**: `cd ~/.local/share/devaipod/workspaces/<id>/api && git log`
+- **Human fetches agent commits**: `git fetch ~/.local/share/devaipod/workspaces/<id>/api`
 - **Agent sees human updates**: source is a live bind mount, so new
   commits appear at `/mnt/source/` in real time. Agent runs
   `git fetch source` to pick them up.
@@ -120,13 +121,13 @@ tracking branch.
 ## Controlplane mount strategy
 
 Devaipod itself runs as a container. To create agent directories on the
-host filesystem, the controlplane container needs `~/.var/lib/devaipod/`
+host filesystem, the controlplane container needs `~/.local/share/devaipod/workspaces/`
 bind-mounted in from the host. This follows the same pattern as
 `DEVAIPOD_HOST_SOCKET` for the podman socket:
 
 - The Justfile's `container-run` recipe adds
-  `-v "$HOME/.var/lib/devaipod":/var/lib/devaipod-workspaces`
-- `DEVAIPOD_HOST_WORKDIR="$HOME/.var/lib/devaipod"` tells the
+  `-v "$HOME/.local/share/devaipod/workspaces":/var/lib/devaipod-workspaces`
+- `DEVAIPOD_HOST_WORKDIR="$HOME/.local/share/devaipod/workspaces"` tells the
   controlplane the host-side path to use in `-v` args for agent
   containers
 - The controlplane creates directories under the container-side mount
@@ -155,7 +156,7 @@ This is the minimal mount. We do not bind-mount `~` entirely.
 
 ## Resolved Questions
 
-- **Agent dir location**: `~/.var/lib/devaipod/<pod-id>/`, configurable.
+- **Agent dir location**: `~/.local/share/devaipod/workspaces/<pod-id>/`, configurable.
   Keeps agent state out of the source tree entirely.
 - **UID mapping**: follow the devcontainer spec, same as VS Code etc.
 - **Nested source trees**: not an issue since agent dir is outside the
