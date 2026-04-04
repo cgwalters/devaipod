@@ -2771,6 +2771,47 @@ fn run_git(repo: &std::path::Path, args: &[&str]) -> Option<String> {
     }
 }
 
+/// Run a git command inside a container via `podman exec`, returning stdout
+/// or `None` on failure. The `repo_path` is the path *inside* the container.
+fn run_git_in_container(container: &str, repo_path: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = std::process::Command::new("podman");
+    cmd.args(["exec", container, "git", "-C", repo_path]);
+    cmd.args(args);
+    let output = cmd.output().ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    } else {
+        None
+    }
+}
+
+/// Find the git workspace path inside a container. The agent workspace is at
+/// `/workspaces/{project_name}`. Returns the first subdirectory of
+/// `/workspaces/` that contains a `.git` directory.
+fn find_workspace_in_container(container: &str) -> Option<String> {
+    let output = std::process::Command::new("podman")
+        .args(["exec", container, "ls", "/workspaces/"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    for dir in listing.lines() {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            continue;
+        }
+        let path = format!("/workspaces/{dir}");
+        // Check if it's a git repo
+        if run_git_in_container(container, &path, &["rev-parse", "--git-dir"]).is_some() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Resolve the base ref to diff against. Tries `origin/HEAD`, then
 /// `origin/main`, `origin/master`, then the first `origin/*` branch.
 fn resolve_origin_ref(repo: &std::path::Path) -> Option<String> {
@@ -2793,11 +2834,177 @@ fn resolve_origin_ref(repo: &std::path::Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Resolve the base ref to diff against, running git inside a container.
+fn resolve_origin_ref_in_container(container: &str, repo_path: &str) -> Option<String> {
+    if run_git_in_container(
+        container,
+        repo_path,
+        &["rev-parse", "--verify", "origin/HEAD"],
+    )
+    .is_some()
+    {
+        return Some("origin/HEAD".to_string());
+    }
+    for branch in ["main", "master"] {
+        let refname = format!("origin/{branch}");
+        if run_git_in_container(container, repo_path, &["rev-parse", "--verify", &refname])
+            .is_some()
+        {
+            return Some(refname);
+        }
+    }
+    let branches = run_git_in_container(
+        container,
+        repo_path,
+        &["branch", "-r", "--list", "origin/*"],
+    )?;
+    branches
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.contains("->"))
+        .map(|s| s.to_string())
+}
+
+/// Parse null-byte delimited git log output into commit summaries.
+fn parse_commit_log(log_output: &str) -> Vec<CommitSummary> {
+    if log_output.is_empty() {
+        return vec![];
+    }
+    log_output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\0').collect();
+            if fields.len() >= 4 {
+                Some(CommitSummary {
+                    sha: fields[0].to_string(),
+                    message: fields[1].to_string(),
+                    author: fields[2].to_string(),
+                    timestamp: fields[3].to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Build an `AgentDiffResponse` from a locally accessible git repo.
+fn diff_from_local_repo(
+    repo_path: &std::path::Path,
+    use_stat: bool,
+) -> Result<AgentDiffResponse, (StatusCode, String)> {
+    let branch = run_git(repo_path, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let origin_ref = match resolve_origin_ref(repo_path) {
+        Some(r) => r,
+        None => {
+            return Ok(AgentDiffResponse {
+                branch,
+                commit_count: 0,
+                commits: vec![],
+                diff: String::new(),
+                is_stat: use_stat,
+            });
+        }
+    };
+
+    let range = format!("{origin_ref}..HEAD");
+    let commit_count: usize = run_git(repo_path, &["rev-list", "--count", &range])
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let format_str = "%H%x00%s%x00%an%x00%aI";
+    let log_output = run_git(
+        repo_path,
+        &["log", &format!("--format={format_str}"), &range],
+    )
+    .unwrap_or_default();
+    let commits = parse_commit_log(&log_output);
+
+    let diff = if use_stat {
+        run_git(repo_path, &["diff", "--stat", &range])
+    } else {
+        run_git(repo_path, &["diff", &range])
+    }
+    .unwrap_or_default();
+
+    Ok(AgentDiffResponse {
+        branch,
+        commit_count,
+        commits,
+        diff,
+        is_stat: use_stat,
+    })
+}
+
+/// Build an `AgentDiffResponse` by running git inside a container via
+/// `podman exec`. Used for volume-backed workspaces where the control
+/// plane cannot access the filesystem directly.
+fn diff_via_podman_exec(
+    container: &str,
+    use_stat: bool,
+) -> Result<AgentDiffResponse, (StatusCode, String)> {
+    let repo_path = find_workspace_in_container(container).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "No git workspace found in container '{container}'. \
+                 The agent container may not be running."
+            ),
+        )
+    })?;
+
+    let branch = run_git_in_container(container, &repo_path, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let origin_ref = match resolve_origin_ref_in_container(container, &repo_path) {
+        Some(r) => r,
+        None => {
+            return Ok(AgentDiffResponse {
+                branch,
+                commit_count: 0,
+                commits: vec![],
+                diff: String::new(),
+                is_stat: use_stat,
+            });
+        }
+    };
+
+    let range = format!("{origin_ref}..HEAD");
+    let commit_count: usize =
+        run_git_in_container(container, &repo_path, &["rev-list", "--count", &range])
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+    let format_str = "%H%x00%s%x00%an%x00%aI";
+    let format_arg = format!("--format={format_str}");
+    let log_output = run_git_in_container(container, &repo_path, &["log", &format_arg, &range])
+        .unwrap_or_default();
+    let commits = parse_commit_log(&log_output);
+
+    let diff = if use_stat {
+        run_git_in_container(container, &repo_path, &["diff", "--stat", &range])
+    } else {
+        run_git_in_container(container, &repo_path, &["diff", &range])
+    }
+    .unwrap_or_default();
+
+    Ok(AgentDiffResponse {
+        branch,
+        commit_count,
+        commits,
+        diff,
+        is_stat: use_stat,
+    })
+}
+
 /// `GET /api/devaipod/pods/{name}/diff`
 ///
 /// Returns the agent's git diff compared to the origin ref, plus commit
-/// metadata. Runs git commands directly against the agent's workspace
-/// directory on the control plane's filesystem.
+/// metadata. For bind-mount workspaces, runs git directly on the host
+/// filesystem. For volume-backed workspaces (remote-URL sources), falls
+/// back to `podman exec` inside the agent container.
 async fn agent_diff(
     Path(name): Path<String>,
     Query(params): Query<DiffQueryParams>,
@@ -2808,99 +3015,21 @@ async fn agent_diff(
     // All git operations are blocking I/O; run on the blocking pool.
     let result =
         tokio::task::spawn_blocking(move || -> Result<AgentDiffResponse, (StatusCode, String)> {
-            // Locate the agent's workspace directory.
-            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).map_err(|e| {
-                tracing::error!("Failed to resolve agent dir for {pod_name}: {e:#}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to resolve agent directory: {e}"),
-                )
-            })?;
+            // Try the host-side bind-mount directory first (local-path sources).
+            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).ok();
+            let host_repo = agent_dir
+                .as_ref()
+                .filter(|d| d.exists())
+                .and_then(|d| find_git_repo_in_dir(d));
 
-            if !agent_dir.exists() {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    format!("Workspace directory not found for pod '{pod_name}'"),
-                ));
+            if let Some(repo_path) = host_repo {
+                return diff_from_local_repo(&repo_path, use_stat);
             }
 
-            let repo_path = find_git_repo_in_dir(&agent_dir).ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("No git repository found in agent workspace for '{pod_name}'"),
-                )
-            })?;
-
-            // Current branch
-            let branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
-                .unwrap_or_else(|| "HEAD".to_string());
-
-            // Find the base ref to diff against
-            let origin_ref = match resolve_origin_ref(&repo_path) {
-                Some(r) => r,
-                None => {
-                    // No origin — return empty diff (agent hasn't pushed or
-                    // repo was cloned without a remote).
-                    return Ok(AgentDiffResponse {
-                        branch,
-                        commit_count: 0,
-                        commits: vec![],
-                        diff: String::new(),
-                        is_stat: use_stat,
-                    });
-                }
-            };
-
-            // Count commits ahead of origin
-            let range = format!("{origin_ref}..HEAD");
-            let commit_count: usize = run_git(&repo_path, &["rev-list", "--count", &range])
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-
-            // Commit summaries (null-byte delimited for robust parsing)
-            let format_str = "%H%x00%s%x00%an%x00%aI";
-            let log_output = run_git(
-                &repo_path,
-                &["log", &format!("--format={format_str}"), &range],
-            )
-            .unwrap_or_default();
-
-            let commits: Vec<CommitSummary> = if !log_output.is_empty() {
-                log_output
-                    .lines()
-                    .filter_map(|line| {
-                        let fields: Vec<&str> = line.split('\0').collect();
-                        if fields.len() >= 4 {
-                            Some(CommitSummary {
-                                sha: fields[0].to_string(),
-                                message: fields[1].to_string(),
-                                author: fields[2].to_string(),
-                                timestamp: fields[3].to_string(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-
-            // Diff
-            let diff = if use_stat {
-                run_git(&repo_path, &["diff", "--stat", &range])
-            } else {
-                run_git(&repo_path, &["diff", &range])
-            }
-            .unwrap_or_default();
-
-            Ok(AgentDiffResponse {
-                branch,
-                commit_count,
-                commits,
-                diff,
-                is_stat: use_stat,
-            })
+            // Fall back to podman exec inside the agent container (volume-backed
+            // workspaces from remote-URL sources).
+            let container = format!("{pod_name}-agent");
+            diff_via_podman_exec(&container, use_stat)
         })
         .await
         .map_err(|e| {
