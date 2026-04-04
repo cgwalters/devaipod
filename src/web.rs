@@ -3053,6 +3053,185 @@ async fn list_recent_sources() -> axum::Json<Vec<crate::agent_dir::RecentSource>
     axum::Json(crate::agent_dir::load_recent_sources())
 }
 
+// ── Devcontainer endpoints ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct DevcontainerRunRequest {
+    source: Option<String>,
+    name: Option<String>,
+    image: Option<String>,
+    devcontainer_json: Option<String>,
+    #[serde(default)]
+    use_default_devcontainer: bool,
+}
+
+fn compute_devcontainer_pod_name(req: &DevcontainerRunRequest) -> String {
+    if let Some(ref name) = req.name {
+        normalize_pod_name(name)
+    } else {
+        let project = req
+            .source
+            .as_deref()
+            .and_then(|s| s.rsplit('/').next())
+            .map(|s| s.trim_end_matches(".git"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("devcontainer");
+        crate::make_pod_name(project)
+    }
+}
+
+async fn run_devcontainer(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DevcontainerRunRequest>,
+) -> Result<Json<RunResponse>, StatusCode> {
+    let pod_name = compute_devcontainer_pod_name(&req);
+    let short_name = pod_name
+        .strip_prefix("devaipod-")
+        .unwrap_or(&pod_name)
+        .to_string();
+
+    let mut cmd = tokio::process::Command::new(self_exe());
+    cmd.args(["devcontainer", "run"]);
+
+    if let Some(ref source) = req.source {
+        cmd.arg(source);
+    }
+
+    cmd.args(["--name", &pod_name]);
+
+    if let Some(ref image) = req.image {
+        cmd.args(["--image", image]);
+    }
+
+    if let Some(ref json) = req.devcontainer_json {
+        cmd.args(["--devcontainer-json", json]);
+    }
+
+    if req.use_default_devcontainer {
+        cmd.arg("--use-default-devcontainer");
+    }
+
+    cmd.stdin(std::process::Stdio::null());
+
+    tracing::info!("Running devcontainer (async): {:?}", cmd);
+
+    {
+        let mut launches = state.launches.lock().await;
+        if launches.contains_key(&pod_name) {
+            tracing::warn!("Duplicate devcontainer launch rejected for {}", pod_name);
+            return Err(StatusCode::CONFLICT);
+        }
+        launches.insert(pod_name.clone(), LaunchState::Launching);
+    }
+
+    let launches = state.launches.clone();
+    let pod_name_bg = pod_name.clone();
+    tokio::spawn(async move {
+        let result = cmd.output().await;
+        let mut map = launches.lock().await;
+        match result {
+            Ok(output) if output.status.success() => {
+                tracing::info!("devcontainer run completed for {}", pod_name_bg);
+                map.remove(&pod_name_bg);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let msg = stderr.trim().to_string();
+                tracing::error!("devcontainer run failed for {}: {}", pod_name_bg, msg);
+                map.insert(
+                    pod_name_bg.clone(),
+                    LaunchState::Failed {
+                        error: if msg.is_empty() {
+                            format!("Process exited with {}", output.status)
+                        } else {
+                            msg
+                        },
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to execute devcontainer run for {}: {}",
+                    pod_name_bg,
+                    e
+                );
+                map.insert(
+                    pod_name_bg.clone(),
+                    LaunchState::Failed {
+                        error: format!("Failed to execute: {}", e),
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(Json(RunResponse {
+        success: true,
+        workspace: short_name,
+        message: "Launching devcontainer in background".to_string(),
+        status: Some("launching".to_string()),
+        pod_name: Some(pod_name),
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct DevcontainerPodInfo {
+    name: String,
+    status: String,
+    created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containers: Option<Vec<UnifiedContainerInfo>>,
+}
+
+async fn list_devcontainers(State(state): State<Arc<AppState>>) -> Json<Vec<DevcontainerPodInfo>> {
+    let cached_pods = state.pod_cache.read().await;
+
+    let result: Vec<DevcontainerPodInfo> = cached_pods
+        .iter()
+        .filter(|p| {
+            p.labels
+                .as_ref()
+                .and_then(|l| l.get("io.devaipod.mode"))
+                .map(|m| m == "devcontainer")
+                .unwrap_or(false)
+        })
+        .map(|p| DevcontainerPodInfo {
+            name: p.name.clone(),
+            status: p.status.clone(),
+            created: p.created.clone(),
+            labels: p.labels.clone(),
+            containers: p.containers.clone(),
+        })
+        .collect();
+
+    Json(result)
+}
+
+async fn delete_devcontainer(Path(name): Path<String>) -> Result<StatusCode, StatusCode> {
+    let pod_name = normalize_pod_name(&name);
+
+    tracing::info!("Deleting devcontainer pod: {}", pod_name);
+
+    let output = tokio::process::Command::new("podman")
+        .args(["pod", "rm", "-f", &pod_name])
+        .output()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to execute podman pod rm: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("podman pod rm failed for {}: {}", pod_name, stderr.trim());
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Run the web server
 ///
 /// Starts an HTTP server on the specified port with:
@@ -3168,6 +3347,13 @@ fn build_app_with_cache(
         // Workspace-centric endpoints
         .route("/devaipod/workspaces", get(list_workspaces_api))
         .route("/devaipod/recent-sources", get(list_recent_sources))
+        // Devcontainer endpoints
+        .route("/devaipod/devcontainer/run", post(run_devcontainer))
+        .route("/devaipod/devcontainer/list", get(list_devcontainers))
+        .route(
+            "/devaipod/devcontainer/{name}",
+            axum::routing::delete(delete_devcontainer),
+        )
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(
             "/devaipod/pods/{name}/pty",
