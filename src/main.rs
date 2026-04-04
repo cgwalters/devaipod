@@ -182,22 +182,31 @@ fn get_latest_workspace() -> Result<String> {
     Ok(latest.to_string())
 }
 
-/// Resolve the source for a workspace, using dotfiles.url as fallback
+/// Resolve the source for a workspace, using journal or dotfiles as fallback
 ///
-/// If source is provided, returns it. Otherwise, returns the dotfiles URL
-/// from config, or an error if neither is available.
+/// If source is provided, returns it. Otherwise, falls back to the journal
+/// repo (if configured), then the dotfiles URL, or returns an error.
 fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Result<&'a str> {
     if let Some(s) = source {
         return Ok(s);
     }
+
+    // Fall back to journal repo if configured
+    if let Some(ref repo) = config.journal.repo {
+        tracing::info!("No source specified, using journal repo: {}", repo);
+        return Ok(repo.as_str());
+    }
+
     config
         .dotfiles
         .as_ref()
         .map(|d| d.url.as_str())
         .ok_or_else(|| {
             color_eyre::eyre::eyre!(
-                "No source specified and no dotfiles repository configured.\n\
-                 Either provide a source argument or configure dotfiles in your config:\n\n\
+                "No source specified and no journal or dotfiles repository configured.\n\
+                 Either provide a source argument, or configure a fallback in your config:\n\n\
+                 [journal]\n\
+                 repo = \"~/src/journal\"\n\n\
                  [dotfiles]\n\
                  url = \"https://github.com/youruser/dotfiles\""
             )
@@ -495,11 +504,11 @@ enum HostCommand {
     /// For remote URLs (GitHub repos/PRs), service-gator is automatically enabled
     /// with read + draft PR permissions for that repository.
     ///
-    /// If no source is specified, uses the dotfiles repository from config
-    /// (which must contain a devcontainer.json).
+    /// If no source is specified, falls back to the journal repo (if configured),
+    /// then the dotfiles repository from config.
     ///
     /// Examples:
-    ///   devaipod up                                        # Use dotfiles repo
+    ///   devaipod up                                        # Use journal/dotfiles repo
     ///   devaipod up .                                      # Local repo
     ///   devaipod up . -S                                   # Local repo, SSH in after
     ///   devaipod up https://github.com/user/repo           # Remote repo
@@ -507,7 +516,7 @@ enum HostCommand {
     ///   devaipod up . 'fix the bug'                        # With task for agent
     ///   devaipod up . --service-gator=github:myorg/*       # Custom permissions
     Up {
-        /// Source: local path, git URL, or PR URL (default: dotfiles repo from config)
+        /// Source: local path, git URL, or PR URL (default: journal or dotfiles repo from config)
         source: Option<String>,
         #[command(flatten)]
         opts: UpOptions,
@@ -759,17 +768,17 @@ enum HostCommand {
     /// "Fix <issue_url>". If no task is provided and stdin is a TTY, prompts
     /// interactively with the default pre-filled.
     ///
-    /// If no source is specified, uses the dotfiles repository from config
-    /// (which must contain a devcontainer.json).
+    /// If no source is specified, falls back to the journal repo (if configured),
+    /// then the dotfiles repository from config.
     ///
     /// Examples:
-    ///   devaipod run                                         # Use dotfiles repo
+    ///   devaipod run                                         # Use journal/dotfiles repo
     ///   devaipod run https://github.com/org/repo
     ///   devaipod run https://github.com/org/repo 'fix typos in README.md'
     ///   devaipod run https://github.com/org/repo/issues/123  # Default: "Fix <url>"
     ///   devaipod run . 'add unit tests for the parser module'
     Run {
-        /// Source: local path, git URL, issue URL, or PR URL (default: dotfiles repo from config)
+        /// Source: local path, git URL, issue URL, or PR URL (default: journal or dotfiles repo from config)
         source: Option<String>,
         /// Task description for the AI agent
         #[arg(value_name = "TASK")]

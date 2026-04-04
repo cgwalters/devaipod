@@ -98,6 +98,51 @@ pub struct Config {
     /// Git-related configuration
     #[serde(default)]
     pub git: GitConfig,
+
+    /// Journal repository configuration (fallback source for agents without a specific repo)
+    #[serde(default)]
+    pub journal: JournalConfig,
+}
+
+/// Journal repository configuration
+///
+/// The journal repo is a fallback for agents launched without a specific source
+/// repo. It provides a place for research notes, cross-cutting investigations,
+/// and other work that doesn't belong to a specific project.
+///
+/// Example configuration:
+/// ```toml
+/// [journal]
+/// repo = "~/src/journal"
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct JournalConfig {
+    /// Path to the journal git repository.
+    /// Can be a local path (~/src/journal) or a git URL.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+impl JournalConfig {
+    /// Returns the resolved journal repo path, expanding ~ to $HOME.
+    #[allow(dead_code)] // Used by tests; will be used by workspace creation
+    pub fn repo_path(&self) -> Option<std::path::PathBuf> {
+        self.repo.as_ref().map(|r| {
+            if let Some(suffix) = r.strip_prefix("~/")
+                && let Ok(home) = std::env::var("HOME")
+            {
+                return std::path::PathBuf::from(format!("{}/{}", home, suffix));
+            }
+            std::path::PathBuf::from(r)
+        })
+    }
+
+    /// Returns true if a journal repo is configured.
+    #[allow(dead_code)] // Used by tests; will be used by workspace creation
+    pub fn is_configured(&self) -> bool {
+        self.repo.is_some()
+    }
 }
 
 /// Git-related configuration
@@ -2413,5 +2458,59 @@ extra_hosts = []
         let toml = "";
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.git.extra_hosts.is_empty());
+    }
+
+    // =========================================================================
+    // Journal configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_journal_config_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.journal.is_configured());
+        assert!(config.journal.repo_path().is_none());
+    }
+
+    #[test]
+    fn test_journal_config_with_repo() {
+        let config: Config = toml::from_str(
+            r#"
+            [journal]
+            repo = "~/src/journal"
+        "#,
+        )
+        .unwrap();
+        assert!(config.journal.is_configured());
+        // Don't assert the exact path since HOME varies
+        assert!(config.journal.repo_path().is_some());
+    }
+
+    #[test]
+    fn test_journal_config_with_url() {
+        let config: Config = toml::from_str(
+            r#"
+            [journal]
+            repo = "https://github.com/user/journal"
+        "#,
+        )
+        .unwrap();
+        assert!(config.journal.is_configured());
+        assert_eq!(
+            config.journal.repo_path().unwrap().to_str().unwrap(),
+            "https://github.com/user/journal"
+        );
+    }
+
+    #[test]
+    fn test_journal_config_tilde_expansion() {
+        let config = JournalConfig {
+            repo: Some("~/src/journal".to_string()),
+        };
+        let path = config.repo_path().unwrap();
+        // Should expand ~ when HOME is set (which it is in test environments)
+        if std::env::var("HOME").is_ok() {
+            assert!(!path.to_str().unwrap().starts_with("~/"));
+            assert!(path.to_str().unwrap().ends_with("/src/journal"));
+        }
     }
 }
