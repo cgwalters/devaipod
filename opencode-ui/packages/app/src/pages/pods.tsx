@@ -29,6 +29,9 @@ import {
   type LaunchWorkspaceParams,
   type GatorScopeConfig,
   type GatorScopesResponse,
+  type ControlPlaneRepo,
+  type ControlPlaneAgent,
+  type ControlPlaneDevcontainer,
   frecencySortPods,
   effectiveTimestamp,
   timeSection,
@@ -352,6 +355,9 @@ function PodsPageContent() {
         </Card>
       </Show>
 
+      {/* Control plane repo-grouped view */}
+      <ControlPlaneView />
+
       {/* Launch form section */}
       <div class="mb-6">
         <Show
@@ -464,6 +470,187 @@ function PodsPageContent() {
       {/* Devcontainers section */}
       <DevcontainerSection />
     </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Control Plane — repo-grouped view
+// ---------------------------------------------------------------------------
+
+/** Format an ISO timestamp as a relative "time ago" string. */
+function timeAgo(iso: string): string {
+  const ts = new Date(iso).getTime()
+  if (Number.isNaN(ts)) return ""
+  const age = Date.now() - ts
+  if (age < 60_000) return "just now"
+  const mins = Math.floor(age / 60_000)
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days === 1) return "1d ago"
+  return `${days}d ago`
+}
+
+function ControlPlaneView() {
+  const ctx = useDevaipod()
+  const [showInactive, setShowInactive] = createSignal(false)
+
+  const activeRepos = createMemo(() =>
+    ctx.controlPlane.filter((r) => r.active_count > 0),
+  )
+  const inactiveRepos = createMemo(() =>
+    ctx.controlPlane.filter((r) => r.active_count === 0),
+  )
+
+  return (
+    <Show when={ctx.controlPlane.length > 0}>
+      <div class="mb-8">
+        <h2 class="text-16-medium text-text-strong mb-4">Repos</h2>
+        <div class="flex flex-col gap-3">
+          <For each={activeRepos()}>
+            {(repo) => <RepoSection repo={repo} defaultOpen={true} />}
+          </For>
+
+          <Show when={inactiveRepos().length > 0}>
+            <button
+              type="button"
+              class="flex items-center gap-2 text-12-regular text-text-weak hover:text-text-secondary-base transition-colors cursor-pointer py-1"
+              onClick={() => setShowInactive((v) => !v)}
+            >
+              <span class="text-text-weak">{showInactive() ? "\u25BC" : "\u25B8"}</span>
+              Inactive repos ({inactiveRepos().length})
+            </button>
+            <Show when={showInactive()}>
+              <For each={inactiveRepos()}>
+                {(repo) => <RepoSection repo={repo} defaultOpen={false} />}
+              </For>
+            </Show>
+          </Show>
+        </div>
+      </div>
+    </Show>
+  )
+}
+
+function RepoSection(props: { repo: ControlPlaneRepo; defaultOpen: boolean }) {
+  const [open, setOpen] = createSignal(props.defaultOpen)
+
+  // Show last path component for short display, full for title
+  const shortRepoName = () => {
+    const parts = props.repo.repo.split("/")
+    return parts.length > 1 ? parts.slice(-2).join("/") : props.repo.repo
+  }
+
+  return (
+    <div class="border border-border-base rounded">
+      {/* Repo header */}
+      <button
+        type="button"
+        class="w-full flex items-center justify-between px-4 py-2.5 hover:bg-surface-secondary transition-colors cursor-pointer"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="text-text-weak text-11-regular">{open() ? "\u25BC" : "\u25B6"}</span>
+          <span class="text-13-regular text-text-strong truncate">{shortRepoName()}</span>
+        </div>
+        <Show when={props.repo.active_count > 0}>
+          <span class="text-11-regular text-text-weak bg-fill-element-base px-2 py-0.5 rounded-full">
+            {props.repo.active_count} active
+          </span>
+        </Show>
+      </button>
+
+      {/* Repo body */}
+      <Show when={open()}>
+        <div class="border-t border-border-base">
+          <For each={props.repo.agents}>
+            {(agent) => <AgentRow agent={agent} />}
+          </For>
+          <For each={props.repo.devcontainers}>
+            {(dc) => <DevcontainerRow dc={dc} />}
+          </For>
+          <Show when={props.repo.agents.length === 0 && props.repo.devcontainers.length === 0}>
+            <div class="px-4 py-3 text-12-regular text-text-weak">No workspaces</div>
+          </Show>
+        </div>
+      </Show>
+    </div>
+  )
+}
+
+function AgentRow(props: { agent: ControlPlaneAgent }) {
+  const a = () => props.agent
+
+  const statusDot = createMemo(() => {
+    if (a().completion_status === "done") return { char: "\u25C9", cls: "text-violet-400" }
+    if (a().is_running) return { char: "\u25CF", cls: "text-icon-success-base" }
+    return { char: "\u25CF", cls: "text-text-weak" }
+  })
+
+  const displayName = () => a().title || a().short_name
+  const subtitle = () => {
+    if (a().title) return a().short_name
+    if (a().completion_status === "done") return "Done"
+    return a().status
+  }
+
+  const lastActive = () => {
+    if (a().last_active) return timeAgo(a().last_active!)
+    return timeAgo(a().created)
+  }
+
+  function navigate() {
+    window.location.href = `/_devaipod/agent/${encodeURIComponent(a().name)}`
+  }
+
+  return (
+    <button
+      type="button"
+      class="w-full flex items-center gap-3 px-4 py-2 hover:bg-surface-secondary transition-colors cursor-pointer text-left border-t border-border-base first:border-t-0"
+      onClick={navigate}
+    >
+      <span classList={{ [statusDot().cls]: true, "text-11-regular": true }}>{statusDot().char}</span>
+      <span
+        class="text-12-regular truncate min-w-0 flex-1"
+        classList={{
+          "text-text-strong": a().is_running && a().completion_status !== "done",
+          "text-text-weak": !a().is_running || a().completion_status === "done",
+        }}
+      >
+        {displayName()}
+      </span>
+      <span class="text-11-regular text-text-weak truncate shrink-0 max-w-[120px]">{subtitle()}</span>
+      <span class="text-11-regular text-text-weak shrink-0">{lastActive()}</span>
+      <Show when={a().is_running}>
+        <span class="text-text-weak text-11-regular shrink-0">{"\u2192"}</span>
+      </Show>
+    </button>
+  )
+}
+
+function DevcontainerRow(props: { dc: ControlPlaneDevcontainer }) {
+  const dc = () => props.dc
+
+  return (
+    <div class="flex items-center gap-3 px-4 py-2 border-t border-border-base first:border-t-0">
+      <span class="text-11-regular text-text-weak bg-fill-element-base px-1.5 py-0.5 rounded font-mono">DC</span>
+      <span
+        class="text-12-regular truncate min-w-0 flex-1"
+        classList={{
+          "text-text-strong": dc().is_running,
+          "text-text-weak": !dc().is_running,
+        }}
+      >
+        {dc().short_name}
+      </span>
+      <span class="text-11-regular text-text-weak shrink-0">
+        {dc().is_running ? "Running" : "Stopped"}
+      </span>
+      <Show when={dc().is_running}>
+        <span class="text-11-regular text-text-weak font-mono shrink-0">ssh {dc().short_name}</span>
+      </Show>
     </div>
   )
 }

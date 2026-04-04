@@ -89,6 +89,37 @@ export interface DevcontainerPod {
   containers?: { Names: string; Status: string }[]
 }
 
+// ---------------------------------------------------------------------------
+// Control-plane types (repo-grouped view)
+// ---------------------------------------------------------------------------
+
+export interface ControlPlaneAgent {
+  name: string
+  short_name: string
+  status: string
+  task?: string
+  title?: string
+  completion_status?: string
+  last_active?: string
+  is_running: boolean
+  created: string
+}
+
+export interface ControlPlaneDevcontainer {
+  name: string
+  short_name: string
+  status: string
+  created: string
+  is_running: boolean
+}
+
+export interface ControlPlaneRepo {
+  repo: string
+  active_count: number
+  agents: ControlPlaneAgent[]
+  devcontainers: ControlPlaneDevcontainer[]
+}
+
 /** GitHub repo permission flags from the gator config */
 export interface GhRepoPermission {
   read?: boolean
@@ -192,6 +223,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       proposals: [] as Proposal[],
       recentSources: [] as RecentSource[],
       devcontainers: [] as DevcontainerPod[],
+      controlPlane: [] as ControlPlaneRepo[],
       connected: undefined as boolean | undefined,
       error: undefined as string | undefined,
     })
@@ -302,6 +334,17 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       }
     }
 
+    // -- Control plane (repo-grouped view) -----------------------------------
+
+    async function fetchControlPlane() {
+      try {
+        const data = await apiFetch<{ repos: ControlPlaneRepo[] }>("/api/devaipod/control-plane")
+        setStore("controlPlane", reconcile(data.repos, { key: "repo", merge: true }))
+      } catch {
+        // Ignore — endpoint may not exist on older backends
+      }
+    }
+
     // -- Polling setup ------------------------------------------------------
     // Use self-scheduling setTimeout loops instead of setInterval so the next
     // poll is only queued after the current one finishes.  This makes request
@@ -356,6 +399,17 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     scheduleDevcontainerPoll()
     onCleanup(() => clearTimeout(devcontainerTimer))
 
+    let controlPlaneTimer: ReturnType<typeof setTimeout> | undefined
+    function scheduleControlPlanePoll() {
+      if (disposed) return
+      controlPlaneTimer = setTimeout(async () => {
+        await fetchControlPlane()
+        scheduleControlPlanePoll()
+      }, POD_POLL_MS)
+    }
+    scheduleControlPlanePoll()
+    onCleanup(() => clearTimeout(controlPlaneTimer))
+
     // Initial fetch — the effect tracks only refreshCounter; the async bodies
     // read store state (e.g. store.pods, store.launches) which must NOT be tracked
     // here or we'd create a feedback loop (fetch updates store → effect re-fires).
@@ -367,6 +421,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         fetchProposals()
         fetchRecentSources()
         fetchDevcontainers()
+        fetchControlPlane()
       })
     })
 
@@ -577,6 +632,9 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       },
       get devcontainers() {
         return store.devcontainers
+      },
+      get controlPlane() {
+        return store.controlPlane
       },
       get connected() {
         return store.connected
