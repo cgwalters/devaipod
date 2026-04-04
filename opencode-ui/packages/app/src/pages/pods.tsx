@@ -484,6 +484,36 @@ function LaunchForm(props: { onClose: () => void }) {
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
 
+  /** Format a recent-source timestamp as a relative time label. */
+  function formatRecent(isoDate: string): string {
+    const ts = new Date(isoDate).getTime()
+    if (Number.isNaN(ts)) return ""
+    const age = Date.now() - ts
+    const hours = Math.floor(age / 3_600_000)
+    if (hours < 1) return "just now"
+    if (hours < 24) return `${hours}h ago`
+    const days = Math.floor(hours / 24)
+    if (days === 1) return "yesterday"
+    if (days < 7) return `${days}d ago`
+    if (days < 30) return `${Math.floor(days / 7)}w ago`
+    return `${Math.floor(days / 30)}mo ago`
+  }
+
+  /** Shorten a path for display: ~/src/foo instead of /home/user/src/foo. */
+  function shortenSource(s: string): string {
+    // Leave URLs alone
+    if (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("git@")) return s
+    // Collapse home dir
+    const home = "/home/"
+    const idx = s.indexOf(home)
+    if (idx === 0) {
+      const rest = s.slice(home.length)
+      const slash = rest.indexOf("/")
+      if (slash > 0) return "~" + rest.slice(slash)
+    }
+    return s
+  }
+
   function addScope() {
     setScopes((prev) => [...prev, ""])
   }
@@ -540,12 +570,37 @@ function LaunchForm(props: { onClose: () => void }) {
       <form onSubmit={handleSubmit}>
         <div class="flex flex-col gap-4">
           <TextField
-            label="Repository URL"
-            placeholder="https://github.com/org/repo or issue/PR URL"
+            label="Source"
+            placeholder="Local path, repo URL, issue/PR URL"
             value={repoUrl()}
             onChange={setRepoUrl}
             required
           />
+
+          <Show when={ctx.recentSources.length > 0 && !repoUrl().trim()}>
+            <div class="flex flex-col gap-1">
+              <span class="text-11-regular text-text-weak">Recent</span>
+              <div class="flex flex-col">
+                <For each={ctx.recentSources.slice(0, 8)}>
+                  {(recent) => (
+                    <button
+                      type="button"
+                      class="flex items-center justify-between px-2 py-1.5 rounded text-left hover:bg-surface-hover transition-colors group"
+                      onClick={() => setRepoUrl(recent.source)}
+                    >
+                      <span class="text-12-regular text-text-default truncate mr-3 font-mono">
+                        {shortenSource(recent.source)}
+                      </span>
+                      <span class="text-11-regular text-text-weak opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                        {formatRecent(recent.last_used)}
+                      </span>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </div>
+          </Show>
+
           <TextField
             label="Task (optional)"
             placeholder="Describe what the agent should work on..."

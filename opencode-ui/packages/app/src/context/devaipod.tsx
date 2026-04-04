@@ -74,6 +74,12 @@ export interface LaunchWorkspaceParams {
   no_auto_approve?: boolean
 }
 
+/** A recently-used source from the server (local path or remote URL). */
+export interface RecentSource {
+  source: string
+  last_used: string
+}
+
 /** GitHub repo permission flags from the gator config */
 export interface GhRepoPermission {
   read?: boolean
@@ -175,6 +181,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       agentStatus: {} as Record<string, AgentStatus>,
       enrichment: {} as Record<string, { needs_update: boolean }>,
       proposals: [] as Proposal[],
+      recentSources: [] as RecentSource[],
       connected: undefined as boolean | undefined,
       error: undefined as string | undefined,
     })
@@ -263,6 +270,17 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       }
     }
 
+    // -- Recent sources (fetched once, refreshed on launch) ------------------
+
+    async function fetchRecentSources() {
+      try {
+        const sources = await apiFetch<RecentSource[]>("/api/devaipod/recent-sources")
+        setStore("recentSources", reconcile(sources, { key: "source", merge: true }))
+      } catch {
+        // Ignore — not critical
+      }
+    }
+
     // -- Polling setup ------------------------------------------------------
     // Use self-scheduling setTimeout loops instead of setInterval so the next
     // poll is only queued after the current one finishes.  This makes request
@@ -315,6 +333,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         fetchPods()
         fetchLaunches()
         fetchProposals()
+        fetchRecentSources()
       })
     })
 
@@ -371,6 +390,8 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         setStore("launches", result.pod_name, { state: "launching" })
       }
       refresh()
+      // Refresh recent sources so the launcher picks up the new entry
+      fetchRecentSources()
       return result
     }
 
@@ -481,6 +502,9 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       },
       get proposals() {
         return store.proposals
+      },
+      get recentSources() {
+        return store.recentSources
       },
       get connected() {
         return store.connected
