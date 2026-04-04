@@ -1534,7 +1534,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let session_count = sessions.len();
 
     if sessions.is_empty() {
-        let completion_status = read_completion_status(&state.workspace).await;
+        let (completion_status, _changed_at) = read_completion_status(&state.workspace).await;
         return Json(PodSummaryResponse {
             activity: "Idle".to_string(),
             status_line: Some("Waiting for input...".to_string()),
@@ -1580,12 +1580,31 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
     let (activity, status_line, current_tool, recent_output, last_message_ts) =
         derive_agent_status_from_messages(&messages);
 
-    let mut completion_status = read_completion_status(&state.workspace).await;
+    let (mut completion_status, changed_at) = read_completion_status(&state.workspace).await;
 
     // Auto-detect completion: when the agent is idle after doing work,
     // automatically transition to Done. This avoids requiring the user
     // to manually click "Done" or run `devaipod done`.
-    if activity == "Idle" && completion_status == CompletionStatus::Active && !messages.is_empty() {
+    //
+    // Grace period: skip auto-completion if the status was recently set
+    // to Active (e.g. after a review submission). This prevents the race
+    // where the agent hasn't started processing a new message yet but
+    // the poll sees the old "Idle" state.
+    let in_grace_period = if completion_status == CompletionStatus::Active {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        changed_at.is_some_and(|t| (now - t) < AUTO_COMPLETION_GRACE_SECS)
+    } else {
+        false
+    };
+
+    if activity == "Idle"
+        && completion_status == CompletionStatus::Active
+        && !messages.is_empty()
+        && !in_grace_period
+    {
         if let Err(e) = write_completion_status(&state.workspace, CompletionStatus::Done).await {
             tracing::warn!("Failed to auto-set completion status: {e}");
         } else {
@@ -2145,7 +2164,20 @@ enum CompletionStatus {
 #[derive(Debug, Serialize, Deserialize)]
 struct CompletionStatusFile {
     status: CompletionStatus,
+    /// Unix timestamp (seconds) of the last status change. Used to suppress
+    /// auto-completion for a grace period after the status is reset to Active
+    /// (e.g. after a review submission), preventing the auto-completion
+    /// from immediately re-triggering before the agent processes new input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    changed_at: Option<i64>,
 }
+
+/// Duration (in seconds) after a status change to Active during which
+/// auto-completion is suppressed. This prevents the race where a review
+/// resets status to Active but the agent hasn't started processing the
+/// review message yet, so the next /summary poll would see "Idle" and
+/// immediately re-set Done.
+const AUTO_COMPLETION_GRACE_SECS: i64 = 60;
 
 /// Response for GET /completion-status.
 #[derive(Debug, Serialize)]
@@ -2194,23 +2226,32 @@ fn title_path() -> PathBuf {
     state_dir().join("title.txt")
 }
 
-/// Read the current completion status from disk.
-async fn read_completion_status(workspace: &std::path::Path) -> CompletionStatus {
+/// Read the current completion status and change timestamp from disk.
+async fn read_completion_status(workspace: &std::path::Path) -> (CompletionStatus, Option<i64>) {
     let path = completion_status_path(workspace);
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => serde_json::from_str::<CompletionStatusFile>(&content)
-            .map(|f| f.status)
+            .map(|f| (f.status, f.changed_at))
             .unwrap_or_default(),
-        Err(_) => CompletionStatus::default(),
+        Err(_) => Default::default(),
     }
 }
 
 /// Write the completion status to disk atomically (write-to-temp then rename).
+/// Records the current timestamp so auto-completion can be suppressed
+/// during the grace period after a reset to Active.
 async fn write_completion_status(
     workspace: &std::path::Path,
     status: CompletionStatus,
 ) -> Result<(), String> {
-    let file = CompletionStatusFile { status };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let file = CompletionStatusFile {
+        status,
+        changed_at: Some(now),
+    };
     let json = serde_json::to_string_pretty(&file).map_err(|e| format!("serialize: {e}"))?;
     let path = completion_status_path(workspace);
     let temp_path = path.with_extension("json.tmp");
@@ -2342,7 +2383,7 @@ async fn update_gator_scopes(
 
 /// `GET /completion-status` — read current pod completion status.
 async fn get_completion_status(State(state): State<AppState>) -> Json<CompletionStatusResponse> {
-    let status = read_completion_status(&state.workspace).await;
+    let (status, _changed_at) = read_completion_status(&state.workspace).await;
     Json(CompletionStatusResponse { status })
 }
 

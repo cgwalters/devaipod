@@ -2755,7 +2755,8 @@ fn find_git_repo_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     best.map(|(p, _)| p)
 }
 
-/// Run a git command in `repo` and return stdout, or `None` on failure.
+/// Run a git command in `repo` and return stdout, or `None` on failure
+/// or empty output.
 fn run_git(repo: &std::path::Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -2765,7 +2766,7 @@ fn run_git(repo: &std::path::Path, args: &[&str]) -> Option<String> {
         .ok()?;
     if output.status.success() {
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Some(s)
+        if s.is_empty() { None } else { Some(s) }
     } else {
         None
     }
@@ -2800,7 +2801,7 @@ fn find_workspace_in_container(container: &str) -> Option<String> {
     let listing = String::from_utf8_lossy(&output.stdout);
     for dir in listing.lines() {
         let dir = dir.trim();
-        if dir.is_empty() {
+        if dir.is_empty() || dir.contains('/') || dir.contains('\0') || dir == ".." {
             continue;
         }
         let path = format!("/workspaces/{dir}");
@@ -3214,7 +3215,6 @@ async fn submit_review(
         .post(format!(
             "http://{host}:{port}/session/{session_id}/prompt_async"
         ))
-        .header("Content-Type", "application/json")
         .json(&message_body)
         .send()
         .await
@@ -5174,5 +5174,71 @@ mod tests {
         let json = r#"{"devaipod-x":{"last_active_ts":42,"unknown_field":"ok"}}"#;
         let map: HashMap<String, CachedPodState> = serde_json::from_str(json).unwrap();
         assert_eq!(map["devaipod-x"].last_active_ts, Some(42));
+    }
+
+    #[test]
+    fn test_parse_commit_log_normal() {
+        let input = "abc123\0Fix the bug\0Alice\02026-01-01T00:00:00Z\n\
+                      def456\0Add feature\0Bob\02026-01-02T00:00:00Z";
+        let commits = super::parse_commit_log(input);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "abc123");
+        assert_eq!(commits[0].message, "Fix the bug");
+        assert_eq!(commits[0].author, "Alice");
+        assert_eq!(commits[1].sha, "def456");
+        assert_eq!(commits[1].author, "Bob");
+    }
+
+    #[test]
+    fn test_parse_commit_log_empty() {
+        assert!(super::parse_commit_log("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_commit_log_malformed_lines_skipped() {
+        let input = "abc123\0Fix\n\
+                      bad-line-no-nulls\n\
+                      def456\0Add\0Bob\02026-01-01T00:00:00Z";
+        let commits = super::parse_commit_log(input);
+        // Only the last line has 4 fields
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].sha, "def456");
+    }
+
+    #[test]
+    fn test_format_review_message_with_comments() {
+        let req = super::ReviewRequest {
+            message: Some("Please fix the tests".to_string()),
+            comments: vec![
+                super::ReviewComment {
+                    file: "src/main.rs".to_string(),
+                    line: Some(42),
+                    body: "This is wrong".to_string(),
+                },
+                super::ReviewComment {
+                    file: "src/lib.rs".to_string(),
+                    line: None,
+                    body: "Missing docs".to_string(),
+                },
+            ],
+        };
+        let msg = super::format_review_message(&req);
+        assert!(msg.contains("Code Review Feedback"));
+        assert!(msg.contains("Please fix the tests"));
+        assert!(msg.contains("`src/main.rs:42`"));
+        assert!(msg.contains("`src/lib.rs`"));
+        assert!(msg.contains("This is wrong"));
+        assert!(msg.contains("Missing docs"));
+    }
+
+    #[test]
+    fn test_format_review_message_no_comments() {
+        let req = super::ReviewRequest {
+            message: Some("Looks good overall".to_string()),
+            comments: vec![],
+        };
+        let msg = super::format_review_message(&req);
+        assert!(msg.contains("Looks good overall"));
+        assert!(!msg.contains("Inline Comments"));
     }
 }
