@@ -2675,6 +2675,230 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
 // routes git requests through the pod-api proxy.
 
 // =============================================================================
+// Agent diff endpoint — shows changes the agent made vs the starting point
+// =============================================================================
+
+/// Query parameters for the agent diff endpoint.
+#[derive(Debug, Deserialize)]
+struct DiffQueryParams {
+    /// If true, return `--stat` output instead of full diff.
+    stat: Option<bool>,
+}
+
+/// A single commit summary in the diff response.
+#[derive(Debug, Serialize)]
+struct CommitSummary {
+    sha: String,
+    message: String,
+    author: String,
+    timestamp: String,
+}
+
+/// Response for `GET /api/devaipod/pods/{name}/diff`.
+#[derive(Debug, Serialize)]
+struct AgentDiffResponse {
+    /// The branch the agent is on.
+    branch: String,
+    /// Number of commits ahead of the starting point.
+    commit_count: usize,
+    /// Commit summaries (newest first).
+    commits: Vec<CommitSummary>,
+    /// The diff output (full diff or stat).
+    diff: String,
+    /// Whether this is a stat-only response.
+    is_stat: bool,
+}
+
+/// Find a git repo inside `dir`, checking `dir` itself and then one level of
+/// subdirectories. When multiple subdirectories contain a repo, the most
+/// recently modified one wins (same heuristic as `find_agent_git_repo` in
+/// `main.rs`).
+fn find_git_repo_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if dir.join(".git").exists() {
+        return Some(dir.to_path_buf());
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path.join(".git").exists() {
+            let mtime = path
+                .join(".git")
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                best = Some((path, mtime));
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Run a git command in `repo` and return stdout, or `None` on failure.
+fn run_git(repo: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// Resolve the base ref to diff against. Tries `origin/HEAD`, then
+/// `origin/main`, `origin/master`, then the first `origin/*` branch.
+fn resolve_origin_ref(repo: &std::path::Path) -> Option<String> {
+    // Try origin/HEAD (symbolic)
+    if run_git(repo, &["rev-parse", "--verify", "origin/HEAD"]).is_some() {
+        return Some("origin/HEAD".to_string());
+    }
+    for branch in ["main", "master"] {
+        let refname = format!("origin/{branch}");
+        if run_git(repo, &["rev-parse", "--verify", &refname]).is_some() {
+            return Some(refname);
+        }
+    }
+    // Fall back to the first origin/* branch
+    let branches = run_git(repo, &["branch", "-r", "--list", "origin/*"])?;
+    branches
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.contains("->"))
+        .map(|s| s.to_string())
+}
+
+/// `GET /api/devaipod/pods/{name}/diff`
+///
+/// Returns the agent's git diff compared to the origin ref, plus commit
+/// metadata. Runs git commands directly against the agent's workspace
+/// directory on the control plane's filesystem.
+async fn agent_diff(
+    Path(name): Path<String>,
+    Query(params): Query<DiffQueryParams>,
+) -> Result<Json<AgentDiffResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+    let use_stat = params.stat.unwrap_or(false);
+
+    // All git operations are blocking I/O; run on the blocking pool.
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<AgentDiffResponse, (StatusCode, String)> {
+            // Locate the agent's workspace directory.
+            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).map_err(|e| {
+                tracing::error!("Failed to resolve agent dir for {pod_name}: {e:#}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to resolve agent directory: {e}"),
+                )
+            })?;
+
+            if !agent_dir.exists() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("Workspace directory not found for pod '{pod_name}'"),
+                ));
+            }
+
+            let repo_path = find_git_repo_in_dir(&agent_dir).ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("No git repository found in agent workspace for '{pod_name}'"),
+                )
+            })?;
+
+            // Current branch
+            let branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+                .unwrap_or_else(|| "HEAD".to_string());
+
+            // Find the base ref to diff against
+            let origin_ref = match resolve_origin_ref(&repo_path) {
+                Some(r) => r,
+                None => {
+                    // No origin — return empty diff (agent hasn't pushed or
+                    // repo was cloned without a remote).
+                    return Ok(AgentDiffResponse {
+                        branch,
+                        commit_count: 0,
+                        commits: vec![],
+                        diff: String::new(),
+                        is_stat: use_stat,
+                    });
+                }
+            };
+
+            // Count commits ahead of origin
+            let range = format!("{origin_ref}..HEAD");
+            let commit_count: usize = run_git(&repo_path, &["rev-list", "--count", &range])
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            // Commit summaries (null-byte delimited for robust parsing)
+            let format_str = "%H%x00%s%x00%an%x00%aI";
+            let log_output = run_git(
+                &repo_path,
+                &["log", &format!("--format={format_str}"), &range],
+            )
+            .unwrap_or_default();
+
+            let commits: Vec<CommitSummary> = if !log_output.is_empty() {
+                log_output
+                    .lines()
+                    .filter_map(|line| {
+                        let fields: Vec<&str> = line.split('\0').collect();
+                        if fields.len() >= 4 {
+                            Some(CommitSummary {
+                                sha: fields[0].to_string(),
+                                message: fields[1].to_string(),
+                                author: fields[2].to_string(),
+                                timestamp: fields[3].to_string(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            // Diff
+            let diff = if use_stat {
+                run_git(&repo_path, &["diff", "--stat", &range])
+            } else {
+                run_git(&repo_path, &["diff", &range])
+            }
+            .unwrap_or_default();
+
+            Ok(AgentDiffResponse {
+                branch,
+                commit_count,
+                commits,
+                diff,
+                is_stat: use_stat,
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("spawn_blocking panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: "Internal error".to_string(),
+                }),
+            )
+        })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
+}
+
+// =============================================================================
 // Service-gator scope management (proxy to pod-api)
 // =============================================================================
 
@@ -3484,6 +3708,7 @@ fn build_app_with_cache(
             "/devaipod/pods/{name}/completion-status",
             get(get_pod_completion_status).put(update_pod_completion_status),
         )
+        .route("/devaipod/pods/{name}/diff", get(agent_diff))
         // Lightweight endpoint for frontend cookie refresh (every 4h).
         // The auth_middleware already re-issues the cookie on every
         // authenticated request, so this handler is a no-op — its only
