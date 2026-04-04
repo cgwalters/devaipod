@@ -2940,6 +2940,108 @@ async fn prune_done_pods() -> Result<Json<PruneResponse>, StatusCode> {
     }))
 }
 
+// ── Workspace-centric endpoints ──────────────────────────────────────
+
+/// A workspace entry in the workspace list response.
+///
+/// Merges on-disk workspace state with podman pod status.
+#[derive(Debug, Serialize)]
+struct WorkspaceInfo {
+    /// Directory name (doubles as pod name for host-dir workspaces).
+    name: String,
+    /// Source identifier (local path or remote URL).
+    source: String,
+    /// RFC 3339 creation timestamp.
+    created: String,
+    /// RFC 3339 timestamp of last known activity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_active: Option<String>,
+    /// Task description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    /// Human-readable title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Completion status: "active" or "done".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_status: Option<String>,
+    /// Whether a matching podman pod is currently running.
+    pod_running: bool,
+    /// Podman pod status string (e.g. "Running", "Exited"), if a pod exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_status: Option<String>,
+}
+
+/// `GET /api/devaipod/workspaces` — list all workspaces (running + stopped).
+///
+/// Scans the workspaces base directory for state files and cross-references
+/// with the cached podman pod list to determine which workspaces have
+/// running pods.
+async fn list_workspaces_api(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::Json<Vec<WorkspaceInfo>>, StatusCode> {
+    let workspaces = crate::agent_dir::list_workspaces().map_err(|e| {
+        tracing::warn!("Failed to list workspaces: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Build a set of running pod names from the cache for fast lookup.
+    let pod_cache = state.pod_cache.read().await;
+    let pod_status_map: HashMap<&str, &str> = pod_cache
+        .iter()
+        .map(|p| (p.name.as_str(), p.status.as_str()))
+        .collect();
+
+    let mut results: Vec<WorkspaceInfo> = workspaces
+        .into_iter()
+        .map(|(dir_name, _path, state)| {
+            let pod_status = pod_status_map.get(dir_name.as_str()).copied();
+            let pod_running = pod_status
+                .map(|s| s.eq_ignore_ascii_case("running"))
+                .unwrap_or(false);
+
+            match state {
+                Some(ws) => WorkspaceInfo {
+                    name: ws.pod_name,
+                    source: ws.source,
+                    created: ws.created,
+                    last_active: ws.last_active,
+                    task: ws.task,
+                    title: ws.title,
+                    completion_status: ws.completion_status,
+                    pod_running,
+                    pod_status: pod_status.map(|s| s.to_string()),
+                },
+                None => WorkspaceInfo {
+                    name: dir_name.clone(),
+                    source: String::new(),
+                    created: String::new(),
+                    last_active: None,
+                    task: None,
+                    title: None,
+                    completion_status: None,
+                    pod_running,
+                    pod_status: pod_status.map(|s| s.to_string()),
+                },
+            }
+        })
+        .collect();
+
+    // Sort: running first, then by created descending.
+    results.sort_by(|a, b| {
+        b.pod_running
+            .cmp(&a.pod_running)
+            .then_with(|| b.created.cmp(&a.created))
+    });
+
+    Ok(axum::Json(results))
+}
+
+/// `GET /api/devaipod/recent-sources` — list recently-used sources for the launcher.
+async fn list_recent_sources() -> axum::Json<Vec<crate::agent_dir::RecentSource>> {
+    axum::Json(crate::agent_dir::load_recent_sources())
+}
+
 /// Run the web server
 ///
 /// Starts an HTTP server on the specified port with:
@@ -3052,6 +3154,9 @@ fn build_app_with_cache(
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
         // Unified pod list: pods + agent status + enrichment in one response
         .route("/devaipod/pods", get(list_pods_unified))
+        // Workspace-centric endpoints
+        .route("/devaipod/workspaces", get(list_workspaces_api))
+        .route("/devaipod/recent-sources", get(list_recent_sources))
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(
             "/devaipod/pods/{name}/pty",
