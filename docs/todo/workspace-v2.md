@@ -382,3 +382,58 @@ recreated to get a workspace directory.
    form to show recent sources and accept local paths.
 7. **Re-attach**: `devaipod up --workspace <dir>` re-launches compute
    against an existing workspace directory.
+
+## Phase 3: Decouple workspace containers from agent pods
+
+The workspace container (which runs `sleep infinity` and exists solely
+as a human shell target) is unnecessary overhead. Agents are
+self-contained: they have their own git clone, home directory, and
+`opencode serve` process. The workspace container provides no services
+the agent consumes.
+
+### What changes
+
+**Agent pods become leaner.** Drop the workspace container from the
+default pod layout. An agent pod is now: agent + api + gator (+ optional
+worker). This saves one container per pod.
+
+**SSH access adjusts.** The default `{pod}.devaipod` SSH host entry
+points to the agent container instead of the workspace. The `-agent`
+suffix entry is dropped (redundant). Worker entry remains as-is.
+
+**`devaipod attach`/`exec` default target changes** from workspace to
+agent. The `-W` flag becomes a no-op or error for workspace-less pods.
+
+### `devaipod devcontainer` — standalone dev environments
+
+A new subcommand family provides the human-facing devcontainer
+experience, decoupled from agents:
+
+```bash
+devaipod devcontainer run <source>     # launch a devcontainer
+devaipod devcontainer list             # list running devcontainers
+devaipod devcontainer rm <name>        # remove a devcontainer
+```
+
+A devcontainer pod is: workspace + api (no agent, no gator). It gets
+trusted credentials, devcontainer lifecycle commands, dotfiles — the
+full human dev environment. SSH access via `{name}.devaipod`. This is
+the "just give me a dev environment for this repo" path.
+
+The REST API mirrors the CLI:
+- `POST /api/devaipod/devcontainer/run`
+- `GET /api/devaipod/devcontainer/list`
+- `DELETE /api/devaipod/devcontainer/{name}`
+
+### Why separate from agent pods
+
+Agents and devcontainers have different lifecycles and trust models:
+- **Agents** are autonomous, get LLM keys but not forge credentials
+  (those go through gator), run headless, disposable.
+- **Devcontainers** are interactive, get full trusted credentials,
+  have SSH access for editors, may be long-lived.
+
+Coupling them in one pod created confusion: the workspace container
+sat idle most of the time, and users who wanted a quick dev environment
+had to wait for agent infrastructure to spin up. Separating them makes
+both use cases faster and simpler.

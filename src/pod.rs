@@ -1,19 +1,23 @@
 //! Multi-container pod orchestration for devaipod
 //!
 //! This module manages a pod containing multiple containers:
-//! - `workspace`: The user's development environment (from devcontainer.json)
-//! - `agent`: Same image running `opencode serve` with restricted security
+//! - `agent`: Runs `opencode serve` with its own workspace clone
+//! - `api`: Pod-api sidecar for git/PTY endpoints
 //! - `gator`: Optional service-gator MCP server container
+//! - `worker`: Optional worker agent for orchestration mode
 //!
 //! All containers share the same network namespace via the pod, allowing
-//! localhost communication between the agent and workspace.
+//! localhost communication between them.
+//!
+//! Note: The workspace container config builder is retained for future
+//! standalone devcontainer mode but is not included in agent pods.
 
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Context, Result, bail};
 
 use crate::forge::PullRequestInfo;
-use crate::git::{GitRepoInfo, REMOTE_AGENT, REMOTE_WORKER, REMOTE_WORKSPACE, RemoteRepoInfo};
+use crate::git::{GitRepoInfo, REMOTE_WORKER, REMOTE_WORKSPACE, RemoteRepoInfo};
 
 /// Describes the source for the agent workspace: either a named podman volume
 /// or a host-side bind mount directory.
@@ -259,6 +263,7 @@ const WORKER_CTL_SCRIPT: &str = include_str!("../scripts/devaipod-workerctl.py")
 
 /// Default PATH for containers when we need to synthesize one.
 /// This covers the standard locations where utilities are typically found.
+#[allow(dead_code)] // Used by workspace_container_config, retained for future devcontainer mode
 const DEFAULT_CONTAINER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Attempt to resolve environment variable values containing devcontainer variable syntax.
@@ -272,6 +277,7 @@ const DEFAULT_CONTAINER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// - Returns `None` if the value cannot be meaningfully resolved
 ///
 /// Returns `Some(resolved_value)` if resolved, or `None` if the variable should be skipped.
+#[allow(dead_code)] // Used by workspace_container_config, retained for future devcontainer mode
 fn resolve_env_value(value: &str, var_name: &str) -> Option<String> {
     if !value.contains("${") {
         return Some(value.to_string());
@@ -396,7 +402,8 @@ fn get_host_home() -> Option<PathBuf> {
 pub struct DevaipodPod {
     /// Name of the pod
     pub pod_name: String,
-    /// Name of the workspace container
+    /// Name of the workspace container (not created for agent pods; retained for future devcontainer mode)
+    #[allow(dead_code)]
     pub workspace_container: String,
     /// Name of the agent container (task owner in orchestration mode)
     pub agent_container: String,
@@ -941,30 +948,10 @@ impl DevaipodPod {
             .await?;
         }
 
-        // Create workspace container
-        let workspace_config = Self::workspace_container_config(
-            project_path,
-            &workspace_folder,
-            effective_user.as_deref(),
-            config,
-            &workspace_bind_home,
-            &container_home,
-            &volume_name,
-            &agent_home_volume,
-            &agent_workspace_mount_source,
-            &agent_workspace_source,
-            global_config,
-            &labels,
-        );
-        podman
-            .create_container(&workspace_container, &image, pod_name, workspace_config)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create workspace container: {}",
-                    workspace_container
-                )
-            })?;
+        // Note: The workspace container is NOT created for agent pods.
+        // It existed solely as a human shell target, but the agent is
+        // self-contained. The workspace_container_config() function is
+        // kept for future standalone devcontainer mode.
 
         // Note: Task is written to the agent home volume after dotfiles installation
         // in finalize_pod() via write_task_to_volume(). This ensures user dotfiles
@@ -1239,7 +1226,7 @@ impl DevaipodPod {
             None
         };
 
-        let container_count = 2
+        let container_count = 1 // agent
             + if gator_container.is_some() { 1 } else { 0 }
             + if api_container.is_some() { 1 } else { 0 }
             + if worker_container.is_some() { 1 } else { 0 };
@@ -1295,22 +1282,17 @@ impl DevaipodPod {
 
     /// Install dotfiles in the workspace container
     ///
-    /// This should be called after the pod starts but BEFORE lifecycle commands,
-    /// so that bashrc, gitconfig, and other dotfiles are available for lifecycle scripts.
+    /// Note: This is currently a no-op because agent pods no longer have a
+    /// workspace container. Kept for future standalone devcontainer mode.
     pub async fn install_dotfiles(
         &self,
-        podman: &PodmanService,
-        dotfiles: &DotfilesConfig,
-        user: Option<&str>,
+        _podman: &PodmanService,
+        _dotfiles: &DotfilesConfig,
+        _user: Option<&str>,
     ) -> Result<()> {
-        self.install_dotfiles_in_container(
-            podman,
-            dotfiles,
-            &self.workspace_container,
-            user,
-            None, // use container's HOME
-        )
-        .await
+        // No workspace container in agent pods — dotfiles are only installed
+        // in the agent container via install_dotfiles_agent().
+        Ok(())
     }
 
     /// Install dotfiles in the agent container
@@ -1518,11 +1500,11 @@ echo "Dotfiles installed successfully"
         Ok(())
     }
 
-    /// Run lifecycle commands from devcontainer.json in both workspace and agent containers
+    /// Run lifecycle commands from devcontainer.json in the agent container
     ///
     /// Executes in order: onCreateCommand, postCreateCommand, postStartCommand
-    /// Commands run in both containers to ensure consistent environment setup
-    /// (e.g., nested podman configuration needed for both human and AI).
+    /// These run in the agent container to ensure the environment is set up
+    /// (e.g., nested podman configuration).
     pub async fn run_lifecycle_commands(
         &self,
         podman: &PodmanService,
@@ -1530,39 +1512,32 @@ echo "Dotfiles installed successfully"
     ) -> Result<()> {
         let user = config.effective_user();
         let workdir = Some(self.workspace_folder.as_str());
-        let containers = [&self.workspace_container, &self.agent_container];
 
         // onCreateCommand
         if let Some(cmd) = &config.on_create_command {
             let shell_cmd = cmd.to_shell_command();
-            for container in &containers {
-                tracing::debug!("Running onCreateCommand in {}...", container);
-                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
-                    .await
-                    .with_context(|| format!("onCreateCommand failed in {}", container))?;
-            }
+            tracing::debug!("Running onCreateCommand in {}...", self.agent_container);
+            self.run_shell_command_in(&self.agent_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| format!("onCreateCommand failed in {}", self.agent_container))?;
         }
 
         // postCreateCommand
         if let Some(cmd) = &config.post_create_command {
             let shell_cmd = cmd.to_shell_command();
-            for container in &containers {
-                tracing::debug!("Running postCreateCommand in {}...", container);
-                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
-                    .await
-                    .with_context(|| format!("postCreateCommand failed in {}", container))?;
-            }
+            tracing::debug!("Running postCreateCommand in {}...", self.agent_container);
+            self.run_shell_command_in(&self.agent_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| format!("postCreateCommand failed in {}", self.agent_container))?;
         }
 
         // postStartCommand
         if let Some(cmd) = &config.post_start_command {
             let shell_cmd = cmd.to_shell_command();
-            for container in &containers {
-                tracing::debug!("Running postStartCommand in {}...", container);
-                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
-                    .await
-                    .with_context(|| format!("postStartCommand failed in {}", container))?;
-            }
+            tracing::debug!("Running postStartCommand in {}...", self.agent_container);
+            self.run_shell_command_in(&self.agent_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| format!("postStartCommand failed in {}", self.agent_container))?;
         }
 
         Ok(())
@@ -1572,7 +1547,6 @@ echo "Dotfiles installed successfully"
     ///
     /// Executes: postCreateCommand, postStartCommand
     /// Used when rebuilding a container where the workspace already exists.
-    /// Commands run in both containers to ensure consistent environment setup.
     pub async fn run_rebuild_lifecycle_commands(
         &self,
         podman: &PodmanService,
@@ -1580,28 +1554,23 @@ echo "Dotfiles installed successfully"
     ) -> Result<()> {
         let user = config.effective_user();
         let workdir = Some(self.workspace_folder.as_str());
-        let containers = [&self.workspace_container, &self.agent_container];
 
         // postCreateCommand - runs because we created new containers
         if let Some(cmd) = &config.post_create_command {
             let shell_cmd = cmd.to_shell_command();
-            for container in &containers {
-                tracing::debug!("Running postCreateCommand in {}...", container);
-                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
-                    .await
-                    .with_context(|| format!("postCreateCommand failed in {}", container))?;
-            }
+            tracing::debug!("Running postCreateCommand in {}...", self.agent_container);
+            self.run_shell_command_in(&self.agent_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| format!("postCreateCommand failed in {}", self.agent_container))?;
         }
 
         // postStartCommand
         if let Some(cmd) = &config.post_start_command {
             let shell_cmd = cmd.to_shell_command();
-            for container in &containers {
-                tracing::debug!("Running postStartCommand in {}...", container);
-                self.run_shell_command_in(container, podman, &shell_cmd, user, workdir)
-                    .await
-                    .with_context(|| format!("postStartCommand failed in {}", container))?;
-            }
+            tracing::debug!("Running postStartCommand in {}...", self.agent_container);
+            self.run_shell_command_in(&self.agent_container, podman, &shell_cmd, user, workdir)
+                .await
+                .with_context(|| format!("postStartCommand failed in {}", self.agent_container))?;
         }
 
         Ok(())
@@ -1613,7 +1582,6 @@ echo "Dotfiles installed successfully"
     /// bind_home paths into the containers. Using `podman cp` instead of bind
     /// mounts avoids permission issues with rootless podman and user namespaces.
     ///
-    /// For the workspace container, files are copied to the user's home directory.
     /// For the agent container, files are copied to the agent's HOME (persistent volume).
     ///
     /// Note: In container mode (devaipod running as a container), bind_home is not
@@ -1624,8 +1592,8 @@ echo "Dotfiles installed successfully"
         podman: &PodmanService,
         workspace_bind_home: &BindHomeConfig,
         agent_bind_home: &BindHomeConfig,
-        container_home: &str,
-        container_user: Option<&str>,
+        _container_home: &str,
+        _container_user: Option<&str>,
     ) -> Result<()> {
         // In container mode, bind_home is not supported - credentials must use secrets
         if crate::podman::is_container_mode() {
@@ -1646,38 +1614,7 @@ echo "Dotfiles installed successfully"
             return Ok(());
         };
 
-        // Copy files to workspace container
-        for relative_path in &workspace_bind_home.paths {
-            let source = host_home.join(relative_path);
-            let target = format!("{}/{}", container_home, relative_path);
-
-            if !source.exists() {
-                tracing::warn!(
-                    "bind_home: skipping '{}' for workspace (not found at {})",
-                    relative_path,
-                    source.display()
-                );
-                continue;
-            }
-
-            tracing::debug!(
-                "bind_home: copying {} -> {}:{} for workspace",
-                source.display(),
-                self.workspace_container,
-                target
-            );
-
-            if let Err(e) = podman
-                .copy_to_container(&self.workspace_container, &source, &target, container_user)
-                .await
-            {
-                tracing::warn!(
-                    "Failed to copy {} to workspace container: {}",
-                    relative_path,
-                    e
-                );
-            }
-        }
+        // Note: No workspace container in agent pods — skip workspace copy.
 
         // Copy files to agent container (to agent's HOME which is a persistent volume)
         for relative_path in &agent_bind_home.paths {
@@ -2078,16 +2015,14 @@ TASK_EOF"#,
         Ok(())
     }
 
-    /// Set up git remotes for bidirectional collaboration between human and agent
+    /// Set up git remotes for collaboration between agent and worker
     ///
     /// This sets up:
-    /// 1. An 'agent' remote in the workspace container pointing to the agent's workspace
-    /// 2. A 'workspace' remote in the agent container pointing to the human's workspace
-    /// 3. When orchestration is enabled, a 'worker' remote in the agent container pointing
+    /// 1. A 'workspace' remote in the agent container pointing to the human's workspace
+    /// 2. When orchestration is enabled, a 'worker' remote in the agent container pointing
     ///    to the worker's workspace at `/mnt/worker-workspace`
     ///
-    /// This enables the full collaboration workflow:
-    /// - Human reviews agent's commits: `git fetch agent && git diff agent/main`
+    /// This enables the collaboration workflow:
     /// - Agent fetches human's changes: `git fetch workspace && git rebase workspace/main`
     /// - Task owner (agent) fetches worker's commits: `git fetch worker && git cherry-pick worker/...`
     pub async fn setup_git_remotes(&self, podman: &PodmanService) -> Result<()> {
@@ -2096,47 +2031,6 @@ TASK_EOF"#,
             .workspace_folder
             .strip_prefix("/workspaces/")
             .unwrap_or(&self.workspace_folder);
-
-        // Set up 'agent' remote in workspace container
-        let agent_repo_path = format!("/mnt/agent-workspace/{}", project_name);
-        let workspace_script = format!(
-            r#"
-# Mark the agent workspace as safe (different ownership in container)
-git config --global --add safe.directory '{agent_repo_path}'
-
-if git remote get-url {REMOTE_AGENT} >/dev/null 2>&1; then
-    echo "Remote '{REMOTE_AGENT}' already exists, skipping"
-else
-    git remote add {REMOTE_AGENT} '{agent_repo_path}'
-    echo "Added git remote '{REMOTE_AGENT}' pointing to agent workspace"
-fi
-"#,
-            agent_repo_path = agent_repo_path,
-            REMOTE_AGENT = REMOTE_AGENT,
-        );
-
-        tracing::debug!(
-            "Setting up '{}' git remote in workspace container...",
-            REMOTE_AGENT
-        );
-        let exit_code = podman
-            .exec_quiet(
-                &self.workspace_container,
-                &["/bin/sh", "-c", &workspace_script],
-                None,
-                Some(&self.workspace_folder),
-            )
-            .await
-            .context("Failed to set up agent git remote")?;
-
-        if exit_code != 0 {
-            tracing::warn!(
-                "Failed to set up agent git remote (exit code {}). Continuing anyway.",
-                exit_code
-            );
-        } else {
-            tracing::debug!("Agent git remote set up successfully");
-        }
 
         // Set up 'workspace' remote in agent container
         // When orchestration is enabled, also set up 'worker' remote
@@ -2253,7 +2147,11 @@ fi
         Ok(())
     }
 
-    /// Create container config for the workspace container
+    /// Create container config for the workspace container.
+    ///
+    /// Not currently used in agent pods (which no longer include a workspace
+    /// container), but retained for future standalone devcontainer mode.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn workspace_container_config(
         _project_path: &Path,

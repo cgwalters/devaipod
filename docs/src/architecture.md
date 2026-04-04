@@ -4,7 +4,6 @@ Each devaipod workspace is a **podman pod** containing several containers:
 
 | Container | Role |
 |-----------|------|
-| `workspace` | User's dev environment (from devcontainer image) |
 | `agent` | Runs the AI agent (opencode); has its own workspace copy |
 | `gator` | [service-gator](https://github.com/cgwalters/service-gator) — fine-grained MCP server for GitHub/GitLab/Forgejo |
 | `api` | **pod-api** sidecar — HTTP server for git status, summary, completion status |

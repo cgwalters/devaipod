@@ -276,7 +276,6 @@ COMMON WORKFLOWS:
   devaipod list                               See all workspaces
   devaipod attach <workspace>                 Connect to agent in workspace
   devaipod exec <workspace>                   Get a shell in agent container
-  devaipod exec <workspace> -W                Get a shell in workspace container
   devaipod logs <workspace> -f                Follow agent logs
   devaipod delete <workspace>                 Clean up when done
 
@@ -343,7 +342,7 @@ struct UpOptions {
     /// Generate configuration files but don't start containers
     #[arg(long)]
     dry_run: bool,
-    /// Exec into workspace container after starting
+    /// Exec into agent container after starting
     #[arg(short = 'S', long = "exec")]
     exec_after: bool,
     /// Internal: mode of workspace creation (not exposed as CLI arg)
@@ -1347,6 +1346,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             let target = if worker {
                 AttachTarget::Worker
             } else if workspace_mode {
+                tracing::warn!(
+                    "Agent pods no longer have a workspace container; -W targets a container that may not exist"
+                );
                 AttachTarget::Workspace
             } else {
                 AttachTarget::Agent
@@ -1363,6 +1365,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             let target = if worker {
                 AttachTarget::Worker
             } else if workspace_mode {
+                tracing::warn!(
+                    "Agent pods no longer have a workspace container; -W targets a container that may not exist"
+                );
                 AttachTarget::Workspace
             } else {
                 AttachTarget::Agent
@@ -2653,11 +2658,11 @@ async fn create_workspace_from_pr(
 ///
 /// This is a thin wrapper around `create_workspace` that handles:
 /// - Dry-run mode (prints what would be created)
-/// - Optional SSH into the workspace after creation
+/// - Optional exec into the agent container after creation
 ///
 /// Uses podman-native multi-container setup with a pod containing:
-/// - workspace: The user's development environment
-/// - agent: Container running opencode serve with restricted security
+/// - agent: Container running opencode serve
+/// - api: Pod-api sidecar for git/PTY endpoints
 /// - gator (optional): Service-gator MCP server container
 async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Result<()> {
     // Handle dry-run mode
@@ -2669,12 +2674,11 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
     let create_opts = CreateOptions::from_up_options(&opts);
     let result = create_workspace(config, source, &create_opts).await?;
 
-    // Optionally exec into the workspace container - go directly to bash
-    // (the monitor is for observing a running agent, but `up -S` is for interactive work)
+    // Optionally exec into the agent container - go directly to bash
     if opts.exec_after {
         return cmd_exec(
             &result.pod_name,
-            AttachTarget::Workspace,
+            AttachTarget::Agent,
             false,
             &["bash".to_string()],
         )
@@ -2869,7 +2873,7 @@ fn send_initial_message(pod_name: &str, message: &str) -> Result<()> {
 /// Spawns a curl process in the background and returns immediately.
 /// Used for starting agent tasks where we don't need to wait for the response.
 fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result<()> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
     let url = format!(
         "http://localhost:{}/session/{}/message",
         pod::OPENCODE_PORT,
@@ -2883,7 +2887,7 @@ fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result
         .args([
             "exec",
             "-d", // detached mode - run in background
-            &workspace_container,
+            &agent_container,
             "curl",
             "-sf",
             "-X",
@@ -4310,9 +4314,8 @@ fn cmd_ssh_config(pod_name: &str, user: Option<&str>) -> Result<()> {
 
 /// Write SSH config with explicit username (used by CLI command)
 ///
-/// Creates SSH config entries for all containers in the pod:
-/// - `<pod>.devaipod` - workspace container (default for development)
-/// - `<pod>-agent.devaipod` - agent/orchestrator container
+/// Creates SSH config entries for the pod's containers:
+/// - `<pod>.devaipod` - agent container (default target)
 /// - `<pod>-worker.devaipod` - worker container
 fn write_ssh_config_with_user(pod_name: &str, username: &str) -> Result<std::path::PathBuf> {
     use cap_std_ext::cap_primitives::fs::PermissionsExt;
@@ -4333,22 +4336,13 @@ fn write_ssh_config_with_user(pod_name: &str, username: &str) -> Result<std::pat
             .unwrap_or_else(|_| "devaipod".to_string())
     };
 
-    // Create SSH config content for all containers
-    // - workspace: -W flag (primary for development)
-    // - agent: no flag (default target)
+    // Create SSH config content:
+    // - default: agent container (no flag)
     // - worker: --worker flag
     let config_content = format!(
         r#"# Generated by devaipod
-# Workspace container (development environment)
+# Agent container (default target)
 Host {pod}.devaipod
-    ProxyCommand {devaipod} exec -W --stdio {pod}
-    User {user}
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-    LogLevel ERROR
-
-# Agent/orchestrator container
-Host {pod}-agent.devaipod
     ProxyCommand {devaipod} exec --stdio {pod}
     User {user}
     StrictHostKeyChecking no
@@ -5675,20 +5669,20 @@ fn opencode_api_get(pod_name: &str, path: &str) -> Result<serde_json::Value> {
     opencode_api_get_port(pod_name, path, None)
 }
 
-/// Execute a curl command in the workspace container with a specific port
+/// Execute a curl command in the agent container with a specific port
 fn opencode_api_get_port(
     pod_name: &str,
     path: &str,
     port: Option<u16>,
 ) -> Result<serde_json::Value> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
     let port = port.unwrap_or(pod::OPENCODE_PORT);
     let url = format!("http://localhost:{}{}", port, path);
 
     let output = podman_command()
-        .args(["exec", &workspace_container, "curl", "-sf", &url])
+        .args(["exec", &agent_container, "curl", "-sf", &url])
         .output()
-        .context("Failed to execute curl in workspace container")?;
+        .context("Failed to execute curl in agent container")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5701,13 +5695,13 @@ fn opencode_api_get_port(
 
 /// Execute a POST request to the opencode API
 fn opencode_api_post(pod_name: &str, path: &str, body: &str) -> Result<serde_json::Value> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
     let url = format!("http://localhost:{}{}", pod::OPENCODE_PORT, path);
 
     let output = podman_command()
         .args([
             "exec",
-            &workspace_container,
+            &agent_container,
             "curl",
             "-sf",
             "-X",
@@ -5719,7 +5713,7 @@ fn opencode_api_post(pod_name: &str, path: &str, body: &str) -> Result<serde_jso
             &url,
         ])
         .output()
-        .context("Failed to execute curl in workspace container")?;
+        .context("Failed to execute curl in agent container")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5936,14 +5930,14 @@ fn cmd_opencode_status(pod_name: &str, json_output: bool) -> Result<()> {
 
 /// Check if the agent is listening on its port
 fn check_agent_health(pod_name: &str) -> Option<bool> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
 
     // Use nc to check if the port is accepting connections.
     // This is more reliable than HTTP health checks since opencode's
     // endpoints may return errors during/after initialization.
     let check_cmd = format!("nc -z localhost {} 2>/dev/null", pod::OPENCODE_PORT);
     let result = podman_command()
-        .args(["exec", &workspace_container, "/bin/sh", "-c", &check_cmd])
+        .args(["exec", &agent_container, "/bin/sh", "-c", &check_cmd])
         .status();
 
     match result {

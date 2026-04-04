@@ -28,7 +28,10 @@ pub const REMOTE_FORK: &str = "fork";
 
 // Cross-container remotes for collaboration:
 
-/// In workspace container: points to agent's workspace git
+/// In workspace container: points to agent's workspace git.
+/// Currently unused since agent pods no longer have a workspace container,
+/// but retained for future standalone devcontainer mode.
+#[allow(dead_code)]
 pub const REMOTE_AGENT: &str = "agent";
 
 /// In agent container: points to human's workspace git
