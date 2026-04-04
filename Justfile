@@ -378,6 +378,7 @@ container-run: container-build
     fi
     echo "Using podman socket: $SOCKET"
     mkdir -p ~/.ssh/config.d/devaipod
+    mkdir -p "$HOME/.local/share/devaipod/workspaces"
     if [ ! -f ~/.config/devaipod.toml ]; then
         echo "Warning: ~/.config/devaipod.toml not found; container may exit. Run 'devaipod init' on the host first."
     fi
@@ -404,6 +405,8 @@ container-run: container-build
         $ADD_HOST \
         -v "$HOST_SOCKET":/run/docker.sock \
         -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
+        -v "$HOME/.local/share/devaipod/workspaces":/var/lib/devaipod-workspaces \
+        -e DEVAIPOD_HOST_WORKDIR="$HOME/.local/share/devaipod/workspaces" \
         -v devaipod-state:/var/lib/devaipod \
         -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
         -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
