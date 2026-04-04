@@ -15,6 +15,40 @@ use color_eyre::eyre::{Context, Result, bail};
 use crate::forge::PullRequestInfo;
 use crate::git::{GitRepoInfo, REMOTE_AGENT, REMOTE_WORKER, REMOTE_WORKSPACE, RemoteRepoInfo};
 
+/// Describes the source for the agent workspace: either a named podman volume
+/// or a host-side bind mount directory.
+#[derive(Debug, Clone)]
+enum AgentWorkspaceSource {
+    /// Named podman volume (used for RemoteRepo/PullRequest)
+    Volume(String),
+    /// Host-side directory path for bind mounts (used for LocalRepo)
+    HostDir {
+        /// Host path passed to podman `-v` (resolved on host filesystem)
+        host_path: PathBuf,
+    },
+}
+
+impl AgentWorkspaceSource {
+    /// Returns the string to pass to podman `-v` as the mount source.
+    ///
+    /// For volumes this is the volume name; for host dirs this is the
+    /// absolute host path. Podman auto-detects which is which.
+    fn as_mount_source(&self) -> String {
+        match self {
+            AgentWorkspaceSource::Volume(name) => name.clone(),
+            AgentWorkspaceSource::HostDir { host_path } => host_path.to_string_lossy().to_string(),
+        }
+    }
+
+    /// Returns the host path if this is a host dir, or None for volumes.
+    fn host_path(&self) -> Option<&Path> {
+        match self {
+            AgentWorkspaceSource::Volume(_) => None,
+            AgentWorkspaceSource::HostDir { host_path } => Some(host_path),
+        }
+    }
+}
+
 /// Source for workspace content - local git repo, remote URL, or PR/MR
 #[derive(Debug, Clone)]
 pub enum WorkspaceSource {
@@ -649,26 +683,42 @@ impl DevaipodPod {
             tracing::debug!("Using existing agent home volume '{}'", agent_home_volume);
         }
 
-        // Create agent workspace volume for isolated agent git clone
-        // This allows the agent to have its own workspace using git --reference
-        // to share objects with the main workspace clone.
-        let agent_workspace_volume = format!("{}-agent-workspace", pod_name);
-        let agent_workspace_exists = podman.volume_exists(&agent_workspace_volume).await?;
-        if !agent_workspace_exists {
-            podman
-                .create_volume(&agent_workspace_volume)
-                .await
-                .context("Failed to create agent workspace volume")?;
-            tracing::debug!(
-                "Created agent workspace volume '{}'",
-                agent_workspace_volume
-            );
-        } else {
-            tracing::debug!(
-                "Using existing agent workspace volume '{}'",
-                agent_workspace_volume
-            );
-        }
+        // Set up the agent workspace: either a host-side bind mount directory
+        // (for LocalRepo) or a named podman volume (for remote sources).
+        //
+        // For LocalRepo, the host dir avoids the overhead of a podman volume
+        // and lets the control plane directly access agent workspace files.
+        let (agent_workspace_source, agent_workspace_exists) = match source {
+            WorkspaceSource::LocalRepo(_) => {
+                crate::agent_dir::create_agent_dir(pod_name)?;
+                let host_path = crate::agent_dir::agent_dir_host_path(pod_name)?;
+                // Check if the directory already has content (a previous clone)
+                let has_content = crate::agent_dir::agent_dir_container_path(pod_name)
+                    .map(|p| p.join(".git").exists())
+                    .unwrap_or(false);
+                tracing::debug!(
+                    "Agent workspace: host bind mount at {}{}",
+                    host_path.display(),
+                    if has_content { " (existing)" } else { "" },
+                );
+                (AgentWorkspaceSource::HostDir { host_path }, has_content)
+            }
+            _ => {
+                let volume_name = format!("{}-agent-workspace", pod_name);
+                let exists = podman.volume_exists(&volume_name).await?;
+                if !exists {
+                    podman
+                        .create_volume(&volume_name)
+                        .await
+                        .context("Failed to create agent workspace volume")?;
+                    tracing::debug!("Created agent workspace volume '{}'", volume_name);
+                } else {
+                    tracing::debug!("Using existing agent workspace volume '{}'", volume_name);
+                }
+                (AgentWorkspaceSource::Volume(volume_name), exists)
+            }
+        };
+        let agent_workspace_mount_source = agent_workspace_source.as_mount_source();
 
         // Clone into agent workspace using --shared to share objects with main workspace
         if !agent_workspace_exists {
@@ -739,7 +789,7 @@ impl DevaipodPod {
             let exit_code = podman
                 .run_init_container(
                     &image,
-                    &agent_workspace_volume,
+                    &agent_workspace_mount_source,
                     "/workspaces",
                     &["/bin/sh", "-c", &clone_script],
                     &extra_binds,
@@ -748,10 +798,17 @@ impl DevaipodPod {
                 .context("Failed to run init container for agent workspace clone")?;
 
             if exit_code != 0 {
-                // Clean up the volume on failure
-                let _ = podman.remove_volume(&agent_workspace_volume, true).await;
+                // Clean up on failure
+                match &agent_workspace_source {
+                    AgentWorkspaceSource::Volume(name) => {
+                        let _ = podman.remove_volume(name, true).await;
+                    }
+                    AgentWorkspaceSource::HostDir { .. } => {
+                        let _ = crate::agent_dir::remove_agent_dir(pod_name);
+                    }
+                }
                 bail!(
-                    "Failed to clone into agent workspace volume (exit code {})",
+                    "Failed to clone into agent workspace (exit code {})",
                     exit_code
                 );
             }
@@ -769,7 +826,7 @@ impl DevaipodPod {
             Self::write_gator_config_to_volume(
                 podman,
                 &image,
-                &agent_workspace_volume,
+                &agent_workspace_mount_source,
                 &jwt_scopes,
             )
             .await?;
@@ -798,7 +855,8 @@ impl DevaipodPod {
             &container_home,
             &volume_name,
             &agent_home_volume,
-            &agent_workspace_volume,
+            &agent_workspace_mount_source,
+            &agent_workspace_source,
             global_config,
             &labels,
         );
@@ -916,10 +974,10 @@ impl DevaipodPod {
                     }
                 };
 
-                // Mount task owner's workspace (agent_workspace_volume) as reference for git --shared clone
+                // Mount task owner's workspace (agent workspace) as reference for git --shared clone
                 // Also mount main workspace for git alternates chain
                 let extra_binds = vec![
-                    format!("{}:/mnt/owner-workspace:ro", agent_workspace_volume),
+                    format!("{}:/mnt/owner-workspace:ro", agent_workspace_mount_source),
                     format!("{}:/mnt/main-workspace:ro", volume_name),
                 ];
 
@@ -952,6 +1010,13 @@ impl DevaipodPod {
             (None, None)
         };
 
+        // Determine source repo host path for LocalRepo bind mount.
+        // This is the whole source repo directory mounted read-only at /mnt/source/.
+        let source_repo_host_path = match source {
+            WorkspaceSource::LocalRepo(git_info) => Some(git_info.local_path.clone()),
+            _ => None,
+        };
+
         let agent_config = Self::agent_container_config(
             project_path,
             &workspace_folder,
@@ -960,12 +1025,14 @@ impl DevaipodPod {
             Some(devcontainer_config),
             enable_gator,
             enable_orchestration,
-            &volume_name,            // main workspace (read-only reference mount)
-            &agent_workspace_volume, // agent's own workspace clone
+            &volume_name,                  // main workspace (read-only reference mount)
+            &agent_workspace_mount_source, // agent's own workspace clone (volume name or host path)
+            &agent_workspace_source,       // enum describing bind mount vs volume
             &agent_home_volume,
             worker_workspace_volume_name.as_deref(),
             global_config,
             auto_approve,
+            source_repo_host_path.as_deref(),
         );
         podman
             .create_container(&agent_container, &image, pod_name, agent_config)
@@ -994,12 +1061,13 @@ impl DevaipodPod {
                 }
             }
 
-            // Mount the AGENT workspace volume where the agent's commits are, plus
+            // Mount the AGENT workspace where the agent's commits are, plus
             // the main workspace volume at /mnt/main-workspace because the agent's
             // git clone uses alternates pointing there for object sharing.
-            // Gator reads the scope config file from the workspace volume.
+            // Gator reads the scope config file from the workspace.
             let gator_config = Self::gator_container_config(
-                &agent_workspace_volume,
+                &agent_workspace_mount_source,
+                &agent_workspace_source,
                 "/workspaces",
                 &volume_name,
                 global_config,
@@ -1022,7 +1090,8 @@ impl DevaipodPod {
         let socket_path = crate::podman::get_host_socket_path()
             .context("Cannot create API sidecar without container socket")?;
         let api_config = Self::api_container_config(
-            &agent_workspace_volume,
+            &agent_workspace_mount_source,
+            &agent_workspace_source,
             &volume_name,
             &workspace_container,
             &agent_container,
@@ -1058,11 +1127,11 @@ impl DevaipodPod {
                 Some(devcontainer_config),
                 enable_gator,
                 worker_gator_mode,
-                &volume_name,            // main workspace (read-only)
-                &agent_workspace_volume, // task owner workspace (read-only)
-                worker_workspace_volume, // worker's own workspace
-                worker_home_volume,      // worker's own home volume (read-write)
-                &agent_home_volume,      // agent's home for LLM credentials (read-only)
+                &volume_name,                  // main workspace (read-only)
+                &agent_workspace_mount_source, // task owner workspace (read-only)
+                worker_workspace_volume,       // worker's own workspace
+                worker_home_volume,            // worker's own home volume (read-write)
+                &agent_home_volume,            // agent's home for LLM credentials (read-only)
                 global_config,
             );
             podman
@@ -2106,7 +2175,8 @@ fi
         _container_home: &str,
         volume_name: &str,
         agent_home_volume: &str,
-        agent_workspace_volume: &str,
+        agent_workspace_mount_source: &str,
+        agent_workspace_source: &AgentWorkspaceSource,
         global_config: &crate::config::Config,
         labels: &[(String, String)],
     ) -> ContainerConfig {
@@ -2162,9 +2232,8 @@ fi
             format!("http://localhost:{}", OPENCODE_PORT),
         );
 
-        // No bind mounts - we clone the repo into the container instead
-        // This avoids UID mapping issues with rootless podman
-        let mounts = vec![];
+        // Bind mounts added below for agent workspace when using host dirs
+        let mut mounts = vec![];
 
         // Auto-detect development devices to pass through
         let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
@@ -2230,6 +2299,25 @@ fi
         // Get file-based secrets (mounted as files, env var points to path)
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
         let file_secrets = global_config.trusted_env.file_secret_mounts();
+
+        // Agent workspace mount: bind mount if host dir, volume mount otherwise.
+        // The workspace container mounts the agent workspace read-only for
+        // the `git fetch agent` workflow.
+        let is_bind_mount = agent_workspace_source.host_path().is_some();
+        if is_bind_mount {
+            mounts.push(crate::podman::MountConfig {
+                source: agent_workspace_mount_source.to_string(),
+                target: "/mnt/agent-workspace".to_string(),
+                readonly: true,
+            });
+        }
+
+        // When using a bind mount, we need to disable SELinux labeling so
+        // podman can access the host directory.
+        let mut security_opts = security_opts;
+        if is_bind_mount && !security_opts.iter().any(|s| s.starts_with("label=")) {
+            security_opts.push("label=disable".to_string());
+        }
 
         ContainerConfig {
             mounts,
@@ -2305,26 +2393,32 @@ exec sleep infinity
             // - workspace volume at /workspaces (main workspace clone)
             // - workspace volume also at /mnt/main-workspace (read-only, for git alternates resolution)
             // - agent home volume at /opt/devaipod (read-only, for scripts)
-            // - agent workspace volume at /mnt/agent-workspace (read-only, for git remote)
+            // - agent workspace: via volume_mounts if named volume, via mounts if bind mount (above)
             //
             // Note: The /mnt/main-workspace mount is needed because the agent's git clone uses
             // --shared which creates an alternates file pointing to /mnt/main-workspace/...
             // This path must exist in the workspace container for `git fetch agent` to work.
-            volume_mounts: vec![
-                (volume_name.to_string(), "/workspaces".to_string()),
-                (
-                    volume_name.to_string(),
-                    "/mnt/main-workspace:ro".to_string(),
-                ),
-                (
-                    agent_home_volume.to_string(),
-                    "/opt/devaipod:ro".to_string(),
-                ),
-                (
-                    agent_workspace_volume.to_string(),
-                    "/mnt/agent-workspace:ro".to_string(),
-                ),
-            ],
+            volume_mounts: {
+                let mut vols = vec![
+                    (volume_name.to_string(), "/workspaces".to_string()),
+                    (
+                        volume_name.to_string(),
+                        "/mnt/main-workspace:ro".to_string(),
+                    ),
+                    (
+                        agent_home_volume.to_string(),
+                        "/opt/devaipod:ro".to_string(),
+                    ),
+                ];
+                // Only use volume mount for agent workspace if it's a named volume
+                if !is_bind_mount {
+                    vols.push((
+                        agent_workspace_mount_source.to_string(),
+                        "/mnt/agent-workspace:ro".to_string(),
+                    ));
+                }
+                vols
+            },
             secrets,
             file_secrets,
             labels: labels.iter().cloned().collect(),
@@ -2362,11 +2456,13 @@ exec sleep infinity
         enable_gator: bool,
         enable_orchestration: bool,
         workspace_volume: &str,
-        agent_workspace_volume: &str,
+        agent_workspace_mount_source: &str,
+        agent_workspace_source: &AgentWorkspaceSource,
         agent_home_volume: &str,
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
         auto_approve: bool,
+        source_repo_host_path: Option<&Path>,
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
@@ -2430,14 +2526,32 @@ exec sleep infinity
             );
         }
 
-        // No bind mounts - we clone the repo into the container instead
-        // This avoids UID mapping issues with rootless podman
-        let mounts = vec![];
+        // Start with bind mounts for agent workspace and source repo (when using host dirs)
+        let mut mounts = vec![];
+        let is_bind_mount = agent_workspace_source.host_path().is_some();
+
+        if is_bind_mount {
+            // Bind mount the agent workspace directory (read-write)
+            mounts.push(crate::podman::MountConfig {
+                source: agent_workspace_mount_source.to_string(),
+                target: "/workspaces".to_string(),
+                readonly: false,
+            });
+        }
+
+        // For LocalRepo, bind-mount the whole source repo read-only at /mnt/source/
+        if let Some(repo_path) = source_repo_host_path {
+            mounts.push(crate::podman::MountConfig {
+                source: repo_path.to_string_lossy().to_string(),
+                target: "/mnt/source".to_string(),
+                readonly: true,
+            });
+        }
 
         // Get security settings from devcontainer config to match workspace container.
         // In rootless podman, capabilities are relative to the user namespace, so the
         // agent container can safely have the same settings as workspace for nested containers.
-        let (devices, privileged, security_opts, cap_add, extra_create_args) =
+        let (devices, privileged, mut security_opts, cap_add, extra_create_args) =
             if let Some(config) = devcontainer_config {
                 // Auto-detect development devices to pass through
                 let mut devices: Vec<String> = DEV_PASSTHROUGH_PATHS
@@ -2610,6 +2724,12 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             opencode_port = OPENCODE_PORT
         );
 
+        // When using bind mounts, disable SELinux labeling so podman
+        // can access the host directories.
+        if is_bind_mount && !security_opts.iter().any(|s| s.starts_with("label=")) {
+            security_opts.push("label=disable".to_string());
+        }
+
         ContainerConfig {
             mounts,
             env,
@@ -2632,31 +2752,34 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             security_opts,
             privileged,
             // Mount volumes:
-            // - agent_workspace_volume at /workspaces: agent's own git clone
+            // - agent workspace at /workspaces: via volume_mounts (named volume) or mounts (bind mount, above)
             // - workspace_volume at /mnt/main-workspace:ro: read-only reference to main workspace
             // - agent_home_volume at AGENT_HOME_PATH: persistent agent state
             // - worker_workspace_volume at /mnt/worker-workspace:ro (when orchestration enabled)
             volume_mounts: {
-                let mut mounts = vec![
-                    (
-                        agent_workspace_volume.to_string(),
+                let mut vols = vec![];
+                // Only add agent workspace as a volume mount if it's a named volume;
+                // bind mount case is handled via the mounts field above.
+                if !is_bind_mount {
+                    vols.push((
+                        agent_workspace_mount_source.to_string(),
                         "/workspaces".to_string(),
-                    ),
-                    (
-                        workspace_volume.to_string(),
-                        "/mnt/main-workspace:ro".to_string(),
-                    ),
-                    (agent_home_volume.to_string(), AGENT_HOME_PATH.to_string()),
-                ];
+                    ));
+                }
+                vols.push((
+                    workspace_volume.to_string(),
+                    "/mnt/main-workspace:ro".to_string(),
+                ));
+                vols.push((agent_home_volume.to_string(), AGENT_HOME_PATH.to_string()));
                 // When orchestration is enabled, mount worker's workspace read-only
                 // so the task owner can access worker's commits via git
                 if enable_orchestration && let Some(worker_vol) = worker_workspace_volume {
-                    mounts.push((
+                    vols.push((
                         worker_vol.to_string(),
                         "/mnt/worker-workspace:ro".to_string(),
                     ));
                 }
-                mounts
+                vols
             },
             secrets,
             file_secrets,
@@ -2688,7 +2811,8 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
     /// The gator config file is read from the workspace volume at /workspaces/.devaipod/gator-config.json.
     /// Gator uses inotify to watch for changes, enabling live scope updates via `devaipod gator add`.
     fn gator_container_config(
-        agent_workspace_volume: &str,
+        agent_workspace_mount_source: &str,
+        agent_workspace_source: &AgentWorkspaceSource,
         workspace_folder: &str,
         main_workspace_volume: &str,
         global_config: &Config,
@@ -2726,20 +2850,43 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             scope_file_path,
         ];
 
-        // Mount the agent workspace volume read-only so git_push_local can access commits
-        let agent_workspace_mount = format!("{}:ro", workspace_folder);
+        // Mount the agent workspace read-only so git_push_local can access commits
+        let is_bind_mount = agent_workspace_source.host_path().is_some();
+        let mut mounts = vec![];
+        if is_bind_mount {
+            mounts.push(crate::podman::MountConfig {
+                source: agent_workspace_mount_source.to_string(),
+                target: workspace_folder.to_string(),
+                readonly: true,
+            });
+        }
+
+        // When using bind mounts, disable SELinux labeling
+        let mut security_opts = vec![];
+        if is_bind_mount {
+            security_opts.push("label=disable".to_string());
+        }
 
         ContainerConfig {
+            mounts,
             // Mount volumes:
-            // 1. Agent workspace at /workspaces - where the agent's commits are (also has gator config)
+            // 1. Agent workspace at /workspaces (via volume_mounts or mounts depending on source type)
             // 2. Main workspace at /mnt/main-workspace - for git alternates object sharing
-            volume_mounts: vec![
-                (agent_workspace_volume.to_string(), agent_workspace_mount),
-                (
+            volume_mounts: {
+                let mut vols = vec![];
+                if !is_bind_mount {
+                    let agent_workspace_mount = format!("{}:ro", workspace_folder);
+                    vols.push((
+                        agent_workspace_mount_source.to_string(),
+                        agent_workspace_mount,
+                    ));
+                }
+                vols.push((
                     main_workspace_volume.to_string(),
                     "/mnt/main-workspace:ro".to_string(),
-                ),
-            ],
+                ));
+                vols
+            },
             env,
             workdir: None,
             user: None,
@@ -2748,6 +2895,7 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
             drop_all_caps: true,
             cap_add: vec!["NET_BIND_SERVICE".to_string()],
             no_new_privileges: true,
+            security_opts,
             secrets,
             file_secrets,
             tmpfs_mounts: default_tmpfs_mounts(),
@@ -2766,8 +2914,10 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
     /// so the host podman can find it when creating the sibling container.
     /// The target is always `/run/docker.sock` so the sidecar's
     /// `get_container_socket()` finds it at the canonical location.
+    #[allow(clippy::too_many_arguments)]
     fn api_container_config(
-        agent_workspace_volume: &str,
+        agent_workspace_mount_source: &str,
+        agent_workspace_source: &AgentWorkspaceSource,
         main_workspace_volume: &str,
         workspace_container_name: &str,
         agent_container_name: &str,
@@ -2804,29 +2954,41 @@ exec opencode serve --port {opencode_port} --hostname 0.0.0.0"#,
         // Bind-mount the container runtime socket. The source is the
         // host-side path (resolved via mountinfo); the target is the
         // canonical /run/docker.sock so the sidecar finds it.
-        let socket_mount = MountConfig {
+        let is_bind_mount = agent_workspace_source.host_path().is_some();
+        let mut mounts = vec![MountConfig {
             source: socket_path.to_string_lossy().to_string(),
             target: "/run/docker.sock".to_string(),
             readonly: false,
-        };
+        }];
+
+        // Agent workspace: bind mount if host dir, volume mount otherwise
+        if is_bind_mount {
+            mounts.push(MountConfig {
+                source: agent_workspace_mount_source.to_string(),
+                target: "/workspaces".to_string(),
+                readonly: false,
+            });
+        }
 
         ContainerConfig {
-            // Bind mount: container runtime socket for exec-into-workspace PTY.
-            mounts: vec![socket_mount],
+            mounts,
             // Named volumes:
-            // 1. Agent workspace at /workspaces — read-write because git fetch/push
-            //    need to update refs and objects.
+            // 1. Agent workspace at /workspaces (via volume_mounts or mounts depending on source)
             // 2. Main workspace at /mnt/main-workspace — read-only for git alternates.
-            volume_mounts: vec![
-                (
-                    agent_workspace_volume.to_string(),
-                    "/workspaces".to_string(),
-                ),
-                (
+            volume_mounts: {
+                let mut vols = vec![];
+                if !is_bind_mount {
+                    vols.push((
+                        agent_workspace_mount_source.to_string(),
+                        "/workspaces".to_string(),
+                    ));
+                }
+                vols.push((
                     main_workspace_volume.to_string(),
                     "/mnt/main-workspace:ro".to_string(),
-                ),
-            ],
+                ));
+                vols
+            },
             env,
             workdir: None,
             user: None,
@@ -3178,6 +3340,7 @@ mod tests {
             volume_name,
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -3247,6 +3410,7 @@ mod tests {
             volume_name,
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &labels,
         );
@@ -3285,10 +3449,12 @@ mod tests {
             false,                  // enable_orchestration
             "test-main-workspace",  // main workspace (read-only reference)
             "test-agent-workspace", // agent's own workspace clone
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             true, // auto_approve
+            None, // source_repo_host_path
         );
 
         // Volume mounts: agent workspace, main workspace (readonly), and agent home
@@ -3349,10 +3515,12 @@ mod tests {
             false,                  // enable_orchestration
             "test-main-workspace",  // main workspace (read-only reference)
             "test-agent-workspace", // agent's own workspace clone
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             false, // auto_approve disabled
+            None,  // source_repo_host_path
         );
 
         assert!(
@@ -3380,10 +3548,12 @@ mod tests {
             true,                   // enable_orchestration
             "test-main-workspace",  // main workspace (read-only reference)
             "test-agent-workspace", // agent's own workspace clone
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             "test-agent-home",
             Some("test-worker-workspace"), // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            None, // source_repo_host_path
         );
 
         // With orchestration enabled, should have 4 volume mounts:
@@ -3441,17 +3611,18 @@ mod tests {
             false, // enable_orchestration
             "test-main-workspace",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            None, // source_repo_host_path
         );
 
-        // No bind mounts - we clone the repo into the container instead
-        // bind_home files are copied using podman cp after container starts
+        // No bind mounts when using volumes
         assert!(
             container_config.mounts.is_empty(),
-            "Agent should have no mounts (we clone instead), got {} mounts",
+            "Agent should have no mounts when using volumes, got {} mounts",
             container_config.mounts.len()
         );
     }
@@ -3478,10 +3649,12 @@ mod tests {
             false,                  // enable_orchestration
             "test-main-workspace",  // main workspace (read-only reference)
             "test-agent-workspace", // agent's own workspace clone
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
             true, // auto_approve
+            None, // source_repo_host_path
         );
 
         // Verify file_secrets are included for agent container
@@ -3498,8 +3671,11 @@ mod tests {
         let workspace_folder = "/workspaces";
         let main_workspace_volume = "test-main-workspace";
         let global_config = crate::config::Config::default();
+        let agent_workspace_source =
+            AgentWorkspaceSource::Volume(agent_workspace_volume.to_string());
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
+            &agent_workspace_source,
             workspace_folder,
             main_workspace_volume,
             &global_config,
@@ -3539,6 +3715,8 @@ mod tests {
     #[test]
     fn test_api_container_config() {
         let agent_workspace_volume = "test-agent-workspace";
+        let agent_workspace_source =
+            AgentWorkspaceSource::Volume(agent_workspace_volume.to_string());
         let main_workspace_volume = "test-main-workspace";
         let workspace_container = "devaipod-test-workspace";
         let agent_container = "devaipod-test-agent";
@@ -3546,6 +3724,7 @@ mod tests {
         let socket_path = std::path::Path::new("/run/user/1000/podman/podman.sock");
         let container_config = DevaipodPod::api_container_config(
             agent_workspace_volume,
+            &agent_workspace_source,
             main_workspace_volume,
             workspace_container,
             agent_container,
@@ -3604,8 +3783,11 @@ mod tests {
             "GITLAB_TOKEN=gitlab_token".to_string(),
         ];
 
+        let agent_workspace_source =
+            AgentWorkspaceSource::Volume(agent_workspace_volume.to_string());
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
+            &agent_workspace_source,
             workspace_folder,
             main_workspace_volume,
             &global_config,
@@ -3647,8 +3829,11 @@ mod tests {
             .vars
             .insert("JIRA_API_TOKEN".to_string(), "jira_value".to_string());
 
+        let agent_workspace_source =
+            AgentWorkspaceSource::Volume(agent_workspace_volume.to_string());
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
+            &agent_workspace_source,
             workspace_folder,
             main_workspace_volume,
             &global_config,
@@ -3682,8 +3867,11 @@ mod tests {
         global_config.trusted_env.file_secrets =
             vec!["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()];
 
+        let agent_workspace_source =
+            AgentWorkspaceSource::Volume(agent_workspace_volume.to_string());
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
+            &agent_workspace_source,
             workspace_folder,
             main_workspace_volume,
             &global_config,
@@ -3720,6 +3908,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -3784,6 +3973,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -3833,6 +4023,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -3871,6 +4062,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -3910,10 +4102,12 @@ mod tests {
             false, // enable_orchestration
             "test-main-workspace",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            None, // source_repo_host_path
         );
 
         // Agent should have no secrets
@@ -4007,6 +4201,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4052,6 +4247,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4089,6 +4285,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4119,6 +4316,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4152,6 +4350,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4200,6 +4399,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4234,6 +4434,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4267,6 +4468,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4290,6 +4492,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4478,6 +4681,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4530,6 +4734,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4575,10 +4780,12 @@ mod tests {
             false, // enable_orchestration
             "test-workspace-vol",
             "test-agent-workspace-vol",
+            &AgentWorkspaceSource::Volume("test-agent-workspace-vol".to_string()),
             "test-agent-home-vol",
             None, // worker_workspace_volume
             &global_config,
             true, // auto_approve
+            None, // source_repo_host_path
         );
 
         // Should have devcontainer secrets (LLM keys go to agent)
@@ -4603,8 +4810,11 @@ mod tests {
         let main_workspace_volume = "test-main-workspace";
         let global_config = crate::config::Config::default();
 
+        let agent_workspace_source =
+            AgentWorkspaceSource::Volume(agent_workspace_volume.to_string());
         let container_config = DevaipodPod::gator_container_config(
             agent_workspace_volume,
+            &agent_workspace_source,
             workspace_folder,
             main_workspace_volume,
             &global_config,
@@ -4643,6 +4853,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );
@@ -4692,6 +4903,7 @@ mod tests {
             "test-volume",
             "test-agent-home",
             "test-agent-workspace",
+            &AgentWorkspaceSource::Volume("test-agent-workspace".to_string()),
             &global_config,
             &[], // labels
         );

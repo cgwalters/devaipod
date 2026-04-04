@@ -425,10 +425,7 @@ pub fn get_host_workdir_path() -> Result<PathBuf> {
 
     // Absolute fallback
     let path = PathBuf::from("/var/lib/devaipod/workspaces");
-    tracing::debug!(
-        "Using fallback host workdir path: {}",
-        path.display()
-    );
+    tracing::debug!("Using fallback host workdir path: {}", path.display());
     Ok(path)
 }
 
