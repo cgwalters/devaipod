@@ -124,7 +124,6 @@ fn test_readonly_exec_stdio_with_command(fixture: &SharedFixture) -> Result<()> 
     // When a command is provided, exec --stdio does direct podman exec (not SSH)
     let output = run_devaipod(&[
         "exec",
-        "-W",
         "--stdio",
         short_name,
         "--",
@@ -269,8 +268,8 @@ fn test_ssh_server_starts_on_exec_stdio() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // Start exec --stdio without a command - this starts the SSH server
     // Use binary path directly since we're spawning a child process that needs host mode
@@ -278,7 +277,7 @@ fn test_ssh_server_starts_on_exec_stdio() -> Result<()> {
     let mut child = Command::new(&devaipod)
         .env("DEVAIPOD_HOST_MODE", "1")
         .env(SSH_CONFIG_DIR_ENV, ssh_guard.config_dir_str())
-        .args(["exec", "-W", "--stdio", short_name(&pod_name)])
+        .args(["exec", "--stdio", short_name(&pod_name)])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -389,22 +388,22 @@ fn test_ssh_client_connectivity() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Verify the workspace container is ready before attempting SSH.
+    // Verify the agent container is ready before attempting SSH.
     // SSH needs the container runtime to be fully ready, which can take
     // longer in CI environments.
     {
-        let workspace_container = format!("{}-workspace", pod_name);
+        let agent_container = format!("{}-agent", pod_name);
         let poll_sh = shell()?;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            let result = cmd!(poll_sh, "podman exec {workspace_container} echo ready")
+            let result = cmd!(poll_sh, "podman exec {agent_container} echo ready")
                 .ignore_status()
                 .output()?;
             if result.status.success() {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                tracing::warn!("Workspace container not ready after 30s, skipping SSH test");
+                tracing::warn!("Agent container not ready after 30s, skipping SSH test");
                 return Ok(());
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -419,7 +418,7 @@ fn test_ssh_client_connectivity() -> Result<()> {
 
     // Build the ProxyCommand string (includes env vars for proper execution)
     let proxy_cmd = format!(
-        "DEVAIPOD_HOST_MODE=1 {}={} {} exec -W --stdio {}",
+        "DEVAIPOD_HOST_MODE=1 {}={} {} exec --stdio {}",
         SSH_CONFIG_DIR_ENV, ssh_config_dir, devaipod, short
     );
 
@@ -567,11 +566,11 @@ fn test_exec_stdio_multiple_commands() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // Test 1: pwd command
-    let pwd_output = run_devaipod(&["exec", "-W", "--stdio", short_name(&pod_name), "--", "pwd"])?;
+    let pwd_output = run_devaipod(&["exec", "--stdio", short_name(&pod_name), "--", "pwd"])?;
     pwd_output.assert_success("pwd via exec --stdio");
     assert!(
         pwd_output.stdout.trim().starts_with('/'),
@@ -582,7 +581,6 @@ fn test_exec_stdio_multiple_commands() -> Result<()> {
     // Test 2: ls command
     let ls_output = run_devaipod(&[
         "exec",
-        "-W",
         "--stdio",
         short_name(&pod_name),
         "--",
@@ -599,7 +597,6 @@ fn test_exec_stdio_multiple_commands() -> Result<()> {
     // Test 3: Command with arguments
     let cat_output = run_devaipod(&[
         "exec",
-        "-W",
         "--stdio",
         short_name(&pod_name),
         "--",
@@ -638,8 +635,8 @@ fn test_exec_stdio_agent_container() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // Default exec --stdio goes to agent container
     let output = run_devaipod(&[

@@ -24,7 +24,7 @@
 //!
 //! # Volume cleanup
 //!
-//! Each pod creates up to 5 named volumes (see [`POD_VOLUME_SUFFIXES`]).
+//! Each pod creates up to 4 named volumes (see [`POD_VOLUME_SUFFIXES`]).
 //! [`SharedFixture::cleanup`] removes these on teardown. Tests that create
 //! their own pods should use `PodGuard` (in the test runner binary) which
 //! removes pods and volumes on drop. Volumes can leak if a test run is
@@ -53,7 +53,6 @@ pub const SHARED_POD_NAME: &str = "devaipod-integration-shared";
 
 /// Volume suffixes created by devaipod pods (used for cleanup)
 pub const POD_VOLUME_SUFFIXES: &[&str] = &[
-    "-workspace",
     "-agent-home",
     "-agent-workspace",
     "-worker-home",
@@ -519,11 +518,6 @@ impl SharedFixture {
     /// Get the path to the test repository
     pub fn repo_path(&self) -> &PathBuf {
         &self.repo_path
-    }
-
-    /// Get the workspace container name
-    pub fn workspace_container(&self) -> String {
-        format!("{}-workspace", self.pod_name)
     }
 
     /// Get the agent container name
