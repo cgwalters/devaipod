@@ -8,7 +8,7 @@
 //! - Opencode-info and agent-status endpoints for the pods page
 //! - Static file serving for web UI
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -3232,6 +3232,155 @@ async fn delete_devcontainer(Path(name): Path<String>) -> Result<StatusCode, Sta
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Control plane overview endpoint ───────────────────────────────────
+
+/// Top-level response for the control plane overview.
+#[derive(Debug, Serialize)]
+struct ControlPlaneResponse {
+    repos: Vec<RepoGroup>,
+}
+
+/// Pods grouped by repository.
+#[derive(Debug, Serialize)]
+struct RepoGroup {
+    /// Repository identifier (e.g. "cgwalters/devaipod").
+    repo: String,
+    /// Number of running, non-done agents in this repo.
+    active_count: usize,
+    /// Agent pods for this repo.
+    agents: Vec<ControlPlaneAgent>,
+    /// Devcontainer pods for this repo.
+    devcontainers: Vec<ControlPlaneDevcontainer>,
+}
+
+/// An agent pod in the control plane overview.
+#[derive(Debug, Serialize)]
+struct ControlPlaneAgent {
+    /// Full pod name.
+    name: String,
+    /// Short name (without `devaipod-` prefix).
+    short_name: String,
+    /// Pod status ("Running", "Stopped", etc.).
+    status: String,
+    /// Task description from labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    /// Title (from agent status or labels).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Completion status ("active", "done").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_status: Option<String>,
+    /// Last active timestamp (RFC 3339 from pod state cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_active: Option<String>,
+    /// Whether the pod is currently running.
+    is_running: bool,
+    /// Created timestamp.
+    created: String,
+}
+
+/// A devcontainer pod in the control plane overview.
+#[derive(Debug, Serialize)]
+struct ControlPlaneDevcontainer {
+    name: String,
+    short_name: String,
+    status: String,
+    created: String,
+    is_running: bool,
+}
+
+/// `GET /api/devaipod/control-plane` — pods grouped by git repository.
+///
+/// Reads the cached pod list and pod state cache to produce a view of all
+/// pods organised by their `io.devaipod.repo` label. No new data sources
+/// are consulted; this is purely a grouping/projection of existing data.
+async fn control_plane(State(state): State<Arc<AppState>>) -> Json<ControlPlaneResponse> {
+    let cached_pods = state.pod_cache.read().await;
+    let pod_state_cache = state.pod_state_cache.read().await;
+
+    let mut repo_map: BTreeMap<String, RepoGroup> = BTreeMap::new();
+
+    for pod in cached_pods.iter() {
+        let labels = pod.labels.as_ref();
+        let mode = labels
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .map(|s| s.as_str());
+        let repo = labels
+            .and_then(|l| l.get("io.devaipod.repo"))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let is_running = pod.status.eq_ignore_ascii_case("running");
+        let short_name = pod
+            .name
+            .strip_prefix("devaipod-")
+            .unwrap_or(&pod.name)
+            .to_string();
+
+        let group = repo_map.entry(repo.clone()).or_insert_with(|| RepoGroup {
+            repo: repo.clone(),
+            active_count: 0,
+            agents: Vec::new(),
+            devcontainers: Vec::new(),
+        });
+
+        match mode {
+            Some("devcontainer") => {
+                group.devcontainers.push(ControlPlaneDevcontainer {
+                    name: pod.name.clone(),
+                    short_name,
+                    status: pod.status.clone(),
+                    created: pod.created.clone(),
+                    is_running,
+                });
+            }
+            _ => {
+                // Agent pod (mode "up", "run", or absent)
+                let cached_state = pod_state_cache.get(&pod.name);
+
+                let task = labels.and_then(|l| l.get("io.devaipod.task")).cloned();
+                let title = cached_state
+                    .and_then(|s| s.title.clone())
+                    .or_else(|| labels.and_then(|l| l.get("io.devaipod.title")).cloned());
+                let completion_status = cached_state.and_then(|s| s.completion_status.clone());
+                let last_active = cached_state.and_then(|s| s.last_active_ts).map(|ts| {
+                    chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| ts.to_string())
+                });
+
+                let is_done = completion_status.as_deref() == Some("done");
+                if is_running && !is_done {
+                    group.active_count += 1;
+                }
+
+                group.agents.push(ControlPlaneAgent {
+                    name: pod.name.clone(),
+                    short_name,
+                    status: pod.status.clone(),
+                    task,
+                    title,
+                    completion_status,
+                    last_active,
+                    is_running,
+                    created: pod.created.clone(),
+                });
+            }
+        }
+    }
+
+    // Sort: repos with active agents first, then alphabetically.
+    let mut repos: Vec<RepoGroup> = repo_map.into_values().collect();
+    repos.sort_by(|a, b| {
+        b.active_count
+            .cmp(&a.active_count)
+            .then_with(|| a.repo.cmp(&b.repo))
+    });
+
+    Json(ControlPlaneResponse { repos })
+}
+
 /// Run the web server
 ///
 /// Starts an HTTP server on the specified port with:
@@ -3344,6 +3493,8 @@ fn build_app_with_cache(
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
         // Unified pod list: pods + agent status + enrichment in one response
         .route("/devaipod/pods", get(list_pods_unified))
+        // Control plane overview: pods grouped by repository
+        .route("/devaipod/control-plane", get(control_plane))
         // Workspace-centric endpoints
         .route("/devaipod/workspaces", get(list_workspaces_api))
         .route("/devaipod/recent-sources", get(list_recent_sources))
@@ -4265,6 +4416,150 @@ mod tests {
         let corrupt = "not valid json {{{";
         let result: Result<HashMap<String, CachedPodState>, _> = serde_json::from_str(corrupt);
         assert!(result.is_err());
+    }
+
+    /// Control plane endpoint must require authentication.
+    #[tokio::test]
+    async fn test_control_plane_requires_auth() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/control-plane")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "control-plane must return 401 without auth"
+        );
+    }
+
+    /// Control plane endpoint returns empty repos for an empty pod cache.
+    #[tokio::test]
+    async fn test_control_plane_empty_cache() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/control-plane")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["repos"], serde_json::json!([]),);
+    }
+
+    /// Control plane groups pods by repo label.
+    #[tokio::test]
+    async fn test_control_plane_groups_by_repo() {
+        let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(vec![
+            CachedPodInfo {
+                name: "devaipod-foo-abc".to_string(),
+                status: "Running".to_string(),
+                created: "2025-01-01T00:00:00Z".to_string(),
+                labels: Some(HashMap::from([
+                    ("io.devaipod.repo".into(), "owner/repo-a".into()),
+                    ("io.devaipod.task".into(), "Fix the bug".into()),
+                ])),
+                containers: None,
+                needs_update: false,
+            },
+            CachedPodInfo {
+                name: "devaipod-bar-def".to_string(),
+                status: "Exited".to_string(),
+                created: "2025-01-02T00:00:00Z".to_string(),
+                labels: Some(HashMap::from([(
+                    "io.devaipod.repo".into(),
+                    "owner/repo-a".into(),
+                )])),
+                containers: None,
+                needs_update: false,
+            },
+            CachedPodInfo {
+                name: "devaipod-baz-ghi".to_string(),
+                status: "Running".to_string(),
+                created: "2025-01-03T00:00:00Z".to_string(),
+                labels: Some(HashMap::from([
+                    ("io.devaipod.repo".into(), "owner/repo-b".into()),
+                    ("io.devaipod.mode".into(), "devcontainer".into()),
+                ])),
+                containers: None,
+                needs_update: false,
+            },
+            CachedPodInfo {
+                name: "devaipod-unlabeled-xyz".to_string(),
+                status: "Running".to_string(),
+                created: "2025-01-04T00:00:00Z".to_string(),
+                labels: None,
+                containers: None,
+                needs_update: false,
+            },
+        ]));
+        let pod_state_cache: PodStateCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let app = build_app_with_cache(
+            "test-token".into(),
+            "mcp".into(),
+            None,
+            None,
+            pod_cache,
+            pod_state_cache,
+            8080,
+        );
+
+        let req = Request::builder()
+            .uri("/api/devaipod/control-plane")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let repos = json["repos"].as_array().unwrap();
+
+        // Three groups: owner/repo-a, owner/repo-b, unknown
+        assert_eq!(repos.len(), 3, "expected 3 repo groups: {json:#}");
+
+        // Repos with active agents first: owner/repo-a (1 running), unknown (1 running),
+        // then owner/repo-b (0 agents, only devcontainer — active_count=0).
+        // Among groups with active_count=1, alphabetical order applies.
+        let repo_names: Vec<&str> = repos.iter().map(|r| r["repo"].as_str().unwrap()).collect();
+        assert_eq!(repo_names, &["owner/repo-a", "unknown", "owner/repo-b"]);
+
+        // repo-a should have 1 active, 2 agents, 0 devcontainers
+        let repo_a = &repos[0];
+        assert_eq!(repo_a["active_count"], 1);
+        assert_eq!(repo_a["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(repo_a["devcontainers"].as_array().unwrap().len(), 0);
+        // First agent should have the task label
+        let agent0 = &repo_a["agents"][0];
+        assert_eq!(agent0["task"], "Fix the bug");
+        assert_eq!(agent0["short_name"], "foo-abc");
+        assert!(agent0["is_running"].as_bool().unwrap());
+
+        // repo-b should have 0 agents, 1 devcontainer
+        let repo_b = &repos[2];
+        assert_eq!(repo_b["active_count"], 0);
+        assert_eq!(repo_b["agents"].as_array().unwrap().len(), 0);
+        assert_eq!(repo_b["devcontainers"].as_array().unwrap().len(), 1);
+        let dc0 = &repo_b["devcontainers"][0];
+        assert_eq!(dc0["short_name"], "baz-ghi");
+        assert!(dc0["is_running"].as_bool().unwrap());
+
+        // "unknown" should have 1 active, 1 agent
+        let unknown = &repos[1];
+        assert_eq!(unknown["repo"], "unknown");
+        assert_eq!(unknown["active_count"], 1);
+        assert_eq!(unknown["agents"].as_array().unwrap().len(), 1);
     }
 
     #[test]
