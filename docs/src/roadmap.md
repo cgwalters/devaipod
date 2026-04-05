@@ -15,12 +15,21 @@ into a dependency-ordered plan.
 - **Script injection reduction**: Auth proxy and workspace monitor
   replaced with pod-api; clone scripts remain.
   See [minimize-injection.md](../todo/minimize-injection.md).
+- **Workspace v2 (core)**: Agent workspaces are host directories
+  (bind-mounted, not volumes). Multi-repo support, `--source-dir`,
+  harvest, and auto-harvest on agent completion.
+  See [workspace-v2.md](../todo/workspace-v2.md).
+- **Git state awareness**: `devaipod status` (from a git repo) shows
+  agent workspaces, harvested branches, push status, and PRs.
+- **Review and push (CLI)**: `devaipod fetch`, `devaipod diff`,
+  `devaipod review` (TUI), `devaipod apply`, `devaipod push`,
+  `devaipod pr`. Pod-api endpoints `/git/fetch-agent` and
+  `/git/push` are functional.
 
 ## In Progress / Near-term
 
 - **Agent completion detection**: Partially implemented via `/summary`
   endpoint. Needs full idle-state detection for `run` mode.
-- **Git state awareness**: Detect and warn about unpushed commits.
 - **Agent readiness probes**: Partially implemented via pod-api health
   checks. Needs refinement.
 - **Pod-api as lifecycle driver**: Make pod-api the single entry point
@@ -29,35 +38,35 @@ into a dependency-ordered plan.
   See [pod-api-driver.md](../todo/pod-api-driver.md).
 - **UI improvements**: Session titles, card layout, attach experience.
   See [ui.md](../todo/ui.md).
+- **Web UI review component**: Pod-api git endpoints are functional,
+  but the web frontend still needs push approval gate, viewed-files
+  tracking, and Signed-off-by checkbox.
+- **Git hook hardening on read path**: Pod-api `run_git()` only sets
+  `safe.directory=*`; the full hardening (fsmonitor, hooksPath,
+  credential.helper) described in
+  [lightweight-review.md](../todo/lightweight-review.md) is not yet
+  implemented.
 
 ## Planned Work
 
 The following features have design docs and are ordered by dependency.
 Later items build on earlier ones.
 
-### 1. Workspace v2: source tree and worktree modes
+### 1. Workspace v2: remaining phases
 
-Rethink how code gets into the container. Add `--worktree` for
-Cursor-like local development (agent works in a sibling worktree
-bind-mounted into the container) and `--source-dir` for multi-repo
-tasks (user's `~/src/work` mounted read-only, agent clones repos
-on demand into a podman volume).
-
-This is foundational -- review, push, and multi-repo support all
-build on the workspace infrastructure.
+Core workspace-v2 (host directories, multi-repo, harvest) is done.
+Remaining work: workspace-anchored UI/model rework (Phase 2),
+decoupling workspace containers from agent pods (Phase 3), and
+repo-centric control plane (Phase 4).
 
 See [workspace-v2.md](../todo/workspace-v2.md).
 
-### 2. Review and push (lightweight review)
+### 2. Review and push (web UI)
 
-Build the review and push layer on top of workspace-v2. Pod-api
-owns all git push operations using GH_TOKEN; the agent never gets
-push credentials. Three modes: autonomous (headless draft PR),
-interactive (human review gate in the web UI), and fully interactive
-(IDE + agent handoff).
-
-Depends on workspace-v2 for the dual-workspace trust model and
-multi-repo volume layout.
+CLI review and push commands are done (`devaipod review/push/pr`).
+Pod-api git endpoints work. Remaining: web UI approval gate,
+viewed-files tracking, Signed-off-by checkbox, and git hook
+hardening on the pod-api read path.
 
 See [lightweight-review.md](../todo/lightweight-review.md).
 

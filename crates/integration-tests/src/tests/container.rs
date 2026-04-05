@@ -1257,9 +1257,9 @@ fn test_agent_workspace_shares_git_objects() -> Result<()> {
 }
 podman_integration_test!(test_agent_workspace_shares_git_objects);
 
-/// Readonly test: Verify the agent workspace volumes are set up correctly.
+/// Readonly test: Verify the agent workspace mounts are set up correctly.
 ///
-/// This is a lightweight check that uses the shared fixture to verify the volume
+/// This is a lightweight check that uses the shared fixture to verify the mount
 /// configuration without modifying state.
 fn test_readonly_agent_has_separate_workspace(fixture: &SharedFixture) -> Result<()> {
     let sh = shell()?;
@@ -1323,7 +1323,7 @@ readonly_test!(test_readonly_agent_has_separate_workspace);
 /// Verify that the gator container can access the agent's workspace.
 ///
 /// With agent isolation, the gator needs to read from /workspaces/<project>
-/// which is mounted from the agent-workspace volume (not main workspace).
+/// which is bind-mounted from the host agent directory (not main workspace).
 /// This is required for git_push_local to read the agent's commits.
 fn test_gator_can_access_agent_workspace() -> Result<()> {
     let repo = TestRepo::new()?;
@@ -1761,7 +1761,7 @@ fn test_forward_ports_published() -> Result<()> {
 }
 podman_integration_test!(test_forward_ports_published);
 
-/// Verify that rebuild reads devcontainer.json from the workspace volume
+/// Verify that rebuild reads devcontainer.json from the workspace
 /// rather than cloning the remote. Modifying devcontainer.json inside the
 /// workspace (adding forwardPorts) should be reflected after rebuild.
 fn test_rebuild_reads_workspace_devcontainer() -> Result<()> {

@@ -225,15 +225,31 @@ without processing the source repo's `.git/config` or hooks.
 
 The `GitReviewTab` component exists and provides read-only review:
 commit log, per-file diffs, SSE auto-refresh. All read endpoints
-work via hardened `run_git()` against the agent workspace.
+work via `run_git()` against the agent workspace (note: `run_git()`
+currently only applies `safe.directory=*`, not the full hardening
+described in the Security section above — that remains to be done).
 
-What does **not** work today:
+**Working today:**
 
-- `POST /git/fetch-agent` runs in the wrong context. Always fails.
-- `POST /git/push` has no credentials. Always fails.
-- No git hook hardening on the read path.
-- No push UI (no buttons, no approval gate).
-- `git_push_local` in service-gator is fragile and being removed.
+- `POST /git/fetch-agent` fetches agent commits in pod-api.
+- `POST /git/push` pushes a branch to origin from pod-api.
+- CLI commands: `devaipod push`, `devaipod pr`, `devaipod apply`,
+  `devaipod fetch`, `devaipod diff`, `devaipod review` (TUI).
+- `devaipod status` (no-arg) shows repo-level overview of agent
+  workspaces, branches, and PRs.
+- Control plane harvest: `POST /api/devaipod/pods/{name}/fetch`
+  fetches agent commits into the user's source repo. Auto-harvest
+  triggers on agent completion for local-source workspaces.
+- `git_push_local` removed from service-gator.
+
+**Not yet implemented:**
+
+- Full git hook hardening on the pod-api read path (fsmonitor,
+  hooksPath, credential.helper — see Security section).
+- `POST /git/create-branch` (fetch + push as new branch).
+- Push approval gate in the web UI (buttons, viewed-files tracking).
+- Signed-off-by checkbox in web UI.
+- MCP tool `create_or_update_branch` for agent-initiated push.
 
 ## API Endpoints
 

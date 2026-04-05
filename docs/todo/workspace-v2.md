@@ -4,9 +4,9 @@ Assisted-by: OpenCode (Claude Opus 4.6)
 
 ## Problem Statement
 
-The current sandbox model creates up to 5 named volumes per pod. Code
-lives inside opaque podman volumes -- invisible from the host, requiring
-special transport to move data in or out. This is unnecessary complexity.
+The previous sandbox model created up to 5 named volumes per pod. Code
+lived inside opaque podman volumes — invisible from the host, requiring
+special transport to move data in or out. This was unnecessary complexity.
 
 ## Prior Art
 
@@ -173,8 +173,9 @@ This is the minimal mount. We do not bind-mount `~` entirely.
 - UID mapping: see [rootless-uidmapping.md](./rootless-uidmapping.md)
 - UI/model rework: workspace-anchored design (see Phase 2 below)
 - `devaipod clean` garbage-collects orphaned agent dirs
-- Push/PR creation from the control plane (credentials, "approve &
-  push" flow — see [lightweight-review.md](./lightweight-review.md))
+- Web UI push approval gate (CLI `devaipod push` and `devaipod pr`
+  work; web UI needs buttons, viewed-files tracking, and
+  Signed-off-by — see [lightweight-review.md](./lightweight-review.md))
 - Web UI review component (REST API is ready, frontend needs inline
   commenting UI)
 

@@ -268,7 +268,6 @@ containers (workspace pods) that run alongside it on the host.
 
 ## Limitations
 
-- **Remote URLs only** - only works with remote repository URLs, not local directories
 - **No `bind_home`** - the `[bind_home]` config option is not supported; use `[trusted.secrets]` instead
 
 ## Building from source

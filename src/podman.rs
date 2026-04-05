@@ -988,7 +988,6 @@ impl PodmanService {
     }
 
     /// Remove a volume
-    #[allow(dead_code)] // Part of public API
     pub async fn remove_volume(&self, name: &str, force: bool) -> Result<()> {
         let mut args = vec!["volume", "rm"];
         if force {
@@ -1546,7 +1545,6 @@ impl PodmanService {
     /// Execute a command and return its output
     ///
     /// Returns (exit_code, stdout, stderr)
-    #[allow(dead_code)] // Useful API method for future use
     pub async fn exec_output(
         &self,
         container: &str,

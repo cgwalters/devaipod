@@ -170,7 +170,7 @@ The proposal is completely inert — no pod is created, no code is touched —
 until a human explicitly approves it. On approval, devaipod translates the
 proposal into a `devaipod run` invocation.
 
-## CLI Command (planned)
+## CLI Command (implemented)
 
 `devaipod advisor` manages the advisor pod lifecycle:
 

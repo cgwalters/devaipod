@@ -6108,7 +6108,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
         pr: Option<String>,
         task: Option<String>,
         mode: Option<String>,
-        #[allow(dead_code)] // Used in JSON output enrichment
+        #[allow(dead_code)] // Populated from labels but not yet shown in tabular output
         title: Option<String>,
         agent_status: Option<bool>,
     }
