@@ -23,6 +23,8 @@ The `api` container has a `/healthz` endpoint and a podman healthcheck configure
 | `src/config.rs` | Configuration types and loading |
 | `src/agent_dir.rs` | Host-side agent workspace directories, harvest, multi-repo discovery |
 | `src/git.rs` | Git clone scripts, agent workspace init, reference clones |
+| `src/advisor.rs` | Advisor data types, pod/workspace introspection, draft proposals |
+| `src/mcp.rs` | MCP JSON-RPC server for advisor tools (`/api/devaipod/mcp`) |
 | `src/review_tui.rs` | Interactive TUI for reviewing agent diffs (`devaipod review`) |
 | `src/ssh_server.rs` | SSH server for `exec --stdio` connections |
 

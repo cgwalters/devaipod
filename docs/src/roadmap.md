@@ -107,8 +107,10 @@ ordering. Some have design docs, others are rough ideas.
 - **Local Forgejo instance**: Git caching, local CI/CD, and code
   review UI. Deferred in favor of the lightweight review approach
   for now. See [forgejo-integration.md](../todo/forgejo-integration.md).
-- **Advisor agent**: Long-running read-only observer that proposes
-  tasks for human approval based on GitHub issues and pod health.
+- **Advisor agent** (partially implemented): Read-only observer that proposes
+  agent pods based on GitHub activity and pod health. Core infrastructure
+  is complete (MCP tools, CLI, workspace introspection); approval UI and
+  auto-launch from proposals are not yet implemented.
   See [advisor.md](../todo/advisor.md).
 - **Dynamic port forwarding**: Forward ports from running pods
   without restart, via `podman exec` TCP relay.

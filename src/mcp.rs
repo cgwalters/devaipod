@@ -171,7 +171,30 @@ fn handle_tools_list() -> Value {
                         }
                     }
                 }
-            }
+            },
+            {
+                "name": "list_workspaces",
+                "description": "List all agent workspaces with their state, source repos, git branches, completion status, and commit counts. This gives a comprehensive view of all active and completed agent work.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "workspace_diff",
+                "description": "Get the git diff for all repos in a specific agent workspace, showing what the agent has changed relative to the upstream default branch.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": {
+                            "type": "string",
+                            "description": "Workspace name (pod name without 'devaipod-' prefix)"
+                        }
+                    },
+                    "required": ["workspace"]
+                }
+            },
         ]
     })
 }
@@ -193,6 +216,8 @@ async fn handle_tools_call(params: Option<Value>) -> Result<Value, Value> {
         "pod_logs" => call_pod_logs(&arguments),
         "propose_agent" => call_propose_agent(&arguments),
         "list_proposals" => call_list_proposals(&arguments),
+        "list_workspaces" => call_list_workspaces(),
+        "workspace_diff" => call_workspace_diff(&arguments),
         _ => Err(format!("Unknown tool: {}", name)),
     })
     .await
@@ -310,6 +335,19 @@ fn call_list_proposals(args: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(&proposals).map_err(|e| e.to_string())
 }
 
+fn call_list_workspaces() -> Result<String, String> {
+    let summaries = advisor::list_workspace_summaries().map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&summaries).map_err(|e| e.to_string())
+}
+
+fn call_workspace_diff(args: &Value) -> Result<String, String> {
+    let workspace = args
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing workspace argument")?;
+    advisor::workspace_diff(workspace).map_err(|e| e.to_string())
+}
+
 /// Normalize pod name: ensure it has the "devaipod-" prefix.
 fn normalize_pod_name(name: &str) -> String {
     if name.starts_with("devaipod-") {
@@ -405,7 +443,7 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let tools = json["result"]["tools"].as_array().unwrap();
-        assert!(tools.len() >= 5, "Expected at least 5 tools");
+        assert!(tools.len() >= 7, "Expected at least 7 tools");
 
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"list_pods"));
@@ -413,6 +451,8 @@ mod tests {
         assert!(names.contains(&"pod_logs"));
         assert!(names.contains(&"propose_agent"));
         assert!(names.contains(&"list_proposals"));
+        assert!(names.contains(&"list_workspaces"));
+        assert!(names.contains(&"workspace_diff"));
     }
 
     #[tokio::test]

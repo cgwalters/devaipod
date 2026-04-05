@@ -11,7 +11,6 @@ use std::process::Command as ProcessCommand;
 use clap::{Args, CommandFactory, Parser};
 use color_eyre::eyre::{Context, Result, bail};
 
-#[allow(dead_code)] // MCP server will use these in a follow-up
 mod advisor;
 mod agent_dir;
 mod config;
@@ -1008,6 +1007,15 @@ enum HostCommand {
         /// Override the advisor pod name (default: advisor → devaipod-advisor)
         #[arg(long)]
         name: Option<String>,
+        /// Additional source directories to mount read-only in the advisor pod.
+        ///
+        /// The advisor can browse these to understand project structure,
+        /// check git status, and correlate across repos — without being
+        /// able to modify anything.
+        ///
+        /// Example: --source-dir ~/src
+        #[arg(long = "source-dir", value_name = "DIR")]
+        source_dirs: Vec<PathBuf>,
     },
 
     /// Fetch agent commits into the current git repo
@@ -1807,7 +1815,18 @@ async fn run_host(cli: HostCli) -> Result<()> {
             status,
             proposals,
             name,
-        } => cmd_advisor(&config, task.as_deref(), status, proposals, name.as_deref()).await,
+            source_dirs,
+        } => {
+            cmd_advisor(
+                &config,
+                task.as_deref(),
+                status,
+                proposals,
+                name.as_deref(),
+                &source_dirs,
+            )
+            .await
+        }
         HostCommand::Devcontainer { action } => cmd_devcontainer(&config, action).await,
         HostCommand::Helper { action } => run_helper_async(action).await,
         HostCommand::Internals { action } => run_internals(action),
@@ -5150,6 +5169,7 @@ async fn cmd_advisor(
     show_status: bool,
     show_proposals: bool,
     name_override: Option<&str>,
+    source_dirs: &[PathBuf],
 ) -> Result<()> {
     let advisor_pod = match name_override {
         Some(n) => normalize_pod_name(n),
@@ -5196,7 +5216,7 @@ async fn cmd_advisor(
         }
         AdvisorPodState::NotFound => {
             eprintln!("No advisor pod found. Creating one...");
-            create_advisor_pod(config, task).await?;
+            create_advisor_pod(config, task, source_dirs).await?;
             if no_attach {
                 return Ok(());
             }
@@ -5207,6 +5227,48 @@ async fn cmd_advisor(
 
 /// Default fallback image for the advisor pod (used only when auto-detection fails)
 const ADVISOR_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
+
+/// Default system prompt for the advisor agent.
+///
+/// This prompt instructs the advisor to use its MCP tools to survey the
+/// current state and proactively suggest agent pods to launch.
+const ADVISOR_SYSTEM_PROMPT: &str = "\
+You are the devaipod advisor agent. Your job is to observe the user's development \
+environment and suggest useful agent pods to launch. You have two sets of tools:
+
+- **devaipod MCP tools** for pod/workspace introspection: `list_pods`, `list_workspaces`, \
+  `workspace_diff`, `pod_status`, `pod_logs`, `propose_agent`, `list_proposals`
+- **service-gator MCP tools** for GitHub access: use these to search for PRs where \
+  you are requested as a reviewer, list notifications, browse issues, etc.
+
+Start by surveying the current state:
+
+1. Use service-gator to find open PRs where the user is requested as a reviewer. \
+   For each non-draft PR, consider proposing an agent pod to review it.
+2. Use `list_workspaces` to see what agent pods are already running or completed, \
+   what repos they're working on, and their completion status.
+3. Use service-gator to check GitHub notifications for new issues, mentions, or \
+   CI failures that might warrant an agent.
+4. Use `list_pods` to check pod health. Look for stuck or unhealthy pods.
+
+Based on what you find, use `propose_agent` to create draft proposals for new \
+agent pods. Each proposal should have:
+- A clear title describing the work
+- The target repo (e.g. 'owner/repo')
+- A detailed task description the agent can act on
+- Your rationale for why this is worth doing
+- A priority level (high/medium/low)
+- The source that triggered it (e.g. 'github:owner/repo#123')
+
+Focus on actionable items: PRs waiting for review, issues with clear reproduction \
+steps, dependency updates, CI failures. Skip anything that's already being worked \
+on by an existing agent pod.
+
+If source directories are mounted at /mnt/source/, browse them to understand \
+project structure and cross-repo dependencies. This helps you write better task \
+descriptions.
+
+After your initial survey, summarize what you found and what you proposed.";
 
 /// Get the container image to use for the advisor pod.
 ///
@@ -5258,9 +5320,13 @@ fn detect_own_container_image() -> Option<String> {
 /// the workspace source (same default as `devaipod up` with no args),
 /// and override the image to use our own container which has opencode
 /// installed.
-async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Result<()> {
+async fn create_advisor_pod(
+    config: &config::Config,
+    task: Option<&str>,
+    source_dirs: &[PathBuf],
+) -> Result<()> {
     let image = advisor_image();
-    let default_task = task.unwrap_or("You are the devaipod advisor agent. Wait for instructions.");
+    let default_task = task.unwrap_or(ADVISOR_SYSTEM_PROMPT);
 
     // The MCP server runs as a route on the devaipod web server.
     // The advisor agent reaches it via host.containers.internal:8080
@@ -5304,12 +5370,12 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         Some("advisor"), // Becomes devaipod-advisor via normalize_pod_name
         &[],             // service-gator scopes from config
         None,
-        true,  // read-only service-gator
+        true,                                   // read-only service-gator
         &[],   // no CLI mcp_servers — entry is already in the config
         None,  // no devcontainer override
         false, // don't override project devcontainer
         true,  // auto_approve
-        &[],   // no source_dirs
+        &canonicalize_source_dirs(source_dirs), // read-only source dirs
     )
     .await?;
 
