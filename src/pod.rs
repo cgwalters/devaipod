@@ -698,40 +698,21 @@ impl DevaipodPod {
             tracing::debug!("Using existing agent home volume '{}'", agent_home_volume);
         }
 
-        // Set up the agent workspace: either a host-side bind mount directory
-        // (for LocalRepo) or a named podman volume (for remote sources).
-        //
-        // For LocalRepo, the host dir avoids the overhead of a podman volume
-        // and lets the control plane directly access agent workspace files.
-        let (agent_workspace_source, agent_workspace_exists) = match source {
-            WorkspaceSource::LocalRepo(_) => {
-                crate::agent_dir::create_agent_dir(pod_name)?;
-                let host_path = crate::agent_dir::agent_dir_host_path(pod_name)?;
-                let has_content = crate::agent_dir::agent_dir_container_path(pod_name)
-                    .map(|p| p.join(".git").exists())
-                    .unwrap_or(false);
-                tracing::debug!(
-                    "Agent workspace: host bind mount at {}{}",
-                    host_path.display(),
-                    if has_content { " (existing)" } else { "" },
-                );
-                (AgentWorkspaceSource::HostDir { host_path }, has_content)
-            }
-            _ => {
-                let volume_name = format!("{}-agent-workspace", pod_name);
-                let exists = podman.volume_exists(&volume_name).await?;
-                if !exists {
-                    podman
-                        .create_volume(&volume_name)
-                        .await
-                        .context("Failed to create agent workspace volume")?;
-                    tracing::debug!("Created agent workspace volume '{}'", volume_name);
-                } else {
-                    tracing::debug!("Using existing agent workspace volume '{}'", volume_name);
-                }
-                (AgentWorkspaceSource::Volume(volume_name), exists)
-            }
-        };
+        // Agent workspace is always a host directory, regardless of source type.
+        // This ensures agent state is visible on the host filesystem for
+        // direct access by review tools, diff, fetch, etc.
+        crate::agent_dir::create_agent_dir(pod_name)?;
+        let host_path = crate::agent_dir::agent_dir_host_path(pod_name)?;
+        let has_content = crate::agent_dir::agent_dir_container_path(pod_name)
+            .map(|p| p.join(".git").exists())
+            .unwrap_or(false);
+        tracing::debug!(
+            "Agent workspace: host bind mount at {}{}",
+            host_path.display(),
+            if has_content { " (existing)" } else { "" },
+        );
+        let agent_workspace_source = AgentWorkspaceSource::HostDir { host_path };
+        let agent_workspace_exists = has_content;
         let agent_workspace_mount_source = agent_workspace_source.as_mount_source();
 
         // Clone into agent workspace using --shared to share objects with main workspace

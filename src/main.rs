@@ -2492,6 +2492,7 @@ fn write_workspace_state(
         task: task.map(|s| s.to_string()),
         title: title.map(|s| s.to_string()),
         completion_status: None,
+        last_harvested: std::collections::HashMap::new(),
     };
 
     if let Err(e) = state.save(&ws_dir) {
@@ -3661,18 +3662,16 @@ async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) ->
 // Fetch / Diff Commands
 // =============================================================================
 
-/// Find the git repo inside an agent's host-side workspace directory.
+/// Find ALL git repos inside an agent's host-side workspace directory.
 ///
-/// The workspace is at `<base>/<pod-name>/` and typically contains a single
-/// subdirectory (the project clone) that has a `.git` directory. Returns the
-/// path to the git repo root.
-fn find_agent_git_repo(pod_name: &str) -> Result<PathBuf> {
+/// Resolves the pod's workspace directory and delegates to the shared
+/// [`agent_dir::find_git_repos_in_dir`]. Returns an error if the directory
+/// doesn't exist or contains no git repos.
+fn find_all_agent_git_repos(pod_name: &str) -> Result<Vec<(String, PathBuf)>> {
     let base = agent_dir::agent_workdir_base()?;
     let pod_dir = base.join(pod_name);
 
     if !pod_dir.exists() {
-        // Distinguish between "workspace not found" and "workspace uses a volume"
-        // by checking if the pod actually exists in podman.
         let pod_exists = podman_command()
             .args(["pod", "exists", pod_name])
             .stdout(std::process::Stdio::null())
@@ -3682,8 +3681,8 @@ fn find_agent_git_repo(pod_name: &str) -> Result<PathBuf> {
             .unwrap_or(false);
         if pod_exists {
             bail!(
-                "Workspace '{}' uses a volume-based workspace (no host directory). \
-                 `fetch` is only available for local workspaces created with `devaipod up <local-path>`.",
+                "Workspace '{}' has no host directory (possibly a legacy volume-based workspace). \
+                 Try recreating it with `devaipod delete` then `devaipod up`.",
                 strip_pod_prefix(pod_name)
             );
         } else {
@@ -3694,55 +3693,17 @@ fn find_agent_git_repo(pod_name: &str) -> Result<PathBuf> {
         }
     }
 
-    // Check if the pod_dir itself is a git repo
-    if pod_dir.join(".git").exists() {
-        return Ok(pod_dir);
-    }
+    let repos = agent_dir::find_git_repos_in_dir(&pod_dir);
 
-    // Look for subdirectories that are git repos
-    let entries = std::fs::read_dir(&pod_dir).with_context(|| {
-        format!(
-            "Failed to read agent workspace directory {}",
+    if repos.is_empty() {
+        bail!(
+            "No git repository found in agent workspace at {}. \
+             The agent may not have cloned the repo yet.",
             pod_dir.display()
-        )
-    })?;
-
-    let mut git_repos: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && path.join(".git").exists() {
-            git_repos.push(path);
-        }
+        );
     }
 
-    match git_repos.len() {
-        1 => return Ok(git_repos.into_iter().next().unwrap()),
-        n if n > 1 => {
-            // Multiple repos — sort by modification time (most recent first)
-            git_repos.sort_by(|a, b| {
-                let mtime = |p: &PathBuf| {
-                    p.join(".git")
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                };
-                mtime(b).cmp(&mtime(a))
-            });
-            tracing::info!(
-                "Multiple git repos in workspace, using most recent: {}",
-                git_repos[0].display()
-            );
-            return Ok(git_repos.into_iter().next().unwrap());
-        }
-        _ => {}
-    }
-
-    bail!(
-        "No git repository found in agent workspace at {}. \
-         The agent may not have cloned the repo yet.",
-        pod_dir.display()
-    );
+    Ok(repos)
 }
 
 /// Verify the current directory is a git repo.
@@ -3761,112 +3722,130 @@ fn verify_current_dir_is_git_repo() -> Result<()> {
 }
 
 /// Fetch agent commits into the current git repo
+///
+/// Discovers all git repos in the agent's workspace and fetches each one.
+/// For single-repo workspaces the remote is named `devaipod/<workspace>`;
+/// for multi-repo workspaces each remote is `devaipod/<workspace>/<repo>`.
 fn cmd_fetch(pod_name: &str) -> Result<()> {
     verify_current_dir_is_git_repo()?;
 
-    let agent_repo = find_agent_git_repo(pod_name)?;
+    let repos = find_all_agent_git_repos(pod_name)?;
     let short_name = strip_pod_prefix(pod_name);
-    let remote_name = format!("devaipod/{}", short_name);
 
-    tracing::info!("Fetching from agent workspace: {}", agent_repo.display());
+    for (repo_name, agent_repo) in &repos {
+        // Remote name includes the repo name to distinguish multi-repo remotes
+        let remote_name = if repos.len() == 1 {
+            format!("devaipod/{}", short_name)
+        } else {
+            format!("devaipod/{}/{}", short_name, repo_name)
+        };
 
-    // Add or update the remote
-    let agent_repo_str = agent_repo.to_str().ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "Agent repo path is not valid UTF-8: {}",
-            agent_repo.display()
-        )
-    })?;
-    let add_result = ProcessCommand::new("git")
-        .args(["remote", "add", &remote_name, &agent_repo_str])
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .context("Failed to run git remote add")?;
+        tracing::info!("Fetching from agent workspace: {}", agent_repo.display());
 
-    if !add_result.status.success() {
-        let stderr = String::from_utf8_lossy(&add_result.stderr);
-        if stderr.contains("already exists") {
-            // Update the URL instead
-            let set_result = ProcessCommand::new("git")
-                .args(["remote", "set-url", &remote_name, &agent_repo_str])
-                .output()
-                .context("Failed to run git remote set-url")?;
-            if !set_result.status.success() {
-                let stderr = String::from_utf8_lossy(&set_result.stderr);
+        // Add or update the remote
+        let agent_repo_str = agent_repo.to_str().ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "Agent repo path is not valid UTF-8: {}",
+                agent_repo.display()
+            )
+        })?;
+        let add_result = ProcessCommand::new("git")
+            .args(["remote", "add", &remote_name, agent_repo_str])
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .context("Failed to run git remote add")?;
+
+        if !add_result.status.success() {
+            let stderr = String::from_utf8_lossy(&add_result.stderr);
+            if stderr.contains("already exists") {
+                // Update the URL instead
+                let set_result = ProcessCommand::new("git")
+                    .args(["remote", "set-url", &remote_name, agent_repo_str])
+                    .output()
+                    .context("Failed to run git remote set-url")?;
+                if !set_result.status.success() {
+                    let stderr = String::from_utf8_lossy(&set_result.stderr);
+                    bail!(
+                        "Failed to update remote '{}': {}",
+                        remote_name,
+                        stderr.trim()
+                    );
+                }
+                tracing::debug!("Updated remote '{}' URL", remote_name);
+            } else {
+                bail!("Failed to add remote '{}': {}", remote_name, stderr.trim());
+            }
+        }
+
+        // Fetch from the remote. The agent's repo may have git alternates
+        // referencing container-internal paths (e.g. /mnt/main-workspace/...),
+        // which produce benign "unable to normalize alternate object path"
+        // warnings. We filter these from the output.
+        let fetch_output = ProcessCommand::new("git")
+            .args(["fetch", &remote_name])
+            .output()
+            .context("Failed to run git fetch")?;
+
+        if !fetch_output.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+            // Filter out alternates warnings before checking for real errors
+            let real_errors: Vec<&str> = stderr
+                .lines()
+                .filter(|l| !l.contains("unable to normalize alternate"))
+                .collect();
+            if !real_errors.is_empty() {
                 bail!(
-                    "Failed to update remote '{}': {}",
+                    "Failed to fetch from '{}': {}",
                     remote_name,
-                    stderr.trim()
+                    real_errors.join("\n")
                 );
             }
-            tracing::debug!("Updated remote '{}' URL", remote_name);
-        } else {
-            bail!("Failed to add remote '{}': {}", remote_name, stderr.trim());
         }
-    }
 
-    // Fetch from the remote. The agent's repo may have git alternates
-    // referencing container-internal paths (e.g. /mnt/main-workspace/...),
-    // which produce benign "unable to normalize alternate object path"
-    // warnings. We filter these from the output.
-    let fetch_output = ProcessCommand::new("git")
-        .args(["fetch", &remote_name])
-        .output()
-        .context("Failed to run git fetch")?;
-
-    if !fetch_output.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch_output.stderr);
-        // Filter out alternates warnings before checking for real errors
-        let real_errors: Vec<&str> = stderr
-            .lines()
-            .filter(|l| !l.contains("unable to normalize alternate"))
-            .collect();
-        if !real_errors.is_empty() {
-            bail!(
-                "Failed to fetch from '{}': {}",
-                remote_name,
-                real_errors.join("\n")
-            );
-        }
-    }
-
-    // Print stderr from fetch (contains the branch update info), filtering
-    // out benign alternates warnings
-    let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
-    for line in fetch_stderr.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() && !trimmed.contains("unable to normalize alternate") {
-            println!("  {}", trimmed);
-        }
-    }
-
-    // List the fetched branches
-    let branch_output = ProcessCommand::new("git")
-        .args(["branch", "-r", "--list", &format!("{}/*", remote_name)])
-        .output()
-        .context("Failed to list remote branches")?;
-
-    if branch_output.status.success() {
-        let branches = String::from_utf8_lossy(&branch_output.stdout);
-        let branch_list: Vec<&str> = branches
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect();
-        if !branch_list.is_empty() {
-            println!();
-            println!("Fetched branches:");
-            for branch in &branch_list {
-                println!("  {}", branch);
+        // Print stderr from fetch (contains the branch update info), filtering
+        // out benign alternates warnings
+        let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
+        for line in fetch_stderr.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.contains("unable to normalize alternate") {
+                println!("  {}", trimmed);
             }
-            // Suggest commands using the detected default branch
-            if let Ok(Some(default_branch)) = resolve_remote_default_branch(&remote_name) {
-                let ref_name = format!("{}/{}", remote_name, default_branch);
+        }
+
+        // List the fetched branches
+        let branch_output = ProcessCommand::new("git")
+            .args(["branch", "-r", "--list", &format!("{}/*", remote_name)])
+            .output()
+            .context("Failed to list remote branches")?;
+
+        if branch_output.status.success() {
+            let branches = String::from_utf8_lossy(&branch_output.stdout);
+            let branch_list: Vec<&str> = branches
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if !branch_list.is_empty() {
                 println!();
-                println!("To review agent changes:");
-                println!("  git log {}", ref_name);
-                println!("  git diff HEAD...{}", ref_name);
-                println!("  devaipod diff {}", short_name);
+                if repos.len() > 1 {
+                    println!("Fetched branches for {}:", repo_name);
+                } else {
+                    println!("Fetched branches:");
+                }
+                for branch in &branch_list {
+                    println!("  {}", branch);
+                }
+                // Suggest commands using the detected default branch
+                if let Ok(Some(default_branch)) = resolve_remote_default_branch(&remote_name) {
+                    let ref_name = format!("{}/{}", remote_name, default_branch);
+                    println!();
+                    println!("To review agent changes:");
+                    println!("  git log {}", ref_name);
+                    println!("  git diff HEAD...{}", ref_name);
+                    if repos.len() == 1 {
+                        println!("  devaipod diff {}", short_name);
+                    }
+                }
             }
         }
     }
