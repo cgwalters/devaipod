@@ -733,13 +733,23 @@ enum HostCommand {
         #[arg(short = 'n', long)]
         tail: Option<u32>,
     },
-    /// Show detailed status of a pod
+    /// Show status of agent workspaces, branches, and PRs
     ///
-    /// Displays pod status, container states, agent health, and exposed ports.
+    /// When run from a git repository with no arguments, displays a
+    /// comprehensive overview of all agent work related to the current
+    /// repository: workspace status, harvested branches, push status,
+    /// and associated pull requests.
+    ///
+    /// When a workspace name is given, displays detailed pod status
+    /// including container states, agent health, and exposed ports.
+    ///
+    /// Examples:
+    ///   devaipod status                          # Repo overview (from a git repo)
+    ///   devaipod status myworkspace              # Pod-level status
     Status {
-        /// Workspace name (devaipod- prefix optional)
+        /// Workspace name (devaipod- prefix optional). Omit for repo overview.
         #[arg(allow_hyphen_values = true)]
-        workspace: String,
+        workspace: Option<String>,
         /// Output in JSON format
         #[arg(long)]
         json: bool,
@@ -1066,6 +1076,44 @@ enum HostCommand {
         /// Cherry-pick instead of merge (for individual commits)
         #[arg(long)]
         cherry_pick: bool,
+    },
+
+    /// Push agent branch to origin
+    ///
+    /// Pushes the most recently harvested branch from the named (or latest)
+    /// workspace to the remote origin. Equivalent to running `devaipod fetch`
+    /// then `git push origin <ref>:<branch>`.
+    ///
+    /// Must be run from your source repository.
+    ///
+    /// Examples:
+    ///   devaipod push                            # Push latest workspace's branch
+    ///   devaipod push myworkspace                # Push specific workspace
+    Push {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+    },
+
+    /// Create a pull request from agent work
+    ///
+    /// Pushes the agent branch and creates a PR using `gh pr create`.
+    /// Requires the `gh` CLI to be installed and authenticated.
+    ///
+    /// Must be run from your source repository.
+    ///
+    /// Examples:
+    ///   devaipod pr                              # PR from latest workspace
+    ///   devaipod pr myworkspace                  # PR from specific workspace
+    ///   devaipod pr --draft myworkspace          # Create as draft PR
+    Pr {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+        /// Create as draft PR
+        #[arg(long)]
+        draft: bool,
+        /// PR title (auto-generated from commits if omitted)
+        #[arg(long)]
+        title: Option<String>,
     },
 
     /// Get or set the session title for a pod
@@ -1412,6 +1460,12 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
             | HostCommand::Diff { .. }
             | HostCommand::Review { .. }
             | HostCommand::Apply { .. }
+            | HostCommand::Push { .. }
+            | HostCommand::Pr { .. }
+            | HostCommand::Status {
+                workspace: None,
+                ..
+            }
     )
 }
 
@@ -1428,6 +1482,12 @@ fn command_allowed_on_host(cmd: &HostCommand) -> bool {
             | HostCommand::Diff { .. }
             | HostCommand::Review { .. }
             | HostCommand::Apply { .. }
+            | HostCommand::Push { .. }
+            | HostCommand::Pr { .. }
+            | HostCommand::Status {
+                workspace: None,
+                ..
+            }
     )
 }
 
@@ -1565,9 +1625,13 @@ async fn run_host(cli: HostCli) -> Result<()> {
             follow,
             tail,
         } => cmd_logs(&normalize_pod_name(&workspace), &container, follow, tail),
-        HostCommand::Status { workspace, json } => {
-            cmd_status(&normalize_pod_name(&workspace), json)
-        }
+        HostCommand::Status {
+            workspace: Some(workspace),
+            json,
+        } => cmd_status(&normalize_pod_name(&workspace), json),
+        HostCommand::Status {
+            workspace: None, ..
+        } => cmd_repo_status(),
         HostCommand::Debug { workspace, json } => cmd_debug(&normalize_pod_name(&workspace), json),
         HostCommand::Run {
             source,
@@ -1720,6 +1784,18 @@ async fn run_host(cli: HostCli) -> Result<()> {
         } => {
             let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
             cmd_apply(&pod_name, cherry_pick)
+        }
+        HostCommand::Push { workspace } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            cmd_push(&pod_name)
+        }
+        HostCommand::Pr {
+            workspace,
+            draft,
+            title,
+        } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            cmd_pr(&pod_name, draft, title.as_deref())
         }
         HostCommand::Title { name, title } => {
             cmd_title(&normalize_pod_name(&name), title.as_deref()).await
@@ -4006,6 +4082,543 @@ fn cmd_apply(pod_name: &str, cherry_pick: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Repo-level commands: status, push, pr
+// =============================================================================
+
+/// Show a comprehensive overview of agent work for the current repo.
+///
+/// Displays workspace status, harvested branches, push status, and PRs.
+fn cmd_repo_status() -> Result<()> {
+    verify_current_dir_is_git_repo()?;
+
+    let repo_name = detect_repo_name().unwrap_or_else(|_| "(unknown)".to_string());
+    let repo_root = repo_root_path()?;
+    let current_branch = current_branch_name().unwrap_or_else(|_| "(detached)".to_string());
+
+    println!("Repo: {} ({})", repo_name, repo_root.display());
+    println!("Branch: {}", current_branch);
+    println!();
+
+    // 1. Find agent workspaces for this repo
+    let workspaces = find_workspaces_for_repo(&repo_root);
+    if !workspaces.is_empty() {
+        println!("Agent workspaces:");
+        for ws in &workspaces {
+            let status_icon = match ws.completion_status.as_deref() {
+                Some("done") => "\u{25c9}",   // ◉
+                Some("active") => "\u{25cf}", // ●
+                _ => "\u{25cb}",              // ○
+            };
+            let commit_info = if ws.commit_count > 0 {
+                format!("{} commits", ws.commit_count)
+            } else {
+                "\u{2014}".to_string() // —
+            };
+            println!(
+                "  {} {:<30} {:<8} {:<12} {}",
+                status_icon,
+                ws.short_name,
+                ws.completion_status.as_deref().unwrap_or("unknown"),
+                commit_info,
+                ws.age_display,
+            );
+        }
+        println!();
+    }
+
+    // 2. Show harvested branches (devaipod/* remotes)
+    let branches = find_devaipod_branches();
+    if !branches.is_empty() {
+        // Try to get PR info via gh CLI (best effort, single call for all branches)
+        let prs = list_prs_for_repo();
+
+        println!("Harvested branches:");
+        for branch in &branches {
+            println!("  {}", branch.ref_name);
+            if branch.ahead > 0 {
+                println!(
+                    "    {} commit{} ahead of {}",
+                    branch.ahead,
+                    if branch.ahead == 1 { "" } else { "s" },
+                    branch.base_branch,
+                );
+            }
+            match &branch.push_status {
+                RepoPushStatus::NotPushed => println!("    Not pushed"),
+                RepoPushStatus::Pushed(remote_ref) => {
+                    println!("    Pushed to {}", remote_ref)
+                }
+            }
+            if let Some(pr) = match_pr(&branch.ref_name, &prs) {
+                println!(
+                    "    PR #{}: \"{}\" ({})",
+                    pr.number,
+                    pr.title,
+                    pr.state_display()
+                );
+            }
+            println!();
+        }
+    } else if workspaces.is_empty() {
+        println!("No agent workspaces or harvested branches found for this repo.");
+        println!("Run `devaipod up . \"your task\"` to launch an agent.");
+    }
+
+    Ok(())
+}
+
+/// Push agent branch to origin.
+fn cmd_push(pod_name: &str) -> Result<()> {
+    verify_current_dir_is_git_repo()?;
+
+    // Ensure we have the latest
+    cmd_fetch(pod_name)?;
+
+    let short_name = strip_pod_prefix(pod_name);
+    let remote_name = format!("devaipod/{}", short_name);
+
+    let default_branch = resolve_remote_default_branch(&remote_name)?.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No branches found for remote '{}'. The agent may not have made any commits.",
+            remote_name
+        )
+    })?;
+
+    let ref_name = format!("{}/{}", remote_name, default_branch);
+
+    println!("Pushing {} to origin/{}...", ref_name, default_branch);
+
+    let result = ProcessCommand::new("git")
+        .args([
+            "push",
+            "origin",
+            &format!("{}:{}", ref_name, default_branch),
+        ])
+        .status()
+        .context("Failed to run git push")?;
+
+    if !result.success() {
+        bail!("Push failed. Check your permissions and try again.");
+    }
+
+    println!("Pushed to origin/{}", default_branch);
+    Ok(())
+}
+
+/// Create a pull request from agent work.
+///
+/// Pushes the branch first, then runs `gh pr create`.
+fn cmd_pr(pod_name: &str, draft: bool, title: Option<&str>) -> Result<()> {
+    verify_current_dir_is_git_repo()?;
+
+    // Push first
+    cmd_push(pod_name)?;
+
+    let short_name = strip_pod_prefix(pod_name);
+    let remote_name = format!("devaipod/{}", short_name);
+
+    let default_branch = resolve_remote_default_branch(&remote_name)?.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No branches found for remote '{}'. The agent may not have made any commits.",
+            remote_name
+        )
+    })?;
+
+    // Auto-generate title from commit log if not provided
+    let pr_title = if let Some(t) = title {
+        t.to_string()
+    } else {
+        let ref_name = format!("{}/{}", remote_name, default_branch);
+        let log_output = ProcessCommand::new("git")
+            .args(["log", "--format=%s", "-1", &ref_name])
+            .output()
+            .context("Failed to get commit message for PR title")?;
+        String::from_utf8_lossy(&log_output.stdout)
+            .trim()
+            .to_string()
+    };
+
+    let mut gh_args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--head".to_string(),
+        default_branch.clone(),
+        "--title".to_string(),
+        pr_title,
+    ];
+
+    if draft {
+        gh_args.push("--draft".to_string());
+    }
+
+    // Fill the body with the commit log
+    let ref_name = format!("{}/{}", remote_name, default_branch);
+    let body_output = ProcessCommand::new("git")
+        .args(["log", "--format=- %s", &format!("HEAD..{}", ref_name)])
+        .output()
+        .ok();
+
+    let body = body_output
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if !body.is_empty() {
+        gh_args.push("--body".to_string());
+        gh_args.push(body);
+    }
+
+    println!("Creating pull request...");
+
+    let result = ProcessCommand::new("gh")
+        .args(&gh_args)
+        .status()
+        .context("Failed to run `gh pr create`. Is the GitHub CLI installed and authenticated?")?;
+
+    if !result.success() {
+        bail!("gh pr create failed. Check the output above for details.");
+    }
+
+    Ok(())
+}
+
+// ── Repo-status helpers ──────────────────────────────────────────────
+
+/// Extract org/repo from the origin remote URL.
+fn detect_repo_name() -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .context("Failed to get origin URL")?;
+    if !output.status.success() {
+        bail!("No 'origin' remote configured");
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Handle https://github.com/org/repo.git and git@github.com:org/repo.git
+    let path = url.strip_suffix(".git").unwrap_or(&url);
+    // Try to find a hosting provider hostname
+    for sep in ["github.com", "gitlab.com", "codeberg.org", "bitbucket.org"] {
+        if let Some(idx) = path.find(sep) {
+            let after = &path[idx + sep.len()..];
+            let clean = after.trim_start_matches('/').trim_start_matches(':');
+            return Ok(clean.to_string());
+        }
+    }
+    Ok(url)
+}
+
+/// Get the current branch name.
+fn current_branch_name() -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .context("Failed to get current branch")?;
+    if !output.status.success() {
+        bail!("HEAD is detached");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Get the repo root path.
+fn repo_root_path() -> Result<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("Failed to get repo root")?;
+    if !output.status.success() {
+        bail!("Not inside a git working tree");
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+/// Summary of a workspace relevant to the current repo.
+struct RepoWorkspaceInfo {
+    short_name: String,
+    completion_status: Option<String>,
+    commit_count: usize,
+    age_display: String,
+}
+
+/// Scan the workspaces directory for workspaces whose source matches this repo.
+fn find_workspaces_for_repo(repo_root: &Path) -> Vec<RepoWorkspaceInfo> {
+    let repo_str = repo_root.to_string_lossy();
+    let workspaces = match agent_dir::list_workspaces() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::debug!("Failed to list workspaces: {e:#}");
+            return Vec::new();
+        }
+    };
+
+    let mut results = Vec::new();
+    for (_dir_name, ws_dir, state) in &workspaces {
+        let Some(state) = state else { continue };
+
+        // Check if this workspace is for our repo (source path or source_dirs)
+        let matches = state.source == repo_str
+            || state
+                .source_dirs
+                .iter()
+                .any(|d| d.to_string_lossy() == repo_str);
+        if !matches {
+            continue;
+        }
+
+        let short_name = strip_pod_prefix(&state.pod_name).to_string();
+
+        // Count commits in agent workspace
+        let repos = agent_dir::find_git_repos_in_dir(ws_dir);
+        let commit_count: usize = repos
+            .iter()
+            .filter_map(|(_, rp)| {
+                let output = ProcessCommand::new("git")
+                    .arg("-C")
+                    .arg(rp)
+                    .args(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"])
+                    .output()
+                    .ok()?;
+                if output.status.success() {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                } else {
+                    None
+                }
+            })
+            .sum();
+
+        // Format age from created timestamp
+        let age_display = format_relative_time(&state.created);
+
+        results.push(RepoWorkspaceInfo {
+            short_name,
+            completion_status: state.completion_status.clone(),
+            commit_count,
+            age_display,
+        });
+    }
+    results
+}
+
+/// Format an RFC 3339 timestamp as a human-readable relative time.
+fn format_relative_time(rfc3339: &str) -> String {
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let now = chrono::Utc::now();
+    let elapsed = now.signed_duration_since(ts);
+
+    if elapsed.num_seconds() < 60 {
+        "just now".to_string()
+    } else if elapsed.num_minutes() < 60 {
+        let m = elapsed.num_minutes();
+        format!("{m} min ago")
+    } else if elapsed.num_hours() < 24 {
+        let h = elapsed.num_hours();
+        format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
+    } else {
+        let d = elapsed.num_days();
+        if d == 1 {
+            "yesterday".to_string()
+        } else {
+            format!("{d} days ago")
+        }
+    }
+}
+
+/// Information about a harvested devaipod branch.
+struct RepoBranchInfo {
+    ref_name: String,
+    ahead: usize,
+    base_branch: String,
+    push_status: RepoPushStatus,
+}
+
+enum RepoPushStatus {
+    NotPushed,
+    Pushed(String),
+}
+
+/// PR metadata from `gh pr list`.
+#[derive(Debug, Clone)]
+struct RepoPrInfo {
+    number: u64,
+    title: String,
+    state: String,
+    draft: bool,
+    head_ref_name: String,
+}
+
+impl RepoPrInfo {
+    fn state_display(&self) -> String {
+        if self.draft {
+            "draft".to_string()
+        } else {
+            self.state.to_lowercase()
+        }
+    }
+}
+
+/// List all `devaipod/*` remote-tracking branches in the current repo.
+fn find_devaipod_branches() -> Vec<RepoBranchInfo> {
+    let output = match ProcessCommand::new("git")
+        .args(["branch", "-r", "--list", "devaipod/*"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let branches_str = String::from_utf8_lossy(&output.stdout);
+    let branch_refs: Vec<String> = branches_str
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.contains("->"))
+        .collect();
+
+    if branch_refs.is_empty() {
+        return Vec::new();
+    }
+
+    let base_branch = detect_default_branch();
+
+    branch_refs
+        .into_iter()
+        .map(|ref_name| {
+            let range = format!("{}..{}", base_branch, ref_name);
+            let ahead: usize = ProcessCommand::new("git")
+                .args(["rev-list", "--count", &range])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+                .unwrap_or(0);
+
+            let push_status = check_push_status(&ref_name);
+
+            RepoBranchInfo {
+                ref_name,
+                ahead,
+                base_branch: base_branch.clone(),
+                push_status,
+            }
+        })
+        .collect()
+}
+
+/// Detect whether the repo uses `main` or `master` as default branch.
+fn detect_default_branch() -> String {
+    for branch in ["main", "master"] {
+        let result = ProcessCommand::new("git")
+            .args(["rev-parse", "--verify", branch])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if result.is_ok_and(|s| s.success()) {
+            return branch.to_string();
+        }
+    }
+    "HEAD".to_string()
+}
+
+/// Check if a devaipod remote-tracking branch has a corresponding `origin/` ref.
+fn check_push_status(devaipod_ref: &str) -> RepoPushStatus {
+    // devaipod_ref looks like "devaipod/<workspace>/<branch>"
+    // We check if origin has a matching ref.
+    let parts: Vec<&str> = devaipod_ref.splitn(3, '/').collect();
+    if parts.len() >= 3 {
+        // Try origin/<workspace>/<branch>
+        let full_branch = format!("{}/{}", parts[1], parts[2]);
+        let origin_ref = format!("origin/{}", full_branch);
+        let result = ProcessCommand::new("git")
+            .args(["rev-parse", "--verify", &origin_ref])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if result.is_ok_and(|s| s.success()) {
+            return RepoPushStatus::Pushed(origin_ref);
+        }
+        // Try just origin/<branch> (the branch part only)
+        let simple_ref = format!("origin/{}", parts[2]);
+        let result = ProcessCommand::new("git")
+            .args(["rev-parse", "--verify", &simple_ref])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if result.is_ok_and(|s| s.success()) {
+            return RepoPushStatus::Pushed(simple_ref);
+        }
+    }
+    RepoPushStatus::NotPushed
+}
+
+/// List open PRs for the current repo via `gh pr list` (best effort).
+fn list_prs_for_repo() -> Vec<RepoPrInfo> {
+    let output = ProcessCommand::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--json",
+            "number,title,state,headRefName,isDraft",
+            "--limit",
+            "50",
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+
+    #[derive(serde::Deserialize)]
+    struct GhPr {
+        number: u64,
+        title: String,
+        state: String,
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+    }
+
+    match serde_json::from_str::<Vec<GhPr>>(&json_str) {
+        Ok(prs) => prs
+            .into_iter()
+            .map(|p| RepoPrInfo {
+                number: p.number,
+                title: p.title,
+                state: p.state,
+                draft: p.is_draft,
+                head_ref_name: p.head_ref_name,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Match a devaipod remote ref to a PR by branch name.
+fn match_pr<'a>(ref_name: &str, prs: &'a [RepoPrInfo]) -> Option<&'a RepoPrInfo> {
+    let parts: Vec<&str> = ref_name.splitn(3, '/').collect();
+    if parts.len() >= 3 {
+        let branch_suffix = parts[2]; // e.g., "devaipod/fix-auth" or "main"
+        for pr in prs {
+            if pr.head_ref_name == branch_suffix
+                || pr.head_ref_name.ends_with(branch_suffix)
+                || branch_suffix.ends_with(&pr.head_ref_name)
+            {
+                return Some(pr);
+            }
+        }
+    }
+    None
 }
 
 /// Get or set the session title for a pod
