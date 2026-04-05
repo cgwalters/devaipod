@@ -197,6 +197,11 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
+/// Strip the `devaipod-` prefix from a pod name to get the short workspace name.
+fn strip_pod_prefix(name: &str) -> &str {
+    name.strip_prefix("devaipod-").unwrap_or(name)
+}
+
 /// Normalize pod name: ensure it has the "devaipod-" prefix.
 fn normalize_pod_name(name: &str) -> String {
     if name.starts_with("devaipod-") {
@@ -1511,10 +1516,7 @@ async fn run_workspace(
     Json(req): Json<RunRequest>,
 ) -> Result<Json<RunResponse>, StatusCode> {
     let pod_name = compute_pod_name(&req);
-    let short_name = pod_name
-        .strip_prefix("devaipod-")
-        .unwrap_or(&pod_name)
-        .to_string();
+    let short_name = strip_pod_prefix(&pod_name).to_string();
 
     let mut cmd = tokio::process::Command::new(self_exe());
     cmd.arg("run");
@@ -1876,7 +1878,7 @@ async fn recreate_workspace(
         ));
     }
 
-    let short_name = pod_name.strip_prefix("devaipod-").unwrap_or(&pod_name);
+    let short_name = strip_pod_prefix(&pod_name);
     Ok(Json(RunResponse {
         success: true,
         workspace: short_name.to_string(),
@@ -2131,6 +2133,7 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
 
     let mut result = Vec::with_capacity(tasks.len());
     let mut cache_changed = false;
+    let mut newly_done_pods: Vec<String> = Vec::new();
 
     {
         let mut psc = state.pod_state_cache.write().await;
@@ -2154,6 +2157,13 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
                     let old = psc.insert(pod.name.clone(), new_cached.clone());
                     if old.as_ref() != Some(&new_cached) {
                         cache_changed = true;
+                    }
+                    // Detect completion_status transition to "done"
+                    let was_done =
+                        old.as_ref().and_then(|o| o.completion_status.as_deref()) == Some("done");
+                    let is_done = new_cached.completion_status.as_deref() == Some("done");
+                    if is_done && !was_done {
+                        newly_done_pods.push(pod.name.clone());
                     }
                     (Some(status), ts)
                 } else {
@@ -2202,6 +2212,27 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
         let cache = state.pod_state_cache.clone();
         tokio::spawn(async move {
             save_pod_state_cache(&cache).await;
+        });
+    }
+
+    // Auto-harvest: when a pod transitions to "done", fetch its commits
+    // into the source repo in the background. Each pod is harvested at most
+    // once per completion (we only fire when the cached status changes).
+    for pod_name in newly_done_pods {
+        tokio::task::spawn_blocking(move || match harvest_agent_commits(&pod_name) {
+            Ok(result) => {
+                for repo in &result.repos {
+                    tracing::info!(
+                        "Auto-harvested {} branch(es) from {} into {}",
+                        repo.branches.len(),
+                        repo.repo_name,
+                        repo.target_repo
+                    );
+                }
+            }
+            Err((_, msg)) => {
+                tracing::debug!("Auto-harvest skipped for {pod_name}: {msg}");
+            }
         });
     }
 
@@ -2578,12 +2609,7 @@ fn extract_workspace_name(output: &str) -> Option<String> {
                 .unwrap_or(rest.len());
             let pod_name = &rest[..end];
             // Strip the prefix and return
-            return Some(
-                pod_name
-                    .strip_prefix("devaipod-")
-                    .unwrap_or(pod_name)
-                    .to_string(),
-            );
+            return Some(strip_pod_prefix(pod_name).to_string());
         }
     }
     None
@@ -2729,30 +2755,32 @@ struct AgentDiffResponse {
     is_stat: bool,
 }
 
-/// Find a git repo inside `dir`, checking `dir` itself and then one level of
-/// subdirectories. When multiple subdirectories contain a repo, the most
-/// recently modified one wins (same heuristic as `find_agent_git_repo` in
-/// `main.rs`).
+/// Per-repo diff data for multi-repo workspaces.
+#[derive(Debug, Serialize)]
+struct RepoDiffResponse {
+    /// Repository name (directory name, e.g. "devaipod" or "service-gator")
+    repo_name: String,
+    /// The diff data for this repo
+    #[serde(flatten)]
+    diff: AgentDiffResponse,
+}
+
+/// Response for multi-repo diff endpoint.
+#[derive(Debug, Serialize)]
+struct MultiRepoDiffResponse {
+    /// Diff data for each git repo in the workspace
+    repos: Vec<RepoDiffResponse>,
+}
+
+/// Convenience wrapper: find a single git repo inside `dir`.
+///
+/// Returns the first repo found by [`crate::agent_dir::find_git_repos_in_dir`],
+/// or `None` if no repos exist.
 fn find_git_repo_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if dir.join(".git").exists() {
-        return Some(dir.to_path_buf());
-    }
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && path.join(".git").exists() {
-            let mtime = path
-                .join(".git")
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
-                best = Some((path, mtime));
-            }
-        }
-    }
-    best.map(|(p, _)| p)
+    crate::agent_dir::find_git_repos_in_dir(dir)
+        .into_iter()
+        .next()
+        .map(|(_, p)| p)
 }
 
 /// Run a git command in `repo` and return stdout, or `None` on failure
@@ -2772,47 +2800,6 @@ fn run_git(repo: &std::path::Path, args: &[&str]) -> Option<String> {
     }
 }
 
-/// Run a git command inside a container via `podman exec`, returning stdout
-/// or `None` on failure. The `repo_path` is the path *inside* the container.
-fn run_git_in_container(container: &str, repo_path: &str, args: &[&str]) -> Option<String> {
-    let mut cmd = std::process::Command::new("podman");
-    cmd.args(["exec", container, "git", "-C", repo_path]);
-    cmd.args(args);
-    let output = cmd.output().ok()?;
-    if output.status.success() {
-        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
-    } else {
-        None
-    }
-}
-
-/// Find the git workspace path inside a container. The agent workspace is at
-/// `/workspaces/{project_name}`. Returns the first subdirectory of
-/// `/workspaces/` that contains a `.git` directory.
-fn find_workspace_in_container(container: &str) -> Option<String> {
-    let output = std::process::Command::new("podman")
-        .args(["exec", container, "ls", "/workspaces/"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let listing = String::from_utf8_lossy(&output.stdout);
-    for dir in listing.lines() {
-        let dir = dir.trim();
-        if dir.is_empty() || dir.contains('/') || dir.contains('\0') || dir == ".." {
-            continue;
-        }
-        let path = format!("/workspaces/{dir}");
-        // Check if it's a git repo
-        if run_git_in_container(container, &path, &["rev-parse", "--git-dir"]).is_some() {
-            return Some(path);
-        }
-    }
-    None
-}
-
 /// Resolve the base ref to diff against. Tries `origin/HEAD`, then
 /// `origin/main`, `origin/master`, then the first `origin/*` branch.
 fn resolve_origin_ref(repo: &std::path::Path) -> Option<String> {
@@ -2828,37 +2815,6 @@ fn resolve_origin_ref(repo: &std::path::Path) -> Option<String> {
     }
     // Fall back to the first origin/* branch
     let branches = run_git(repo, &["branch", "-r", "--list", "origin/*"])?;
-    branches
-        .lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty() && !l.contains("->"))
-        .map(|s| s.to_string())
-}
-
-/// Resolve the base ref to diff against, running git inside a container.
-fn resolve_origin_ref_in_container(container: &str, repo_path: &str) -> Option<String> {
-    if run_git_in_container(
-        container,
-        repo_path,
-        &["rev-parse", "--verify", "origin/HEAD"],
-    )
-    .is_some()
-    {
-        return Some("origin/HEAD".to_string());
-    }
-    for branch in ["main", "master"] {
-        let refname = format!("origin/{branch}");
-        if run_git_in_container(container, repo_path, &["rev-parse", "--verify", &refname])
-            .is_some()
-        {
-            return Some(refname);
-        }
-    }
-    let branches = run_git_in_container(
-        container,
-        repo_path,
-        &["branch", "-r", "--list", "origin/*"],
-    )?;
     branches
         .lines()
         .map(|l| l.trim())
@@ -2939,73 +2895,10 @@ fn diff_from_local_repo(
     })
 }
 
-/// Build an `AgentDiffResponse` by running git inside a container via
-/// `podman exec`. Used for volume-backed workspaces where the control
-/// plane cannot access the filesystem directly.
-fn diff_via_podman_exec(
-    container: &str,
-    use_stat: bool,
-) -> Result<AgentDiffResponse, (StatusCode, String)> {
-    let repo_path = find_workspace_in_container(container).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!(
-                "No git workspace found in container '{container}'. \
-                 The agent container may not be running."
-            ),
-        )
-    })?;
-
-    let branch = run_git_in_container(container, &repo_path, &["symbolic-ref", "--short", "HEAD"])
-        .unwrap_or_else(|| "HEAD".to_string());
-
-    let origin_ref = match resolve_origin_ref_in_container(container, &repo_path) {
-        Some(r) => r,
-        None => {
-            return Ok(AgentDiffResponse {
-                branch,
-                commit_count: 0,
-                commits: vec![],
-                diff: String::new(),
-                is_stat: use_stat,
-            });
-        }
-    };
-
-    let range = format!("{origin_ref}..HEAD");
-    let commit_count: usize =
-        run_git_in_container(container, &repo_path, &["rev-list", "--count", &range])
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-    let format_str = "%H%x00%s%x00%an%x00%aI";
-    let format_arg = format!("--format={format_str}");
-    let log_output = run_git_in_container(container, &repo_path, &["log", &format_arg, &range])
-        .unwrap_or_default();
-    let commits = parse_commit_log(&log_output);
-
-    let diff = if use_stat {
-        run_git_in_container(container, &repo_path, &["diff", "--stat", &range])
-    } else {
-        run_git_in_container(container, &repo_path, &["diff", &range])
-    }
-    .unwrap_or_default();
-
-    Ok(AgentDiffResponse {
-        branch,
-        commit_count,
-        commits,
-        diff,
-        is_stat: use_stat,
-    })
-}
-
 /// `GET /api/devaipod/pods/{name}/diff`
 ///
 /// Returns the agent's git diff compared to the origin ref, plus commit
-/// metadata. For bind-mount workspaces, runs git directly on the host
-/// filesystem. For volume-backed workspaces (remote-URL sources), falls
-/// back to `podman exec` inside the agent container.
+/// metadata. Reads the agent's git repo from the host filesystem.
 async fn agent_diff(
     Path(name): Path<String>,
     Query(params): Query<DiffQueryParams>,
@@ -3016,21 +2909,22 @@ async fn agent_diff(
     // All git operations are blocking I/O; run on the blocking pool.
     let result =
         tokio::task::spawn_blocking(move || -> Result<AgentDiffResponse, (StatusCode, String)> {
-            // Try the host-side bind-mount directory first (local-path sources).
-            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).ok();
-            let host_repo = agent_dir
-                .as_ref()
-                .filter(|d| d.exists())
-                .and_then(|d| find_git_repo_in_dir(d));
-
-            if let Some(repo_path) = host_repo {
-                return diff_from_local_repo(&repo_path, use_stat);
-            }
-
-            // Fall back to podman exec inside the agent container (volume-backed
-            // workspaces from remote-URL sources).
-            let container = format!("{pod_name}-agent");
-            diff_via_podman_exec(&container, use_stat)
+            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).map_err(|e| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Failed to resolve agent directory for pod '{pod_name}': {e}"),
+                )
+            })?;
+            let repo_path = find_git_repo_in_dir(&agent_dir).ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "No git workspace found in agent directory '{}'",
+                        agent_dir.display()
+                    ),
+                )
+            })?;
+            diff_from_local_repo(&repo_path, use_stat)
         })
         .await
         .map_err(|e| {
@@ -3042,6 +2936,70 @@ async fn agent_diff(
                 }),
             )
         })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
+}
+
+/// `GET /api/devaipod/pods/{name}/diffs`
+///
+/// Returns diffs for ALL git repos in the agent's workspace. For single-repo
+/// workspaces this returns a single entry; for multi-repo workspaces (created
+/// with `--source-dir`) each repo gets its own entry.
+async fn agent_diffs(
+    Path(name): Path<String>,
+    Query(params): Query<DiffQueryParams>,
+) -> Result<Json<MultiRepoDiffResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+    let use_stat = params.stat.unwrap_or(false);
+
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<MultiRepoDiffResponse, (StatusCode, String)> {
+            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).map_err(|e| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Failed to resolve agent directory for pod '{pod_name}': {e}"),
+                )
+            })?;
+            let repos = crate::agent_dir::find_git_repos_in_dir(&agent_dir);
+            if repos.is_empty() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "No git repos found in agent directory '{}'",
+                        agent_dir.display()
+                    ),
+                ));
+            }
+            let mut repo_diffs = Vec::new();
+            for (repo_name, repo_path) in repos {
+                match diff_from_local_repo(&repo_path, use_stat) {
+                    Ok(diff) => repo_diffs.push(RepoDiffResponse { repo_name, diff }),
+                    Err((code, msg)) => {
+                        tracing::warn!(
+                            "Failed to get diff for repo {}: {} {}",
+                            repo_name,
+                            code,
+                            msg
+                        );
+                        // Skip repos that fail (e.g., no commits yet)
+                    }
+                }
+            }
+            Ok(MultiRepoDiffResponse { repos: repo_diffs })
+        },
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("spawn_blocking panicked: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                error: "Internal error".to_string(),
+            }),
+        )
+    })?;
 
     result
         .map(Json)
@@ -3689,10 +3647,7 @@ async fn run_devcontainer(
     Json(req): Json<DevcontainerRunRequest>,
 ) -> Result<Json<RunResponse>, StatusCode> {
     let pod_name = compute_devcontainer_pod_name(&req);
-    let short_name = pod_name
-        .strip_prefix("devaipod-")
-        .unwrap_or(&pod_name)
-        .to_string();
+    let short_name = strip_pod_prefix(&pod_name).to_string();
 
     let mut cmd = tokio::process::Command::new(self_exe());
     cmd.args(["devcontainer", "run"]);
@@ -3916,11 +3871,7 @@ async fn control_plane(State(state): State<Arc<AppState>>) -> Json<ControlPlaneR
             .unwrap_or_else(|| "unknown".to_string());
 
         let is_running = pod.status.eq_ignore_ascii_case("running");
-        let short_name = pod
-            .name
-            .strip_prefix("devaipod-")
-            .unwrap_or(&pod.name)
-            .to_string();
+        let short_name = strip_pod_prefix(&pod.name).to_string();
 
         let group = repo_map.entry(repo.clone()).or_insert_with(|| RepoGroup {
             repo: repo.clone(),
@@ -3983,6 +3934,260 @@ async fn control_plane(State(state): State<Arc<AppState>>) -> Json<ControlPlaneR
     });
 
     Json(ControlPlaneResponse { repos })
+}
+
+// =============================================================================
+// Harvest endpoint — fetch agent commits into the source repo
+// =============================================================================
+
+/// A single repo that was harvested.
+#[derive(Debug, Serialize)]
+struct HarvestedRepo {
+    repo_name: String,
+    target_repo: String,
+    remote_name: String,
+    branches: Vec<String>,
+}
+
+/// Result of a harvest operation.
+#[derive(Debug, Serialize)]
+struct HarvestResult {
+    repos: Vec<HarvestedRepo>,
+}
+
+/// Harvest agent commits by fetching them into the source repo.
+///
+/// Reads the workspace state to find the source repo path, then adds/updates
+/// a git remote named `devaipod/<short_name>` in the source repo and runs
+/// `git fetch` to bring agent branches into the user's repo.
+fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, String)> {
+    let agent_dir = crate::agent_dir::agent_dir_container_path(pod_name)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Agent dir not found: {e}")))?;
+
+    // Load workspace state to find source path
+    let state = crate::agent_dir::WorkspaceState::load(&agent_dir)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load workspace state: {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "No workspace state file found".to_string(),
+            )
+        })?;
+
+    // Only harvest when source is a local path (not a URL)
+    let source_path = PathBuf::from(&state.source);
+    if !source_path.exists() || !source_path.join(".git").exists() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Source '{}' is not a local git repo (remote sources can't be auto-harvested)",
+                state.source
+            ),
+        ));
+    }
+
+    // Find agent git repos
+    let repos = crate::agent_dir::find_git_repos_in_dir(&agent_dir);
+    if repos.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "No git repos in agent workspace".to_string(),
+        ));
+    }
+
+    let short_name = strip_pod_prefix(pod_name);
+    let mut harvested = Vec::new();
+
+    for (repo_name, repo_path) in &repos {
+        // Check if HEAD has advanced since last harvest
+        let current_head = run_git(repo_path, &["rev-parse", "HEAD"]);
+        if let Some(ref head) = current_head
+            && let Some(last) = state.last_harvested.get(repo_name)
+            && last == head
+        {
+            tracing::debug!("Skipping harvest for {repo_name}: HEAD unchanged at {head}");
+            continue;
+        }
+
+        // Determine which source repo to fetch into.
+        // For single-repo: use state.source directly.
+        // For multi-repo: try to find a matching source_dirs entry.
+        let target_repo = if repos.len() == 1 {
+            source_path.clone()
+        } else {
+            state
+                .source_dirs
+                .iter()
+                .find(|d| {
+                    d.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n == repo_name)
+                })
+                .cloned()
+                .unwrap_or_else(|| source_path.clone())
+        };
+
+        if !target_repo.join(".git").exists() {
+            tracing::debug!(
+                "Skipping harvest for {repo_name}: target {:?} is not a git repo",
+                target_repo
+            );
+            continue;
+        }
+
+        let remote_name = if repos.len() == 1 {
+            format!("devaipod/{short_name}")
+        } else {
+            format!("devaipod/{short_name}/{repo_name}")
+        };
+
+        let agent_repo_str = match repo_path.to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+
+        // Add or update the remote in the target repo
+        let add_result = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&target_repo)
+            .args(["remote", "add", &remote_name, &agent_repo_str])
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        match add_result {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("already exists") {
+                    match std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&target_repo)
+                        .args(["remote", "set-url", &remote_name, &agent_repo_str])
+                        .output()
+                    {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            tracing::warn!(
+                                "Failed to update remote '{}' URL: {}",
+                                remote_name,
+                                stderr.trim()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to run git remote set-url: {e}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Run git fetch, filtering alternates warnings from --shared clones
+        let fetch_result = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&target_repo)
+            .args(["fetch", &remote_name])
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        match fetch_result {
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let errors: Vec<&str> = stderr
+                    .lines()
+                    .filter(|l| !l.contains("unable to normalize alternate"))
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+
+                if output.status.success() || errors.is_empty() {
+                    // Get the branches that were fetched
+                    let branch_output = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&target_repo)
+                        .args(["branch", "-r", "--list", &format!("{remote_name}/*")])
+                        .output();
+
+                    let branches: Vec<String> = branch_output
+                        .ok()
+                        .map(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .map(|l| l.trim().to_string())
+                                .filter(|l| !l.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    harvested.push(HarvestedRepo {
+                        repo_name: repo_name.to_string(),
+                        target_repo: target_repo.display().to_string(),
+                        remote_name: remote_name.clone(),
+                        branches,
+                    });
+                } else {
+                    tracing::warn!(
+                        "Failed to fetch {repo_name} into {}: {}",
+                        target_repo.display(),
+                        errors.join("; ")
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to run git fetch for {repo_name}: {e}");
+            }
+        }
+    }
+
+    // Update workspace state with the harvested HEAD SHAs
+    if !harvested.is_empty()
+        && let Ok(Some(mut ws_state)) = crate::agent_dir::WorkspaceState::load(&agent_dir)
+    {
+        for repo in &harvested {
+            // Read HEAD from the agent repo
+            for (name, agent_path) in &repos {
+                if name == &repo.repo_name
+                    && let Some(sha) = run_git(agent_path, &["rev-parse", "HEAD"])
+                {
+                    ws_state.last_harvested.insert(repo.repo_name.clone(), sha);
+                }
+            }
+        }
+        if let Err(e) = ws_state.save(&agent_dir) {
+            tracing::warn!("Failed to update workspace state after harvest: {e}");
+        }
+    }
+
+    Ok(HarvestResult { repos: harvested })
+}
+
+/// `POST /api/devaipod/pods/{name}/fetch`
+///
+/// Harvest agent commits by fetching them into the source repo.
+async fn harvest_commits(
+    Path(name): Path<String>,
+) -> Result<Json<HarvestResult>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+
+    let result = tokio::task::spawn_blocking(move || harvest_agent_commits(&pod_name))
+        .await
+        .map_err(|e| {
+            tracing::error!("spawn_blocking panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: "Internal error".to_string(),
+                }),
+            )
+        })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
 }
 
 /// Run the web server
@@ -4089,7 +4294,10 @@ fn build_app_with_cache(
             get(get_pod_completion_status).put(update_pod_completion_status),
         )
         .route("/devaipod/pods/{name}/diff", get(agent_diff))
+        .route("/devaipod/pods/{name}/diffs", get(agent_diffs))
         .route("/devaipod/pods/{name}/review", post(submit_review))
+        // Harvest agent commits into the source repo
+        .route("/devaipod/pods/{name}/fetch", post(harvest_commits))
         // Lightweight endpoint for frontend cookie refresh (every 4h).
         // The auth_middleware already re-issues the cookie on every
         // authenticated request, so this handler is a no-op — its only
@@ -5240,5 +5448,35 @@ mod tests {
         let msg = super::format_review_message(&req);
         assert!(msg.contains("Looks good overall"));
         assert!(!msg.contains("Inline Comments"));
+    }
+
+    #[test]
+    fn test_harvest_result_serialization() {
+        let result = HarvestResult {
+            repos: vec![HarvestedRepo {
+                repo_name: "devaipod".to_string(),
+                target_repo: "/home/user/src/devaipod".to_string(),
+                remote_name: "devaipod/my-workspace".to_string(),
+                branches: vec!["devaipod/my-workspace/devaipod/fix-auth".to_string()],
+            }],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("devaipod"));
+        assert!(json.contains("fix-auth"));
+
+        // Verify field names
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["repos"][0]["repo_name"].is_string());
+        assert!(parsed["repos"][0]["target_repo"].is_string());
+        assert!(parsed["repos"][0]["remote_name"].is_string());
+        assert!(parsed["repos"][0]["branches"].is_array());
+    }
+
+    #[test]
+    fn test_harvest_result_empty() {
+        let result = HarvestResult { repos: vec![] };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["repos"].as_array().unwrap().len(), 0);
     }
 }

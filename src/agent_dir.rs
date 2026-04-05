@@ -77,6 +77,40 @@ pub fn remove_agent_dir(pod_name: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Git repo discovery ───────────────────────────────────────────────
+
+/// Find all git repositories inside a directory.
+///
+/// Checks `dir` itself first, then scans one level of subdirectories.
+/// Returns `(repo_name, repo_path)` pairs sorted by name.
+pub fn find_git_repos_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
+    if dir.join(".git").exists() {
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        return vec![(name, dir.to_path_buf())];
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    let mut repos: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            let p = e.path();
+            p.is_dir() && p.join(".git").exists()
+        })
+        .map(|e| {
+            let name = e.file_name().to_str().unwrap_or("unknown").to_string();
+            (name, e.path())
+        })
+        .collect();
+    repos.sort_by(|a, b| a.0.cmp(&b.0));
+    repos
+}
+
 // ── Workspace state file ─────────────────────────────────────────────
 
 /// Subdirectory inside each workspace for devaipod metadata.
@@ -121,6 +155,10 @@ pub struct WorkspaceState {
     /// Completion status: `"active"` or `"done"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_status: Option<String>,
+
+    /// SHA of the last harvested HEAD commit per repo, if any.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub last_harvested: std::collections::HashMap<String, String>,
 }
 
 impl WorkspaceState {
@@ -403,6 +441,7 @@ mod tests {
             task: Some("fix the auth bug".into()),
             title: None,
             completion_status: None,
+            last_harvested: std::collections::HashMap::new(),
         };
 
         state.save(&ws_dir).unwrap();
@@ -450,6 +489,7 @@ mod tests {
             task: None,
             title: None,
             completion_status: None,
+            last_harvested: std::collections::HashMap::new(),
         };
 
         state.save(&ws_dir).unwrap();
@@ -467,6 +507,10 @@ mod tests {
         assert!(
             !raw.contains("source_dirs"),
             "empty source_dirs should be omitted"
+        );
+        assert!(
+            !raw.contains("last_harvested"),
+            "empty last_harvested should be omitted"
         );
     }
 
@@ -486,6 +530,7 @@ mod tests {
             task: Some("task a".into()),
             title: None,
             completion_status: None,
+            last_harvested: std::collections::HashMap::new(),
         };
         state1.save(&ws1).unwrap();
 
@@ -557,6 +602,40 @@ mod tests {
     }
 
     #[test]
+    fn test_workspace_state_with_harvest_info() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("devaipod-test-harvest");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let mut state = WorkspaceState {
+            pod_name: "devaipod-test-harvest".into(),
+            source: "/home/user/src/project".into(),
+            source_dirs: vec![],
+            created: "2026-04-04T12:00:00Z".into(),
+            last_active: None,
+            task: None,
+            title: None,
+            completion_status: None,
+            last_harvested: std::collections::HashMap::new(),
+        };
+
+        state
+            .last_harvested
+            .insert("project".into(), "abc123".into());
+        state.save(&ws_dir).unwrap();
+
+        let loaded = WorkspaceState::load(&ws_dir).unwrap().unwrap();
+        assert_eq!(loaded.last_harvested.get("project").unwrap(), "abc123");
+
+        // Verify it appears in the JSON when non-empty
+        let raw = std::fs::read_to_string(WorkspaceState::state_path(&ws_dir)).unwrap();
+        assert!(
+            raw.contains("last_harvested"),
+            "non-empty last_harvested should appear in JSON"
+        );
+    }
+
+    #[test]
     fn test_recent_source_truncation() {
         // Verify that MAX_RECENT_SOURCES caps the list
         let mut sources: Vec<RecentSource> = (0..60)
@@ -570,5 +649,44 @@ mod tests {
         sources.truncate(MAX_RECENT_SOURCES);
 
         assert_eq!(sources.len(), MAX_RECENT_SOURCES);
+    }
+
+    #[test]
+    fn test_find_git_repos_in_dir_multiple() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // Create two "repos" (directories with .git)
+        let repo_a = temp.path().join("alpha");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        let repo_b = temp.path().join("beta");
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+        // Create a non-repo directory
+        std::fs::create_dir_all(temp.path().join("not-a-repo")).unwrap();
+
+        let repos = find_git_repos_in_dir(temp.path());
+        assert_eq!(repos.len(), 2);
+        // Should be sorted by name
+        assert_eq!(repos[0].0, "alpha");
+        assert_eq!(repos[1].0, "beta");
+        assert!(repos[0].1.ends_with("alpha"));
+        assert!(repos[1].1.ends_with("beta"));
+    }
+
+    #[test]
+    fn test_find_git_repos_in_dir_single() {
+        let temp = tempfile::tempdir().unwrap();
+        // Dir itself is a repo
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+
+        let repos = find_git_repos_in_dir(temp.path());
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].1, temp.path());
+    }
+
+    #[test]
+    fn test_find_git_repos_in_dir_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let repos = find_git_repos_in_dir(temp.path());
+        assert!(repos.is_empty());
     }
 }
