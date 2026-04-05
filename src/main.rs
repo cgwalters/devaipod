@@ -6608,6 +6608,25 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
 ///
 /// This stops and removes the containers but keeps the volumes intact,
 /// then recreates the containers with the new/updated image.
+/// Check if a devcontainer config exists in a repo directory.
+///
+/// Handles PermissionDenied (container subuid ownership) gracefully.
+fn check_devcontainer_exists(repo_dir: &std::path::Path) -> bool {
+    let dc_dir = repo_dir.join(".devcontainer");
+    let dc_file = repo_dir.join("devcontainer.json");
+    match std::fs::metadata(&dc_dir) {
+        Ok(m) if m.is_dir() => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
+        _ => {}
+    }
+    match std::fs::metadata(&dc_file) {
+        Ok(m) if m.is_file() => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
+        _ => {}
+    }
+    false
+}
+
 async fn cmd_rebuild(
     config: &config::Config,
     pod_name: &str,
@@ -6667,20 +6686,21 @@ async fn cmd_rebuild(
 
     let workspace_dir = format!("/workspaces/{}", repo_name);
 
-    // Try reading from agent workspace host directory first (workspace-v2)
+    // Try reading from agent workspace host directory first (workspace-v2).
+    // Use agent_dir_container_path for existence checks (visible from our
+    // process), but agent_dir_host_path for the podman bind mount source
+    // (podman resolves paths on the host).
     let (exit_code, raw_output) = {
-        let agent_ws = agent_dir::agent_dir_host_path(pod_name)?;
-        let agent_repo_dir = agent_ws.join(&repo_name);
-        if agent_repo_dir.join(".devcontainer").exists()
-            || agent_repo_dir.join("devcontainer.json").exists()
-        {
+        let agent_ws_container = agent_dir::agent_dir_container_path(pod_name)?;
+        let agent_repo_dir = agent_ws_container.join(&repo_name);
+        let has_devcontainer = check_devcontainer_exists(&agent_repo_dir);
+        if has_devcontainer {
+            let agent_ws_host = agent_dir::agent_dir_host_path(pod_name)?;
             tracing::info!(
                 "Reading devcontainer configuration from agent workspace at {}...",
-                agent_repo_dir.display()
+                agent_ws_host.display()
             );
-            // Run the same internals command but bind-mount the host dir
-            // instead of the workspace volume.
-            let host_path = agent_ws.display().to_string();
+            let host_path = agent_ws_host.display().to_string();
             podman
                 .run_init_container_with_output(
                     &self_image,
