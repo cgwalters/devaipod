@@ -575,6 +575,14 @@ impl PodGuard {
 
 impl Drop for PodGuard {
     fn drop(&mut self) {
+        let ws_base = std::env::var("DEVAIPOD_HOST_WORKDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share/devaipod/workspaces"))
+            })
+            .ok();
+
         for name in &self.names {
             // Best effort cleanup - remove pod which removes all containers in it
             let _ = Command::new("podman")
@@ -586,6 +594,17 @@ impl Drop for PodGuard {
                 let _ = Command::new("podman")
                     .args(["volume", "rm", "-f", &volume_name])
                     .output();
+            }
+            // Remove host-side workspace directory.
+            // Use `podman unshare` because files are owned by container subuids.
+            if let Some(ref base) = ws_base {
+                let ws_dir = base.join(name);
+                if ws_dir.exists() {
+                    let _ = Command::new("podman")
+                        .args(["unshare", "rm", "-rf"])
+                        .arg(&ws_dir)
+                        .output();
+                }
             }
         }
     }

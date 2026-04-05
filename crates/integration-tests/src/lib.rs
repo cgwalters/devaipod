@@ -51,8 +51,13 @@ pub const INTEGRATION_TEST_INSTANCE: &str = "integration-test";
 /// Name used for the shared integration test pod
 pub const SHARED_POD_NAME: &str = "devaipod-integration-shared";
 
-/// Volume suffixes created by devaipod pods (used for cleanup)
+/// Volume suffixes created by devaipod pods (used for cleanup).
+///
+/// Each pod creates a main workspace volume (`-workspace`) and an agent home
+/// volume (`-agent-home`).  When orchestration is enabled, worker volumes
+/// are also created.  Cleanup must remove all of these.
 pub const POD_VOLUME_SUFFIXES: &[&str] = &[
+    "-workspace",
     "-agent-home",
     "-agent-workspace",
     "-worker-home",
@@ -421,6 +426,27 @@ impl SharedFixture {
                 .args(["volume", "rm", "-f", &volume_name])
                 .output();
         }
+        // Also remove stale host-side workspace directory from previous runs.
+        // Use `podman unshare` because files may be owned by container subuids.
+        let ws_base = std::env::var("DEVAIPOD_HOST_WORKDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share/devaipod/workspaces"))
+            });
+        if let Ok(base) = ws_base {
+            let ws_dir = base.join(SHARED_POD_NAME);
+            if ws_dir.exists() {
+                tracing::info!(
+                    "Removing stale host workspace dir from previous run: {}",
+                    ws_dir.display()
+                );
+                let _ = Command::new("podman")
+                    .args(["unshare", "rm", "-rf"])
+                    .arg(&ws_dir)
+                    .output();
+            }
+        }
 
         // Create the shared pod
         // Note: We pass "integration-shared" since devaipod adds "devaipod-" prefix
@@ -562,6 +588,25 @@ impl SharedFixture {
             let _ = Command::new("podman")
                 .args(["volume", "rm", "-f", &volume_name])
                 .output();
+        }
+
+        // Remove host-side workspace directory (workspace-v2 bind mount).
+        // Must use `podman unshare` because files are owned by container subuids.
+        let ws_base = std::env::var("DEVAIPOD_HOST_WORKDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share/devaipod/workspaces"))
+            });
+        if let Ok(base) = ws_base {
+            let ws_dir = base.join(SHARED_POD_NAME);
+            if ws_dir.exists() {
+                tracing::info!("Removing host workspace dir: {}", ws_dir.display());
+                let _ = Command::new("podman")
+                    .args(["unshare", "rm", "-rf"])
+                    .arg(&ws_dir)
+                    .output();
+            }
         }
 
         tracing::info!("Shared fixture cleanup complete");

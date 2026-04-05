@@ -301,7 +301,18 @@ fn test_harness_completion_status_e2e() -> Result<()> {
     let cs_path = format!("/api/devaipod/pods/{short}/completion-status");
 
     // 1. GET default → "active"
-    let (status, body) = harness.get(&cs_path)?;
+    // The web server's pod cache may not have the new pod yet, so
+    // retry a few times if we get 502 (proxy error) or 404.
+    let (status, body) = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (s, b) = harness.get(&cs_path)?;
+            if s == 200 || std::time::Instant::now() > deadline {
+                break (s, b);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    };
     assert_eq!(status, 200, "GET completion-status: {body}");
     let json: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(
