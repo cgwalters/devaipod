@@ -3861,12 +3861,11 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
                 println!("  {}", branch);
             }
             // Suggest commands using the detected default branch
-            if let Ok(Some(default_branch)) = resolve_remote_default_branch(&remote_name) {
-                let ref_name = format!("{}/{}", remote_name, default_branch);
+            if let Ok(Some(full_ref)) = resolve_remote_default_ref(&remote_name) {
                 println!();
                 println!("To review agent changes:");
-                println!("  git log {}", ref_name);
-                println!("  git diff HEAD...{}", ref_name);
+                println!("  git log {}", full_ref);
+                println!("  git diff HEAD...{}", full_ref);
                 if repos.len() == 1 {
                     println!("  devaipod diff {}", short_name);
                 }
@@ -3877,52 +3876,60 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the default branch name for a remote.
+/// Resolve the default branch for a remote, returning the fully-qualified
+/// `refs/remotes/...` path to avoid ambiguity.
 ///
 /// Tries in order: the remote's symbolic HEAD, then `main`, then `master`,
 /// then falls back to the first available branch. Returns `None` if the remote
 /// has no branches.
-fn resolve_remote_default_branch(remote_name: &str) -> Result<Option<String>> {
+///
+/// Returns a fully-qualified ref like `refs/remotes/devaipod/ws/main` that
+/// git will resolve unambiguously even when the remote name contains slashes.
+fn resolve_remote_default_ref(remote_name: &str) -> Result<Option<String>> {
     // Try the remote's symbolic HEAD (set by `git clone` or `git remote set-head`)
-    let head_ref = format!("{}/HEAD", remote_name);
+    let head_ref = format!("refs/remotes/{}/HEAD", remote_name);
     let head_output = ProcessCommand::new("git")
-        .args(["symbolic-ref", &format!("refs/remotes/{}", head_ref)])
+        .args(["symbolic-ref", &head_ref])
         .output()
         .ok();
     if let Some(output) = head_output.filter(|o| o.status.success()) {
-        let target = String::from_utf8_lossy(&output.stdout);
-        // Output is like refs/remotes/devaipod/ws/main — extract the branch name
-        if let Some(branch) = target.trim().rsplit('/').next() {
-            return Ok(Some(branch.to_string()));
+        let target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !target.is_empty() {
+            return Ok(Some(target));
         }
     }
 
     // Try well-known branch names
     for branch in ["main", "master"] {
-        let ref_name = format!("{}/{}", remote_name, branch);
+        let ref_name = format!("refs/remotes/{}/{}", remote_name, branch);
         let verify = ProcessCommand::new("git")
             .args(["rev-parse", "--verify", &ref_name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
         if verify.is_ok_and(|s| s.success()) {
-            return Ok(Some(branch.to_string()));
+            return Ok(Some(ref_name));
         }
     }
 
-    // Fall back to the first available branch
+    // Fall back to the first available branch (skip HEAD symref)
     let branch_output = ProcessCommand::new("git")
-        .args(["branch", "-r", "--list", &format!("{}/*", remote_name)])
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/{}/", remote_name),
+        ])
         .output()
-        .context("Failed to list remote branches")?;
+        .context("Failed to list remote refs")?;
 
     if branch_output.status.success() {
-        let branches = String::from_utf8_lossy(&branch_output.stdout);
-        if let Some(first) = branches.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
-            // Branch is like "devaipod/ws/feat-branch" — strip the remote prefix
-            if let Some(branch) = first.strip_prefix(&format!("{}/", remote_name)) {
-                return Ok(Some(branch.to_string()));
-            }
+        let refs = String::from_utf8_lossy(&branch_output.stdout);
+        if let Some(first) = refs
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+        {
+            return Ok(Some(first.to_string()));
         }
     }
 
@@ -3939,14 +3946,13 @@ fn cmd_diff(pod_name: &str, stat: bool) -> Result<()> {
     let short_name = strip_pod_prefix(pod_name);
     let remote_name = format!("devaipod/{}", short_name);
 
-    // Find the remote's default branch: try HEAD, then main, then master,
-    // then fall back to the first available branch.
-    let remote_branch = resolve_remote_default_branch(&remote_name)?;
-    let Some(remote_branch) = remote_branch else {
+    // Find the remote's default branch using fully-qualified refs to avoid
+    // ambiguity (remote names with slashes can confuse git's ref resolution).
+    let remote_ref = resolve_remote_default_ref(&remote_name)?;
+    let Some(remote_ref) = remote_ref else {
         println!("No changes from agent yet.");
         return Ok(());
     };
-    let remote_ref = format!("{}/{}", remote_name, remote_branch);
 
     // Check if there are any commits beyond the merge base
     let merge_base = ProcessCommand::new("git")
@@ -4004,14 +4010,12 @@ fn cmd_apply(pod_name: &str, cherry_pick: bool) -> Result<()> {
     let short_name = strip_pod_prefix(pod_name);
     let remote_name = format!("devaipod/{}", short_name);
 
-    let default_branch = resolve_remote_default_branch(&remote_name)?.ok_or_else(|| {
+    let ref_name = resolve_remote_default_ref(&remote_name)?.ok_or_else(|| {
         color_eyre::eyre::eyre!(
             "No branches found for remote '{}'. The agent may not have made any commits.",
             remote_name
         )
     })?;
-
-    let ref_name = format!("{}/{}", remote_name, default_branch);
 
     // Count how many commits the agent is ahead
     let ahead_output = ProcessCommand::new("git")
@@ -4180,22 +4184,26 @@ fn cmd_push(pod_name: &str) -> Result<()> {
     let short_name = strip_pod_prefix(pod_name);
     let remote_name = format!("devaipod/{}", short_name);
 
-    let default_branch = resolve_remote_default_branch(&remote_name)?.ok_or_else(|| {
+    let full_ref = resolve_remote_default_ref(&remote_name)?.ok_or_else(|| {
         color_eyre::eyre::eyre!(
             "No branches found for remote '{}'. The agent may not have made any commits.",
             remote_name
         )
     })?;
 
-    let ref_name = format!("{}/{}", remote_name, default_branch);
+    // Extract the branch name from the full ref for the push target.
+    // e.g., "refs/remotes/devaipod/ws/devaipod/fix-auth" → "devaipod/fix-auth"
+    let push_branch = full_ref
+        .strip_prefix(&format!("refs/remotes/{}/", remote_name))
+        .unwrap_or(&full_ref);
 
-    println!("Pushing {} to origin/{}...", ref_name, default_branch);
+    println!("Pushing {} to origin/{}...", full_ref, push_branch);
 
     let result = ProcessCommand::new("git")
         .args([
             "push",
             "origin",
-            &format!("{}:{}", ref_name, default_branch),
+            &format!("{}:refs/heads/{}", full_ref, push_branch),
         ])
         .status()
         .context("Failed to run git push")?;
@@ -4204,7 +4212,7 @@ fn cmd_push(pod_name: &str) -> Result<()> {
         bail!("Push failed. Check your permissions and try again.");
     }
 
-    println!("Pushed to origin/{}", default_branch);
+    println!("Pushed to origin/{}", push_branch);
     Ok(())
 }
 
@@ -4220,20 +4228,23 @@ fn cmd_pr(pod_name: &str, draft: bool, title: Option<&str>) -> Result<()> {
     let short_name = strip_pod_prefix(pod_name);
     let remote_name = format!("devaipod/{}", short_name);
 
-    let default_branch = resolve_remote_default_branch(&remote_name)?.ok_or_else(|| {
+    let full_ref = resolve_remote_default_ref(&remote_name)?.ok_or_else(|| {
         color_eyre::eyre::eyre!(
             "No branches found for remote '{}'. The agent may not have made any commits.",
             remote_name
         )
     })?;
 
+    let push_branch = full_ref
+        .strip_prefix(&format!("refs/remotes/{}/", remote_name))
+        .unwrap_or(&full_ref);
+
     // Auto-generate title from commit log if not provided
     let pr_title = if let Some(t) = title {
         t.to_string()
     } else {
-        let ref_name = format!("{}/{}", remote_name, default_branch);
         let log_output = ProcessCommand::new("git")
-            .args(["log", "--format=%s", "-1", &ref_name])
+            .args(["log", "--format=%s", "-1", &full_ref])
             .output()
             .context("Failed to get commit message for PR title")?;
         String::from_utf8_lossy(&log_output.stdout)
@@ -4245,7 +4256,7 @@ fn cmd_pr(pod_name: &str, draft: bool, title: Option<&str>) -> Result<()> {
         "pr".to_string(),
         "create".to_string(),
         "--head".to_string(),
-        default_branch.clone(),
+        push_branch.to_string(),
         "--title".to_string(),
         pr_title,
     ];
@@ -4255,9 +4266,8 @@ fn cmd_pr(pod_name: &str, draft: bool, title: Option<&str>) -> Result<()> {
     }
 
     // Fill the body with the commit log
-    let ref_name = format!("{}/{}", remote_name, default_branch);
     let body_output = ProcessCommand::new("git")
-        .args(["log", "--format=- %s", &format!("HEAD..{}", ref_name)])
+        .args(["log", "--format=- %s", &format!("HEAD..{}", full_ref)])
         .output()
         .ok();
 
