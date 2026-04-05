@@ -301,9 +301,9 @@ fn test_harness_completion_status_e2e() -> Result<()> {
 
     let cs_path = format!("/api/devaipod/pods/{short}/completion-status");
 
-    // 1. GET default → "active"
+    // 1. GET initial status.
     // The web server needs time to discover the pod-api's published port
-    // via podman inspect. Retry with exponential backoff.
+    // via podman inspect. Retry until we get a 200.
     let (status, body) = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
@@ -322,13 +322,20 @@ fn test_harness_completion_status_e2e() -> Result<()> {
         );
     }
     let json: serde_json::Value = serde_json::from_str(&body)?;
-    assert_eq!(
-        json["status"].as_str(),
-        Some("active"),
-        "default should be 'active': {body}"
+    let initial_status = json["status"].as_str().unwrap_or("");
+    // The mock agent returns a completed message, so auto-completion may
+    // have already fired by the time we read. Accept either "active" or "done".
+    assert!(
+        initial_status == "active" || initial_status == "done",
+        "initial status should be 'active' or 'done' (auto-completion), got: {body}"
     );
 
-    // 2. PUT "done"
+    // 2. PUT "active" first to establish a known baseline, then test the
+    //    full PUT/GET cycle.
+    let (status, _) = harness.put(&cs_path, r#"{"status":"active"}"#)?;
+    assert_eq!(status, 200, "PUT active should succeed");
+
+    // 3. PUT "done"
     let (status, body) = harness.put(&cs_path, r#"{"status":"done"}"#)?;
     if status != 200 {
         // Collect debug info for the assertion message
@@ -352,7 +359,7 @@ fn test_harness_completion_status_e2e() -> Result<()> {
         );
     }
 
-    // 3. GET → "done"
+    // 4. GET → "done"
     let (status, body) = harness.get(&cs_path)?;
     assert_eq!(status, 200);
     let json: serde_json::Value = serde_json::from_str(&body)?;
@@ -362,7 +369,7 @@ fn test_harness_completion_status_e2e() -> Result<()> {
         "should be 'done' after PUT: {body}"
     );
 
-    // 4. Verify unified pod list reflects completion_status
+    // 5. Verify unified pod list reflects completion_status
     let (status, body) = harness.get("/api/devaipod/pods")?;
     assert_eq!(status, 200);
     let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
@@ -379,7 +386,7 @@ fn test_harness_completion_status_e2e() -> Result<()> {
         }
     }
 
-    // 5. Reset to active
+    // 6. Reset to active
     let (status, _) = harness.put(&cs_path, r#"{"status":"active"}"#)?;
     assert_eq!(status, 200, "reset to active should succeed");
 

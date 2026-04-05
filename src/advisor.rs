@@ -854,4 +854,84 @@ mod tests {
             proposal.created_at
         );
     }
+
+    #[test]
+    fn test_git_diff_from_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("diff-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Set up repo with initial commit on "main"
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "test@test.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("base.txt"), "base content").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        // Set up a bare origin and push to create origin/main
+        let origin = temp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-b", "main"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run_git(&repo, &["push", "-u", "origin", "main"]);
+
+        // Now make a local change: add a new file and commit
+        std::fs::write(repo.join("feature.txt"), "new feature").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "add feature"]);
+
+        let diff = git_diff_from_default(&repo);
+        assert!(
+            diff.contains("feature.txt"),
+            "diff should reference the changed file, got: {diff}"
+        );
+        assert!(
+            diff.contains("new feature"),
+            "diff should include the added content"
+        );
+    }
+
+    #[test]
+    fn test_git_diff_from_default_master_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("master-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Use "master" as the default branch — no "main" anywhere
+        run_git(&repo, &["init", "-b", "master"]);
+        run_git(&repo, &["config", "user.email", "test@test.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("old.txt"), "old content").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial on master"]);
+
+        // Set up bare origin with "master" branch
+        let origin = temp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--bare", "-b", "master"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run_git(&repo, &["push", "-u", "origin", "master"]);
+
+        // Create a local change
+        std::fs::write(repo.join("update.txt"), "updated stuff").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "add update"]);
+
+        let diff = git_diff_from_default(&repo);
+        assert!(
+            diff.contains("update.txt"),
+            "master fallback diff should reference the changed file, got: {diff}"
+        );
+        assert!(
+            diff.contains("updated stuff"),
+            "master fallback diff should include the content"
+        );
+    }
 }

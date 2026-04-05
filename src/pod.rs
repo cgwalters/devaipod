@@ -438,6 +438,16 @@ pub struct DevaipodPod {
     pub has_forwarded_ports: bool,
 }
 
+/// Check if a directory exists, treating PermissionDenied as "exists"
+/// (files owned by container subuids can't be stat'd but are present).
+fn check_dir_exists(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_dir(),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => true,
+        Err(_) => false,
+    }
+}
+
 impl DevaipodPod {
     /// Create a new pod with all containers
     ///
@@ -703,25 +713,38 @@ impl DevaipodPod {
         // direct access by review tools, diff, fetch, etc.
         crate::agent_dir::create_agent_dir(pod_name)?;
         let host_path = crate::agent_dir::agent_dir_host_path(pod_name)?;
-        // Check if the agent workspace already has content. The directory may
-        // be owned by container subuids (user namespace mapping), so we also
-        // accept a directory that exists but can't be stat'd (permission denied
-        // means files are present — an empty dir would be readable).
+        // Check if the agent workspace already has content. The cloned repo
+        // lives inside the agent dir (e.g. {agent_dir}/test-repo/.git), not at
+        // the agent dir root. Check for any .git directory at any depth (1 level
+        // deep). Also handle permission denied from container subuids.
         let has_content = crate::agent_dir::agent_dir_container_path(pod_name)
             .map(|p| {
-                let git_dir = p.join(".git");
-                match std::fs::metadata(&git_dir) {
-                    Ok(m) => m.is_dir(),
+                // First check for .git at root (single-repo workspace)
+                let root_git = p.join(".git");
+                if check_dir_exists(&root_git) {
+                    return true;
+                }
+                // Check one level deep (standard layout: {agent_dir}/{repo}/.git)
+                if let Ok(entries) = std::fs::read_dir(&p) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            if check_dir_exists(&entry.path().join(".git")) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // read_dir may fail with PermissionDenied if subuid-owned;
+                // in that case, the dir exists and has content.
+                match std::fs::read_dir(&p) {
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        // Permission denied means the .git dir exists but is owned
-                        // by container subuids — treat as existing content.
                         tracing::debug!(
-                            "Agent workspace .git exists but not readable (subuid): {}",
-                            git_dir.display()
+                            "Agent workspace not readable (subuid), assuming has content: {}",
+                            p.display()
                         );
                         true
                     }
-                    Err(_) => false,
+                    _ => false,
                 }
             })
             .unwrap_or(false);

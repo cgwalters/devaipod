@@ -508,4 +508,118 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["result"], json!({}));
     }
+
+    /// Helper: send a tools/call request and return the parsed JSON response.
+    async fn tools_call(tool_name: &str, arguments: Value) -> Value {
+        let app = mcp_router();
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "test",
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": arguments }
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_unknown_tool() {
+        let json = tools_call("this_tool_does_not_exist", json!({})).await;
+        assert_eq!(
+            json["result"]["isError"], true,
+            "unknown tool should set isError: true"
+        );
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Unknown tool"),
+            "expected 'Unknown tool' in error text, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_list_workspaces() {
+        let json = tools_call("list_workspaces", json!({})).await;
+        // Should succeed (isError false). The text content is a JSON array
+        // (possibly empty if no workspaces exist).
+        assert_eq!(
+            json["result"]["isError"], false,
+            "list_workspaces should succeed: {:?}",
+            json["result"]
+        );
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(text).expect("list_workspaces output should be a JSON array");
+        // It's fine if it's empty — the point is it returned valid JSON.
+        assert!(parsed.len() < 10000, "sanity check on workspace count");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_workspace_diff_nonexistent() {
+        let json = tools_call(
+            "workspace_diff",
+            json!({ "workspace": "no-such-workspace-zzzzz" }),
+        )
+        .await;
+        assert_eq!(
+            json["result"]["isError"], true,
+            "workspace_diff on missing workspace should fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_workspace_diff_path_traversal() {
+        let json = tools_call("workspace_diff", json!({ "workspace": "../etc" })).await;
+        assert_eq!(
+            json["result"]["isError"], true,
+            "path traversal should be rejected"
+        );
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Invalid workspace name"),
+            "expected path-traversal rejection, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_propose_agent() {
+        let json = tools_call(
+            "propose_agent",
+            json!({
+                "title": "Test proposal",
+                "repo": "testorg/testrepo",
+                "task": "Do the thing",
+                "rationale": "Because tests",
+                "priority": "low"
+            }),
+        )
+        .await;
+        // The call may fail to persist (DRAFTS_PATH not writable) but the
+        // in-memory add succeeds and returns a well-formed response.
+        // Either way, the response must be well-formed JSON-RPC.
+        assert!(
+            json.get("result").is_some(),
+            "propose_agent should return a result (not a JSON-RPC error): {json:?}"
+        );
+        // If isError is false, the text should mention the created proposal.
+        // If isError is true, it should still be a well-formed error message.
+        let content = &json["result"]["content"];
+        assert!(
+            content.is_array() && !content.as_array().unwrap().is_empty(),
+            "response should have content array"
+        );
+    }
 }
