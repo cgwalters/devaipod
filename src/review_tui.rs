@@ -191,6 +191,7 @@ struct ReviewApp {
     pod_name: String,
     api_base: String,
     api_token: String,
+    client: reqwest::Client,
 
     // Data
     diff_data: Option<DiffResponse>,
@@ -202,21 +203,27 @@ struct ReviewApp {
     mode: AppMode,
     focus: Focus,
     commit_state: ListState,
-    diff_scroll: usize, // vertical scroll offset in diff view
-    diff_cursor: usize, // highlighted line in diff view
+    diff_scroll: usize,         // vertical scroll offset in diff view
+    diff_cursor: usize,         // highlighted line in diff view
+    last_visible_height: usize, // tracks actual visible height from last render
     comments: Vec<PendingComment>,
     comment_input: String,   // current comment being typed
     overall_message: String, // overall review message
 }
 
 impl ReviewApp {
-    fn new(pod_name: String, api_base: String, api_token: String) -> Self {
+    fn new(pod_name: String, api_base: String, api_token: String) -> Result<Self> {
         let mut commit_state = ListState::default();
         commit_state.select(Some(0));
-        Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("Failed to create HTTP client")?;
+        Ok(Self {
             pod_name,
             api_base,
             api_token,
+            client,
             diff_data: None,
             diff_lines: Vec::new(),
             error: None,
@@ -226,17 +233,18 @@ impl ReviewApp {
             commit_state,
             diff_scroll: 0,
             diff_cursor: 0,
+            last_visible_height: 30,
             comments: Vec::new(),
             comment_input: String::new(),
             overall_message: String::new(),
-        }
+        })
     }
 
     /// Fetch diff data from the API.
     async fn fetch_diff(&mut self) -> Result<()> {
-        let client = reqwest::Client::new();
         let url = format!("{}/api/devaipod/pods/{}/diff", self.api_base, self.pod_name);
-        let resp = client
+        let resp = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_token))
             .send()
@@ -257,9 +265,27 @@ impl ReviewApp {
         Ok(())
     }
 
+    /// Get the diff line at the current cursor position.
+    fn current_diff_line(&self) -> Option<&DiffLine> {
+        self.diff_lines.get(self.diff_cursor)
+    }
+
+    /// Count comments on a specific diff line.
+    fn comments_on_line(&self, idx: usize) -> Vec<&PendingComment> {
+        if let Some(dl) = self.diff_lines.get(idx)
+            && let (Some(file), Some(line)) = (&dl.file, dl.new_line)
+        {
+            return self
+                .comments
+                .iter()
+                .filter(|c| c.file == *file && c.line == Some(line))
+                .collect();
+        }
+        vec![]
+    }
+
     /// Submit the review to the API.
     async fn submit_review(&mut self) -> Result<()> {
-        let client = reqwest::Client::new();
         let url = format!(
             "{}/api/devaipod/pods/{}/review",
             self.api_base, self.pod_name
@@ -282,7 +308,8 @@ impl ReviewApp {
                 .collect(),
         };
 
-        let resp = client
+        let resp = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_token))
             .json(&review)
@@ -305,25 +332,6 @@ impl ReviewApp {
         }
         Ok(())
     }
-
-    /// Get the diff line at the current cursor position.
-    fn current_diff_line(&self) -> Option<&DiffLine> {
-        self.diff_lines.get(self.diff_cursor)
-    }
-
-    /// Count comments on a specific diff line.
-    fn comments_on_line(&self, idx: usize) -> Vec<&PendingComment> {
-        if let Some(dl) = self.diff_lines.get(idx)
-            && let (Some(file), Some(line)) = (&dl.file, dl.new_line)
-        {
-            return self
-                .comments
-                .iter()
-                .filter(|c| c.file == *file && c.line == Some(line))
-                .collect();
-        }
-        vec![]
-    }
 }
 
 // ── Drawing ──────────────────────────────────────────────────────────────────
@@ -340,6 +348,11 @@ fn draw(f: &mut Frame, app: &mut ReviewApp) {
             Constraint::Length(3), // footer
         ])
         .split(size);
+
+    // Track the actual diff panel height for scroll calculations.
+    // Body is split 30/70, diff panel is the 70% side minus 2 for borders.
+    let body_height = main_chunks[1].height.saturating_sub(2) as usize;
+    app.last_visible_height = body_height.max(5);
 
     draw_header(f, app, main_chunks[0]);
     draw_body(f, app, main_chunks[1]);
@@ -724,11 +737,12 @@ fn draw_submit_confirm(f: &mut Frame, app: &ReviewApp, area: Rect) {
     f.render_widget(confirm, dialog_area);
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -915,8 +929,7 @@ fn handle_submit_confirm_key(app: &mut ReviewApp, key: KeyEvent) -> Action {
 
 /// Ensure the diff cursor is within the visible scroll window.
 fn ensure_cursor_visible(app: &mut ReviewApp) {
-    // Assume ~30 lines visible (will be recalculated on draw, but this is close enough)
-    let visible = 30_usize;
+    let visible = app.last_visible_height.max(5);
     if app.diff_cursor < app.diff_scroll {
         app.diff_scroll = app.diff_cursor;
     } else if app.diff_cursor >= app.diff_scroll + visible {
@@ -938,7 +951,7 @@ pub async fn run(pod_name: &str) -> Result<()> {
     let port = crate::tui::api_port();
     let api_base = format!("http://127.0.0.1:{port}");
 
-    let mut app = ReviewApp::new(pod_name.to_string(), api_base, api_token);
+    let mut app = ReviewApp::new(pod_name.to_string(), api_base, api_token)?;
 
     // Fetch initial data
     app.fetch_diff().await?;
@@ -992,6 +1005,7 @@ async fn run_event_loop(
         // Poll for events with 100ms timeout
         if event::poll(std::time::Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
+            && key.kind == event::KeyEventKind::Press
         {
             match handle_key(app, key) {
                 Action::Quit => break,
@@ -1011,4 +1025,65 @@ async fn run_event_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_str_ascii() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_str_unicode_safe() {
+        let emoji = "🎉🎊🎈🎆🎇";
+        let result = truncate_str(emoji, 3);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_str_exact() {
+        assert_eq!(truncate_str("abc", 3), "abc");
+    }
+
+    #[test]
+    fn test_parse_diff_empty() {
+        assert!(parse_diff("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_diff_classifications() {
+        let input = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1,3 +1,4 @@\n ctx\n-old\n+new\n+extra";
+        let lines = parse_diff(input);
+        assert!(lines.iter().all(|l| l.file.as_deref() == Some("f.rs")));
+        let adds: Vec<_> = lines
+            .iter()
+            .filter(|l| matches!(l.kind, DiffLineKind::Add))
+            .collect();
+        assert_eq!(adds.len(), 2);
+        let removes: Vec<_> = lines
+            .iter()
+            .filter(|l| matches!(l.kind, DiffLineKind::Remove))
+            .collect();
+        assert_eq!(removes.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_diff_line_numbers() {
+        let input = "@@ -1,2 +10,3 @@\n ctx\n+a\n+b";
+        let lines = parse_diff(input);
+        let ctx = lines
+            .iter()
+            .find(|l| matches!(l.kind, DiffLineKind::Context))
+            .unwrap();
+        assert_eq!(ctx.new_line, Some(10));
+        let add = lines
+            .iter()
+            .find(|l| matches!(l.kind, DiffLineKind::Add))
+            .unwrap();
+        assert_eq!(add.new_line, Some(11));
+    }
 }
