@@ -23,11 +23,22 @@ The `api` container has a `/healthz` endpoint and a podman healthcheck configure
 | `src/config.rs` | Configuration types and loading |
 | `src/ssh_server.rs` | SSH server for `exec --stdio` connections |
 
-## Volumes
+## Volumes and workspace storage
 
-Each pod creates up to 5 named volumes (suffixed with the pod name):
-`workspace`, `agent-home`, `agent-workspace`, `worker-home`, `worker-workspace`.
+Agent pods use **host-directory workspaces**: each pod gets a dedicated
+directory on the host (under `~/.local/share/devaipod/workspaces/<pod>/`)
+that is bind-mounted into the agent container. This directory persists
+across pod stop/start/delete cycles and is the primary mechanism for
+harvesting agent commits back into the user's source repo.
+
+Named volumes are still created for home directories and ancillary state.
+Each pod creates up to 4 named volumes (suffixed with the pod name):
+`workspace`, `agent-home`, `worker-home`, `worker-workspace`.
 The worker volumes are only created when orchestration mode is enabled.
+
+Devcontainer pods (created via `devaipod devcontainer run`) use an
+`agent-workspace` volume instead of a host directory for their workspace
+storage.
 
 **Known issue:** `cmd_prune` and `prune_done_pods` do not clean up volumes
 when removing pods. `cmd_delete` handles this correctly. This is a bug to fix.
