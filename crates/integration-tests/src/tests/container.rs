@@ -192,9 +192,11 @@ fn test_readonly_pod_exists(fixture: &SharedFixture) -> Result<()> {
     // Verify instance is running (podman uses .State, not .Status)
     let format_state = "{{.State}}";
     let state = cmd!(sh, "podman pod inspect {pod_name} --format {format_state}").read()?;
+    // Accept "Running" or "Degraded" — the latter is expected when the
+    // service-gator container exits (test repos use fake remote URLs).
     assert!(
-        state.contains("Running"),
-        "Shared instance should be running, got: {}",
+        state.contains("Running") || state.contains("Degraded"),
+        "Shared instance should be running or degraded, got: {}",
         state
     );
 
@@ -592,12 +594,22 @@ fn test_stop_and_start_pod() -> Result<()> {
 
     let sh = shell()?;
 
-    // Verify pod is stopped (containers should not be running)
-    let ps_output = cmd!(sh, "podman ps -q --filter pod={pod_name}").read()?;
+    // Verify pod is stopped. Give podman a moment to tear down containers,
+    // then check that no application containers are still running (the infra
+    // container may linger briefly).
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let format_filter = "{{.Names}}";
+    let ps_output = cmd!(
+        sh,
+        "podman ps --filter pod={pod_name} --format {format_filter}"
+    )
+    .read()?;
+    let running_app_containers: Vec<&str> =
+        ps_output.lines().filter(|l| !l.contains("infra")).collect();
     assert!(
-        ps_output.trim().is_empty(),
-        "No containers should be running after stop: {}",
-        ps_output
+        running_app_containers.is_empty(),
+        "No app containers should be running after stop: {:?}",
+        running_app_containers
     );
 
     // Start pod again via podman (devaipod up would create a new pod now)

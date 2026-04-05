@@ -210,15 +210,17 @@ fn test_pod_no_worker_by_default() -> Result<()> {
     )
     .read()?;
 
-    // Orchestration is disabled by default, so no worker container
-    assert!(
-        ps_output.contains("workspace"),
-        "Pod should have workspace container: {}",
-        ps_output
-    );
+    // Orchestration is disabled by default, so no worker container.
+    // workspace-v2: agent pods no longer have a separate workspace
+    // container — the agent workspace uses a host bind mount.
     assert!(
         ps_output.contains("agent"),
         "Pod should have agent container: {}",
+        ps_output
+    );
+    assert!(
+        ps_output.contains("api"),
+        "Pod should have api container: {}",
         ps_output
     );
     assert!(

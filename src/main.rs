@@ -6620,18 +6620,28 @@ async fn cmd_rebuild(
     let labels = get_pod_labels(pod_name)
         .ok_or_else(|| color_eyre::eyre::eyre!("Pod '{}' not found", pod_name))?;
 
+    // Check workspace state file first — it knows the original source type
+    let ws_state = agent_dir::WorkspaceState::load(
+        &agent_dir::agent_dir_host_path(pod_name).unwrap_or_default(),
+    )
+    .ok()
+    .flatten();
+
     let repo_url = labels
         .get("io.devaipod.repo")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "Pod '{}' has no repository label. Cannot determine source for rebuild.",
-                pod_name
-            )
-        })?;
+        .unwrap_or("");
 
     // Convert repo label back to URL (github.com/owner/repo -> https://github.com/owner/repo)
-    let remote_url = format!("https://{}", repo_url);
+    let remote_url = if repo_url.is_empty() {
+        // No repo label — check workspace state for the source
+        ws_state
+            .as_ref()
+            .map(|s| s.source.clone())
+            .unwrap_or_default()
+    } else {
+        format!("https://{}", repo_url)
+    };
     tracing::debug!("Repository: {}", remote_url);
 
     // Get task label if present (to preserve it)
@@ -6646,31 +6656,68 @@ async fn cmd_rebuild(
         .await
         .context("Failed to start podman service")?;
 
-    // Read devcontainer.json from the existing workspace volume rather
-    // than cloning the remote again.  This picks up any config changes
-    // the agent (or user) made inside the workspace.
-    let volume_name = format!("{}-workspace", pod_name);
+    // Read devcontainer.json from the agent workspace.
+    //
+    // workspace-v2: the agent workspace is a host bind mount, so we can
+    // read directly from the filesystem instead of running an init container.
+    // This correctly picks up modifications the agent made inside the workspace.
+    // Fall back to the workspace volume for older (pre-v2) pods.
     let repo_name = git::extract_repo_name(&remote_url).unwrap_or_else(|| "workspace".to_string());
     let self_image = pod::detect_self_image();
 
     let workspace_dir = format!("/workspaces/{}", repo_name);
 
-    tracing::info!("Reading devcontainer configuration from workspace volume...");
-    let (exit_code, raw_output) = podman
-        .run_init_container_with_output(
-            &self_image,
-            &volume_name,
-            "/workspaces",
-            &[
-                "devaipod",
-                "internals",
-                "output-devcontainer-state",
-                &workspace_dir,
-            ],
-            &[],
-        )
-        .await
-        .context("Failed to read config from workspace volume")?;
+    // Try reading from agent workspace host directory first (workspace-v2)
+    let (exit_code, raw_output) = {
+        let agent_ws = agent_dir::agent_dir_host_path(pod_name)?;
+        let agent_repo_dir = agent_ws.join(&repo_name);
+        if agent_repo_dir.join(".devcontainer").exists()
+            || agent_repo_dir.join("devcontainer.json").exists()
+        {
+            tracing::info!(
+                "Reading devcontainer configuration from agent workspace at {}...",
+                agent_repo_dir.display()
+            );
+            // Run the same internals command but bind-mount the host dir
+            // instead of the workspace volume.
+            let host_path = agent_ws.display().to_string();
+            podman
+                .run_init_container_with_output(
+                    &self_image,
+                    &host_path,
+                    "/workspaces",
+                    &[
+                        "devaipod",
+                        "internals",
+                        "output-devcontainer-state",
+                        &workspace_dir,
+                    ],
+                    &[],
+                )
+                .await
+                .context("Failed to read config from agent workspace")?
+        } else {
+            // Fall back to workspace volume (pre-v2 or devcontainer
+            // was never in the agent workspace)
+            let volume_name = format!("{}-workspace", pod_name);
+            tracing::info!("Reading devcontainer configuration from workspace volume...");
+            podman
+                .run_init_container_with_output(
+                    &self_image,
+                    &volume_name,
+                    "/workspaces",
+                    &[
+                        "devaipod",
+                        "internals",
+                        "output-devcontainer-state",
+                        &workspace_dir,
+                    ],
+                    &[],
+                )
+                .await
+                .context("Failed to read config from workspace volume")?
+        }
+    };
 
     if exit_code != 0 {
         tracing::warn!(
@@ -6734,14 +6781,27 @@ async fn cmd_rebuild(
         None
     };
 
-    // Create remote info for workspace source
-    let remote_info = git::RemoteRepoInfo {
-        remote_url: remote_url.clone(),
-        default_branch,
-        repo_name,
-        fork_url,
+    // Determine workspace source: local path or remote URL.
+    // The workspace state file records the original source string, which is
+    // a local path for `devaipod up .` and a URL for remote repos.
+    let source = if std::path::Path::new(&remote_url).exists() {
+        // Local repository — detect git info from the path
+        let git_info = git::detect_git_info(std::path::Path::new(&remote_url))?;
+        pod::WorkspaceSource::LocalRepo(git_info)
+    } else if !remote_url.is_empty() {
+        let remote_info = git::RemoteRepoInfo {
+            remote_url: remote_url.clone(),
+            default_branch,
+            repo_name,
+            fork_url,
+        };
+        pod::WorkspaceSource::RemoteRepo(remote_info)
+    } else {
+        bail!(
+            "Cannot determine source for rebuild. Pod '{}' has no repo label and no workspace state.",
+            pod_name
+        );
     };
-    let source = pod::WorkspaceSource::RemoteRepo(remote_info);
 
     // Now stop and remove the pod (volumes are preserved)
     tracing::info!("Stopping containers...");
