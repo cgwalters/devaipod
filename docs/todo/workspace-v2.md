@@ -143,8 +143,10 @@ This is the minimal mount. We do not bind-mount `~` entirely.
 
 - `DEVAIPOD_HOST_WORKDIR` env var and `get_host_workdir_path()` helper
 - `<pod-id>/` directory creation at pod creation time
-- `{pod}-agent-workspace` volume replaced with host bind mount at
-  `/workspaces/` for LocalRepo
+- **Agent workspace is always a host directory**, regardless of source
+  type (local repo, remote URL, or PR). The `{pod}-agent-workspace`
+  volume is no longer created for agent pods. This unifies diff, fetch,
+  review, and direct editing across all source types.
 - Source repo bind-mounted RO at `/mnt/source/<dirname>/`
 - `--source-dir` CLI flag: mounts additional read-only directories at
   `/mnt/source/<dirname>/` with automatic git clone into agent workspace
@@ -153,13 +155,28 @@ This is the minimal mount. We do not bind-mount `~` entirely.
 - `devaipod delete` removes the agent directory
 - Justfile `container-run` updated with workspaces bind mount
 - Init container name sanitization for host-path volume sources
+- **Multi-repo workspace support**: `find_git_repos_in_dir()` discovers
+  all git repos in a workspace (shared in `agent_dir.rs`). The
+  `GET /api/devaipod/pods/{name}/diffs` endpoint returns diffs for all
+  repos. `devaipod fetch` fetches all repos with per-repo remote naming
+  (`devaipod/<workspace>/<repo>`).
+- **Harvest**: `POST /api/devaipod/pods/{name}/fetch` fetches agent
+  commits into the user's source repo as `devaipod/<workspace>/*`
+  branches. Auto-harvest triggers on agent completion for local-source
+  workspaces. `WorkspaceState.last_harvested` tracks per-repo HEAD SHAs
+  to skip redundant fetches.
+- **Review TUI**: `devaipod review` provides interactive diff viewing
+  with inline commenting; review comments are sent back to the agent.
 
 ### Remaining
 
 - UID mapping: see [rootless-uidmapping.md](./rootless-uidmapping.md)
-- UI/model rework: workspace-anchored design (see below)
+- UI/model rework: workspace-anchored design (see Phase 2 below)
 - `devaipod clean` garbage-collects orphaned agent dirs
-- For remote pods, add periodic `git fetch` from remote to local
+- Push/PR creation from the control plane (credentials, "approve &
+  push" flow — see [lightweight-review.md](./lightweight-review.md))
+- Web UI review component (REST API is ready, frontend needs inline
+  commenting UI)
 
 ## Resolved Questions
 
