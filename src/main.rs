@@ -287,6 +287,7 @@ COMMON WORKFLOWS:
   devaipod attach <workspace>                 Connect to agent in workspace
   devaipod fetch [workspace]                  Fetch agent commits into your repo
   devaipod diff [workspace]                   Show agent changes vs your branch
+  devaipod apply [workspace]                  Merge agent changes into your branch
   devaipod exec <workspace>                   Get a shell in agent container
   devaipod logs <workspace> -f                Follow agent logs
   devaipod delete <workspace>                 Clean up when done
@@ -1048,6 +1049,25 @@ enum HostCommand {
         workspace: Option<String>,
     },
 
+    /// Apply agent changes to the current branch
+    ///
+    /// Fetches the latest agent commits and merges them into your current
+    /// branch. Equivalent to `devaipod fetch` followed by `git merge`.
+    ///
+    /// Must be run from your source repository.
+    ///
+    /// Examples:
+    ///   devaipod apply                          # Apply from latest workspace
+    ///   devaipod apply myworkspace              # Apply from named workspace
+    ///   devaipod apply --cherry-pick myws       # Cherry-pick instead of merge
+    Apply {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+        /// Cherry-pick instead of merge (for individual commits)
+        #[arg(long)]
+        cherry_pick: bool,
+    },
+
     /// Get or set the session title for a pod
     ///
     /// The title is human-readable metadata for the session, separate from
@@ -1391,6 +1411,7 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
             | HostCommand::Fetch { .. }
             | HostCommand::Diff { .. }
             | HostCommand::Review { .. }
+            | HostCommand::Apply { .. }
     )
 }
 
@@ -1406,6 +1427,7 @@ fn command_allowed_on_host(cmd: &HostCommand) -> bool {
             | HostCommand::Fetch { .. }
             | HostCommand::Diff { .. }
             | HostCommand::Review { .. }
+            | HostCommand::Apply { .. }
     )
 }
 
@@ -1691,6 +1713,13 @@ async fn run_host(cli: HostCli) -> Result<()> {
         HostCommand::Review { workspace } => {
             let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
             crate::review_tui::run(&pod_name).await
+        }
+        HostCommand::Apply {
+            workspace,
+            cherry_pick,
+        } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            cmd_apply(&pod_name, cherry_pick)
         }
         HostCommand::Title { name, title } => {
             cmd_title(&normalize_pod_name(&name), title.as_deref()).await
@@ -3731,9 +3760,9 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
 
     let repos = find_all_agent_git_repos(pod_name)?;
     let short_name = strip_pod_prefix(pod_name);
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
 
     for (repo_name, agent_repo) in &repos {
-        // Remote name includes the repo name to distinguish multi-repo remotes
         let remote_name = if repos.len() == 1 {
             format!("devaipod/{}", short_name)
         } else {
@@ -3742,109 +3771,28 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
 
         tracing::info!("Fetching from agent workspace: {}", agent_repo.display());
 
-        // Add or update the remote
-        let agent_repo_str = agent_repo.to_str().ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "Agent repo path is not valid UTF-8: {}",
-                agent_repo.display()
-            )
-        })?;
-        let add_result = ProcessCommand::new("git")
-            .args(["remote", "add", &remote_name, agent_repo_str])
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .context("Failed to run git remote add")?;
+        let result = agent_dir::harvest_one_repo(&cwd, agent_repo, &remote_name)?;
 
-        if !add_result.status.success() {
-            let stderr = String::from_utf8_lossy(&add_result.stderr);
-            if stderr.contains("already exists") {
-                // Update the URL instead
-                let set_result = ProcessCommand::new("git")
-                    .args(["remote", "set-url", &remote_name, agent_repo_str])
-                    .output()
-                    .context("Failed to run git remote set-url")?;
-                if !set_result.status.success() {
-                    let stderr = String::from_utf8_lossy(&set_result.stderr);
-                    bail!(
-                        "Failed to update remote '{}': {}",
-                        remote_name,
-                        stderr.trim()
-                    );
-                }
-                tracing::debug!("Updated remote '{}' URL", remote_name);
+        // Print branch information (CLI-specific output)
+        if !result.branches.is_empty() {
+            println!();
+            if repos.len() > 1 {
+                println!("Fetched branches for {}:", repo_name);
             } else {
-                bail!("Failed to add remote '{}': {}", remote_name, stderr.trim());
+                println!("Fetched branches:");
             }
-        }
-
-        // Fetch from the remote. The agent's repo may have git alternates
-        // referencing container-internal paths (e.g. /mnt/main-workspace/...),
-        // which produce benign "unable to normalize alternate object path"
-        // warnings. We filter these from the output.
-        let fetch_output = ProcessCommand::new("git")
-            .args(["fetch", &remote_name])
-            .output()
-            .context("Failed to run git fetch")?;
-
-        if !fetch_output.status.success() {
-            let stderr = String::from_utf8_lossy(&fetch_output.stderr);
-            // Filter out alternates warnings before checking for real errors
-            let real_errors: Vec<&str> = stderr
-                .lines()
-                .filter(|l| !l.contains("unable to normalize alternate"))
-                .collect();
-            if !real_errors.is_empty() {
-                bail!(
-                    "Failed to fetch from '{}': {}",
-                    remote_name,
-                    real_errors.join("\n")
-                );
+            for branch in &result.branches {
+                println!("  {}", branch);
             }
-        }
-
-        // Print stderr from fetch (contains the branch update info), filtering
-        // out benign alternates warnings
-        let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
-        for line in fetch_stderr.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.contains("unable to normalize alternate") {
-                println!("  {}", trimmed);
-            }
-        }
-
-        // List the fetched branches
-        let branch_output = ProcessCommand::new("git")
-            .args(["branch", "-r", "--list", &format!("{}/*", remote_name)])
-            .output()
-            .context("Failed to list remote branches")?;
-
-        if branch_output.status.success() {
-            let branches = String::from_utf8_lossy(&branch_output.stdout);
-            let branch_list: Vec<&str> = branches
-                .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .collect();
-            if !branch_list.is_empty() {
+            // Suggest commands using the detected default branch
+            if let Ok(Some(default_branch)) = resolve_remote_default_branch(&remote_name) {
+                let ref_name = format!("{}/{}", remote_name, default_branch);
                 println!();
-                if repos.len() > 1 {
-                    println!("Fetched branches for {}:", repo_name);
-                } else {
-                    println!("Fetched branches:");
-                }
-                for branch in &branch_list {
-                    println!("  {}", branch);
-                }
-                // Suggest commands using the detected default branch
-                if let Ok(Some(default_branch)) = resolve_remote_default_branch(&remote_name) {
-                    let ref_name = format!("{}/{}", remote_name, default_branch);
-                    println!();
-                    println!("To review agent changes:");
-                    println!("  git log {}", ref_name);
-                    println!("  git diff HEAD...{}", ref_name);
-                    if repos.len() == 1 {
-                        println!("  devaipod diff {}", short_name);
-                    }
+                println!("To review agent changes:");
+                println!("  git log {}", ref_name);
+                println!("  git diff HEAD...{}", ref_name);
+                if repos.len() == 1 {
+                    println!("  devaipod diff {}", short_name);
                 }
             }
         }
@@ -3964,6 +3912,97 @@ fn cmd_diff(pod_name: &str, stat: bool) -> Result<()> {
 
     if !status.success() {
         bail!("git diff failed");
+    }
+
+    Ok(())
+}
+
+/// Apply agent changes to the current branch.
+///
+/// Fetches the latest commits (like `cmd_fetch`), then merges or cherry-picks
+/// the agent's branch into the current branch.
+fn cmd_apply(pod_name: &str, cherry_pick: bool) -> Result<()> {
+    // Fetch first to ensure we have the latest
+    cmd_fetch(pod_name)?;
+
+    let short_name = strip_pod_prefix(pod_name);
+    let remote_name = format!("devaipod/{}", short_name);
+
+    let default_branch = resolve_remote_default_branch(&remote_name)?.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No branches found for remote '{}'. The agent may not have made any commits.",
+            remote_name
+        )
+    })?;
+
+    let ref_name = format!("{}/{}", remote_name, default_branch);
+
+    // Count how many commits the agent is ahead
+    let ahead_output = ProcessCommand::new("git")
+        .args(["rev-list", "--count", &format!("HEAD..{}", ref_name)])
+        .output()
+        .context("Failed to count commits")?;
+
+    let count: usize = String::from_utf8_lossy(&ahead_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+
+    if count == 0 {
+        println!("Already up to date with {}.", ref_name);
+        return Ok(());
+    }
+
+    println!("Applying {} commit(s) from {}...", count, ref_name);
+
+    if cherry_pick {
+        let list_output = ProcessCommand::new("git")
+            .args(["rev-list", "--reverse", &format!("HEAD..{}", ref_name)])
+            .output()
+            .context("Failed to list commits")?;
+
+        let sha_strings: Vec<String> = String::from_utf8_lossy(&list_output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for sha in &sha_strings {
+            let result = ProcessCommand::new("git")
+                .args(["cherry-pick", sha])
+                .status()
+                .context("Failed to run git cherry-pick")?;
+
+            if !result.success() {
+                eprintln!();
+                eprintln!(
+                    "Cherry-pick of {} failed. Resolve conflicts, then run:",
+                    sha
+                );
+                eprintln!("  git cherry-pick --continue");
+                return Ok(());
+            }
+        }
+        println!("Applied {} commit(s) via cherry-pick.", sha_strings.len());
+    } else {
+        let result = ProcessCommand::new("git")
+            .args([
+                "merge",
+                "--no-ff",
+                &ref_name,
+                "-m",
+                &format!("Merge agent work from {}", short_name),
+            ])
+            .status()
+            .context("Failed to run git merge")?;
+
+        if !result.success() {
+            eprintln!();
+            eprintln!("Merge conflicts detected. Resolve them, then run:");
+            eprintln!("  git merge --continue");
+            return Ok(());
+        }
+        println!("Merged {} commit(s) from {}.", count, ref_name);
     }
 
     Ok(())

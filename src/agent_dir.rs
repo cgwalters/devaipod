@@ -163,7 +163,7 @@ pub struct WorkspaceState {
 
 impl WorkspaceState {
     /// Path to the state file within a workspace directory.
-    #[allow(dead_code)] // Used by tests and upcoming web API
+    #[allow(dead_code)] // Used by tests
     pub fn state_path(workspace_dir: &Path) -> PathBuf {
         workspace_dir.join(DEVAIPOD_META_DIR).join(STATE_FILENAME)
     }
@@ -201,7 +201,6 @@ impl WorkspaceState {
     ///
     /// Returns `None` if the file doesn't exist (legacy workspace without
     /// state). Returns an error only on parse failures.
-    #[allow(dead_code)] // Used by tests and upcoming web API
     pub fn load(workspace_dir: &Path) -> Result<Option<Self>> {
         let state_path = Self::state_path(workspace_dir);
         match std::fs::read_to_string(&state_path) {
@@ -226,7 +225,6 @@ impl WorkspaceState {
 ///
 /// Returns `(pod_name, workspace_dir, state)` triples. Workspaces without
 /// a state file are included with `state = None` (legacy or orphaned dirs).
-#[allow(dead_code)] // Upcoming web API
 pub fn list_workspaces() -> Result<Vec<(String, PathBuf, Option<WorkspaceState>)>> {
     let base = agent_workdir_base()?;
     if !base.exists() {
@@ -293,7 +291,6 @@ fn recent_sources_path() -> Result<PathBuf> {
 }
 
 /// Load the recent sources list from disk. Returns empty vec on missing/corrupt file.
-#[allow(dead_code)] // Upcoming web API
 pub fn load_recent_sources() -> Vec<RecentSource> {
     let path = match recent_sources_path() {
         Ok(p) => p,
@@ -361,6 +358,114 @@ pub fn record_recent_source(source: &str) {
             tracing::warn!("Failed to serialize recent sources: {e}");
         }
     }
+}
+
+// ── Shared harvest logic ─────────────────────────────────────────────
+
+/// Result of harvesting commits from one agent repo into a target repo.
+#[derive(Debug)]
+pub struct HarvestRepoResult {
+    pub remote_name: String,
+    pub branches: Vec<String>,
+}
+
+/// Add or update a git remote in `target_repo` pointing at `agent_repo`,
+/// then fetch from it. Returns the list of fetched branches.
+///
+/// Filters out benign "unable to normalize alternate" warnings from git
+/// output (common with --shared clones using container-internal alternates).
+pub fn harvest_one_repo(
+    target_repo: &Path,
+    agent_repo: &Path,
+    remote_name: &str,
+) -> Result<HarvestRepoResult> {
+    use color_eyre::eyre::bail;
+
+    let agent_repo_str = agent_repo.to_str().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "Agent repo path is not valid UTF-8: {}",
+            agent_repo.display()
+        )
+    })?;
+
+    // Add or update the remote
+    let add_result = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_repo)
+        .args(["remote", "add", remote_name, agent_repo_str])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run git remote add")?;
+
+    if !add_result.status.success() {
+        let stderr = String::from_utf8_lossy(&add_result.stderr);
+        if stderr.contains("already exists") {
+            let set_result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(target_repo)
+                .args(["remote", "set-url", remote_name, agent_repo_str])
+                .output()
+                .context("Failed to run git remote set-url")?;
+            if !set_result.status.success() {
+                let stderr = String::from_utf8_lossy(&set_result.stderr);
+                tracing::warn!(
+                    "Failed to update remote '{}' URL: {}",
+                    remote_name,
+                    stderr.trim()
+                );
+            }
+        } else {
+            bail!("Failed to add remote '{}': {}", remote_name, stderr.trim());
+        }
+    }
+
+    // Fetch
+    let fetch_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_repo)
+        .args(["fetch", remote_name])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run git fetch")?;
+
+    // Filter alternates warnings
+    let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+    let real_errors: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.contains("unable to normalize alternate"))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if !fetch_output.status.success() && !real_errors.is_empty() {
+        bail!(
+            "Failed to fetch from '{}': {}",
+            remote_name,
+            real_errors.join("\n")
+        );
+    }
+
+    // List branches
+    let branch_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_repo)
+        .args(["branch", "-r", "--list", &format!("{remote_name}/*")])
+        .output()
+        .context("Failed to list remote branches")?;
+
+    let branches: Vec<String> = if branch_output.status.success() {
+        String::from_utf8_lossy(&branch_output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    Ok(HarvestRepoResult {
+        remote_name: remote_name.to_string(),
+        branches,
+    })
 }
 
 #[cfg(test)]
@@ -688,5 +793,54 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repos = find_git_repos_in_dir(temp.path());
         assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn test_harvest_one_repo_roundtrip() {
+        // Create a "source" repo with one commit
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let init = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git command failed");
+        };
+        init(&source, &["init", "-b", "main"]);
+        init(&source, &["config", "user.email", "test@test.com"]);
+        init(&source, &["config", "user.name", "Test"]);
+        std::fs::write(source.join("README.md"), "hello").unwrap();
+        init(&source, &["add", "."]);
+        init(&source, &["commit", "-m", "initial"]);
+
+        // Create an "agent" repo that is a clone of source with an extra commit
+        let agent = temp.path().join("agent");
+        std::process::Command::new("git")
+            .args(["clone", source.to_str().unwrap(), agent.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::fs::write(agent.join("agent.txt"), "agent work").unwrap();
+        init(&agent, &["add", "."]);
+        init(&agent, &["commit", "-m", "agent commit"]);
+
+        // Harvest agent commits into source
+        let result = harvest_one_repo(&source, &agent, "devaipod/test").unwrap();
+        assert_eq!(result.remote_name, "devaipod/test");
+        assert!(
+            !result.branches.is_empty(),
+            "Expected at least one branch after harvest"
+        );
+        assert!(
+            result.branches.iter().any(|b| b.contains("main")),
+            "Expected a main branch in {:?}",
+            result.branches
+        );
+
+        // Harvest again (remote already exists) should succeed
+        let result2 = harvest_one_repo(&source, &agent, "devaipod/test").unwrap();
+        assert!(!result2.branches.is_empty());
     }
 }

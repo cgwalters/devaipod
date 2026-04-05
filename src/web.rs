@@ -2218,6 +2218,13 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
     // Auto-harvest: when a pod transitions to "done", fetch its commits
     // into the source repo in the background. Each pod is harvested at most
     // once per completion (we only fire when the cached status changes).
+    //
+    // TODO: Add periodic harvest while agents are still active. Track a
+    // `last_harvest_check: HashMap<String, Instant>` in AppState and, on
+    // each poll cycle, harvest from pods whose status is "active", whose
+    // source is a local path, and where >5 minutes have elapsed since the
+    // last harvest. This would surface incremental progress before the
+    // agent marks itself done.
     for pod_name in newly_done_pods {
         tokio::task::spawn_blocking(move || match harvest_agent_commits(&pod_name) {
             Ok(result) => {
@@ -4046,99 +4053,20 @@ fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, S
             format!("devaipod/{short_name}/{repo_name}")
         };
 
-        let agent_repo_str = match repo_path.to_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-
-        // Add or update the remote in the target repo
-        let add_result = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&target_repo)
-            .args(["remote", "add", &remote_name, &agent_repo_str])
-            .stderr(std::process::Stdio::piped())
-            .output();
-
-        match add_result {
-            Ok(output) if !output.status.success() => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("already exists") {
-                    match std::process::Command::new("git")
-                        .arg("-C")
-                        .arg(&target_repo)
-                        .args(["remote", "set-url", &remote_name, &agent_repo_str])
-                        .output()
-                    {
-                        Ok(output) if !output.status.success() => {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            tracing::warn!(
-                                "Failed to update remote '{}' URL: {}",
-                                remote_name,
-                                stderr.trim()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to run git remote set-url: {e}");
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Run git fetch, filtering alternates warnings from --shared clones
-        let fetch_result = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&target_repo)
-            .args(["fetch", &remote_name])
-            .stderr(std::process::Stdio::piped())
-            .output();
-
-        match fetch_result {
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let errors: Vec<&str> = stderr
-                    .lines()
-                    .filter(|l| !l.contains("unable to normalize alternate"))
-                    .filter(|l| !l.trim().is_empty())
-                    .collect();
-
-                if output.status.success() || errors.is_empty() {
-                    // Get the branches that were fetched
-                    let branch_output = std::process::Command::new("git")
-                        .arg("-C")
-                        .arg(&target_repo)
-                        .args(["branch", "-r", "--list", &format!("{remote_name}/*")])
-                        .output();
-
-                    let branches: Vec<String> = branch_output
-                        .ok()
-                        .map(|o| {
-                            String::from_utf8_lossy(&o.stdout)
-                                .lines()
-                                .map(|l| l.trim().to_string())
-                                .filter(|l| !l.is_empty())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    harvested.push(HarvestedRepo {
-                        repo_name: repo_name.to_string(),
-                        target_repo: target_repo.display().to_string(),
-                        remote_name: remote_name.clone(),
-                        branches,
-                    });
-                } else {
-                    tracing::warn!(
-                        "Failed to fetch {repo_name} into {}: {}",
-                        target_repo.display(),
-                        errors.join("; ")
-                    );
-                }
+        match crate::agent_dir::harvest_one_repo(&target_repo, repo_path, &remote_name) {
+            Ok(result) => {
+                harvested.push(HarvestedRepo {
+                    repo_name: repo_name.to_string(),
+                    target_repo: target_repo.display().to_string(),
+                    remote_name: result.remote_name,
+                    branches: result.branches,
+                });
             }
             Err(e) => {
-                tracing::warn!("Failed to run git fetch for {repo_name}: {e}");
+                tracing::warn!(
+                    "Failed to harvest {repo_name} into {}: {e}",
+                    target_repo.display(),
+                );
             }
         }
     }
