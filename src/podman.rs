@@ -1138,7 +1138,14 @@ impl PodmanService {
         command: &[&str],
         extra_binds: &[String],
     ) -> Result<(i32, String)> {
-        let container_name = format!("{}-init", volume_name);
+        // Derive a safe container name. When volume_name is a host path
+        // (e.g. /home/user/.local/share/devaipod/workspaces/pod-name), use
+        // only the last path component to avoid slashes in the container name.
+        let safe_name = std::path::Path::new(volume_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(volume_name);
+        let container_name = format!("{}-init", safe_name);
 
         // Remove any existing init container
         let _ = self
@@ -1157,8 +1164,10 @@ impl PodmanService {
             format!("{}:{}", volume_name, mount_path),
         ];
 
-        // Add extra bind mounts (with SELinux label disable and root user if any are present)
-        if !extra_binds.is_empty() {
+        // When using bind mounts (host paths or extra binds), disable SELinux
+        // labels and run as root so the container can access host-owned files.
+        let is_bind_mount = volume_name.contains('/');
+        if is_bind_mount || !extra_binds.is_empty() {
             args.push("--security-opt".to_string());
             args.push("label=disable".to_string());
             args.push("--user".to_string());
