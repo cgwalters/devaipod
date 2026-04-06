@@ -427,12 +427,6 @@ pub fn harvest_one_repo_via_exec(
     workspace_path: &str,
     remote_name: &str,
 ) -> Result<HarvestRepoResult> {
-    use color_eyre::eyre::bail;
-
-    // Build the ext:: URL. We hardcode `git-upload-pack` (used by fetch)
-    // rather than using git's `%S` placeholder, since we only need the
-    // upload-pack direction. The full podman invocation including `--url`
-    // matches how the control plane talks to the host podman daemon.
     let prefix = podman_cli_prefix();
     let ext_url = format!(
         "ext::{} exec -i {} git-upload-pack {}",
@@ -441,13 +435,65 @@ pub fn harvest_one_repo_via_exec(
         shell_quote(workspace_path),
     );
 
-    tracing::debug!("Using ext:: transport: {}", ext_url);
+    tracing::debug!("Using ext:: exec transport: {}", ext_url);
+    harvest_via_ext_url(target_repo, &ext_url, remote_name)
+}
+
+/// Harvest commits by spawning a transient container that mounts the
+/// workspace volume + host-side workspace directory.
+///
+/// This works even when the agent container is stopped. The transient
+/// container mounts the workspace volume at `/mnt/main-workspace` (matching
+/// the alternates path) and the host-side workspace-v2 directory at
+/// `/workspaces`, so all git objects resolve correctly.
+///
+/// `pod_name` is the pod name (e.g. `devaipod-myproject-abc`).
+/// `workspace_path` is the repo path inside the container (e.g.
+/// `/workspaces/myproject`).
+/// `image` is a container image with git installed.
+pub fn harvest_one_repo_via_transient(
+    target_repo: &Path,
+    pod_name: &str,
+    workspace_path: &str,
+    remote_name: &str,
+    image: &str,
+) -> Result<HarvestRepoResult> {
+    // The workspace volume follows the naming convention {pod_name}-workspace.
+    let volume_name = format!("{pod_name}-workspace");
+    // The host-side workspace-v2 directory
+    let host_ws_dir = agent_dir_host_path(pod_name)?;
+
+    let prefix = podman_cli_prefix();
+    let ext_url = format!(
+        "ext::{} run --rm -i \
+         -v {volume}:/mnt/main-workspace:ro \
+         -v {host_dir}:/workspaces:ro \
+         {image} \
+         git-upload-pack {ws_path}",
+        prefix.join(" "),
+        volume = shell_quote(&volume_name),
+        host_dir = shell_quote(&host_ws_dir.to_string_lossy()),
+        image = shell_quote(image),
+        ws_path = shell_quote(workspace_path),
+    );
+
+    tracing::debug!("Using ext:: transient container transport: {}", ext_url);
+    harvest_via_ext_url(target_repo, &ext_url, remote_name)
+}
+
+/// Shared logic: set up a git remote with an `ext::` URL, fetch, and list branches.
+fn harvest_via_ext_url(
+    target_repo: &Path,
+    ext_url: &str,
+    remote_name: &str,
+) -> Result<HarvestRepoResult> {
+    use color_eyre::eyre::bail;
 
     // Add or update the remote
     let add_result = std::process::Command::new("git")
         .arg("-C")
         .arg(target_repo)
-        .args(["remote", "add", remote_name, &ext_url])
+        .args(["remote", "add", remote_name, ext_url])
         .stderr(std::process::Stdio::piped())
         .output()
         .context("Failed to run git remote add")?;
@@ -458,7 +504,7 @@ pub fn harvest_one_repo_via_exec(
             let set_result = std::process::Command::new("git")
                 .arg("-C")
                 .arg(target_repo)
-                .args(["remote", "set-url", remote_name, &ext_url])
+                .args(["remote", "set-url", remote_name, ext_url])
                 .output()
                 .context("Failed to run git remote set-url")?;
             if !set_result.status.success() {
@@ -484,6 +530,9 @@ pub fn harvest_one_repo_via_exec(
         .output()
         .context("Failed to run git fetch via ext:: transport")?;
 
+    // A failed exit code with only "unable to normalize alternate" warnings
+    // is treated as success — these warnings are benign and expected with
+    // workspace-v2 repos that use container-internal alternate paths.
     let stderr = String::from_utf8_lossy(&fetch_output.stderr);
     let real_errors: Vec<&str> = stderr
         .lines()
@@ -539,8 +588,10 @@ fn shell_quote(s: &str) -> String {
 /// Add or update a git remote in `target_repo` pointing at `agent_repo`,
 /// then fetch from it. Returns the list of fetched branches.
 ///
-/// Filters out benign "unable to normalize alternate" warnings from git
-/// output (common with --shared clones using container-internal alternates).
+/// This is the simple path for repos with self-contained objects (no
+/// container-internal alternates). For workspace-v2 repos, prefer
+/// [`harvest_one_repo_via_exec`] or [`harvest_one_repo_via_transient`].
+#[cfg(test)]
 pub fn harvest_one_repo(
     target_repo: &Path,
     agent_repo: &Path,

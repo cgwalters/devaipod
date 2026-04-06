@@ -4049,10 +4049,11 @@ fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, S
             format!("devaipod/{short_name}/{repo_name}")
         };
 
-        // Try ext:: transport through podman exec first (handles workspace-v2
-        // repos with container-internal alternates), falling back to direct path.
+        // Use ext:: transport to handle workspace-v2 repos with container-
+        // internal alternates. When the agent is running, use podman exec;
+        // otherwise spawn a transient container mounting the workspace volume.
+        let workspace_path = format!("/workspaces/{repo_name}");
         let harvest_result = if container_running {
-            let workspace_path = format!("/workspaces/{repo_name}");
             crate::agent_dir::harvest_one_repo_via_exec(
                 &target_repo,
                 &agent_container,
@@ -4060,7 +4061,14 @@ fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, S
                 &remote_name,
             )
         } else {
-            crate::agent_dir::harvest_one_repo(&target_repo, repo_path, &remote_name)
+            let image = crate::pod::detect_self_image();
+            crate::agent_dir::harvest_one_repo_via_transient(
+                &target_repo,
+                pod_name,
+                &workspace_path,
+                &remote_name,
+                &image,
+            )
         };
 
         match harvest_result {

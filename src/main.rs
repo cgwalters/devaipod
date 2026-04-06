@@ -4039,18 +4039,18 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
         );
     }
 
-    for (repo_name, agent_repo) in &repos {
+    for (repo_name, _agent_repo) in &repos {
         let remote_name = if repos.len() == 1 {
             format!("devaipod/{}", short_name)
         } else {
             format!("devaipod/{}/{}", short_name, repo_name)
         };
 
+        let workspace_path = format!("/workspaces/{}", repo_name);
         let result = if container_running {
-            // Use ext:: transport through podman exec
-            let workspace_path = format!("/workspaces/{}", repo_name);
+            // Use ext:: transport through podman exec into the running agent
             tracing::info!(
-                "Fetching from agent container via ext:: transport: {}:{}",
+                "Fetching from agent container: {}:{}",
                 agent_container,
                 workspace_path
             );
@@ -4061,17 +4061,20 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
                 &remote_name,
             )?
         } else {
-            // Fall back to direct filesystem path
-            tracing::info!("Fetching from agent workspace: {}", agent_repo.display());
-            agent_dir::harvest_one_repo(&cwd, agent_repo, &remote_name).with_context(|| {
-                format!(
-                    "Failed to fetch from '{}'. If this workspace uses git alternates \
-                         (workspace-v2), the agent container must be running. \
-                         Try: devaipod start {}",
-                    agent_repo.display(),
-                    short_name
-                )
-            })?
+            // Agent is stopped — spawn a transient container that mounts the
+            // workspace volume + host-side workspace dir so alternates resolve.
+            let image = pod::detect_self_image();
+            tracing::info!(
+                "Agent not running; fetching via transient container for {}",
+                pod_name
+            );
+            agent_dir::harvest_one_repo_via_transient(
+                &cwd,
+                pod_name,
+                &workspace_path,
+                &remote_name,
+                &image,
+            )?
         };
 
         // Print branch information (CLI-specific output)
