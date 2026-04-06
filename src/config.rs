@@ -12,6 +12,100 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+// =============================================================================
+// Source configuration
+// =============================================================================
+
+/// Source access level for bind mounts.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)] // Preparatory for source bind-mount integration
+pub enum SourceAccess {
+    /// Read-only everywhere (control plane + agent). Default.
+    #[default]
+    Readonly,
+    /// Read-write in control plane only, NOT mounted into agent containers.
+    /// Useful for harvest/diff workflows where the control plane needs to write
+    /// (e.g. git remote add) but agents shouldn't modify the original source.
+    Controlplane,
+    /// Read-write everywhere (control plane + agent containers).
+    Agent,
+}
+
+/// A single source entry, supporting both shorthand and full forms.
+/// Shorthand: `src = "~/src"` (defaults to readonly)
+/// Full: `src = { path = "~/src", access = "controlplane" }`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+#[allow(dead_code)] // Preparatory for source bind-mount integration
+pub enum SourceEntry {
+    /// Shorthand: just a path string (defaults to readonly access)
+    Short(String),
+    /// Full entry with explicit access level
+    Full(SourceEntryFull),
+}
+
+/// Full source entry with all options.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Preparatory for source bind-mount integration
+pub struct SourceEntryFull {
+    pub path: String,
+    #[serde(default)]
+    pub access: SourceAccess,
+}
+
+/// Resolved source information after path expansion.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Preparatory for source bind-mount integration
+pub struct ResolvedSource {
+    pub name: String,
+    pub path: PathBuf,
+    pub access: SourceAccess,
+}
+
+/// Environment variable for the host's home directory.
+/// Set by the launcher so container-side tilde expansion resolves to host paths.
+#[allow(dead_code)] // Preparatory for source bind-mount integration
+pub const HOST_HOME_ENV: &str = "DEVAIPOD_HOST_HOME";
+
+/// Expand `~` in a path to the host home directory.
+/// Prefers DEVAIPOD_HOST_HOME (set by launcher) over HOME.
+fn expand_source_path(path: &str) -> PathBuf {
+    if let Some(suffix) = path.strip_prefix("~/") {
+        let home = std::env::var(HOST_HOME_ENV)
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| "/root".to_string());
+        PathBuf::from(home).join(suffix)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// Resolve a source shorthand like `src:github/org/repo` to a full path.
+/// Returns None if the source name is not found in the config or the path doesn't
+/// start with `<name>:`.
+#[allow(dead_code)] // Preparatory for source shorthand resolution
+pub fn resolve_source_shorthand(source: &str, config: &Config) -> Option<PathBuf> {
+    let (name, subpath) = source.split_once(':')?;
+    let entry = config.sources.get(name)?;
+    let (raw_path, _access) = match entry {
+        SourceEntry::Short(p) => (p.clone(), SourceAccess::Readonly),
+        SourceEntry::Full(f) => (f.path.clone(), f.access.clone()),
+    };
+    let expanded = expand_source_path(&raw_path);
+    Some(expanded.join(subpath))
+}
+
+/// Validate a source name. Must be non-empty, alphanumeric + hyphens/underscores.
+#[allow(dead_code)] // Preparatory for source validation
+fn validate_source_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Target container(s) for a secret or configuration
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -102,6 +196,36 @@ pub struct Config {
     /// Journal repository configuration (fallback source for agents without a specific repo)
     #[serde(default)]
     pub journal: JournalConfig,
+
+    /// Named source directories to bind-mount into containers.
+    /// Keys are names (used as mount point: /mnt/<name>), values are paths.
+    #[serde(default)]
+    #[allow(dead_code)] // Preparatory for source bind-mount integration
+    pub sources: HashMap<String, SourceEntry>,
+}
+
+impl Config {
+    /// Resolve all configured sources, expanding ~ to the host home directory.
+    /// Uses DEVAIPOD_HOST_HOME if set (for container-side resolution to host paths),
+    /// otherwise falls back to HOME.
+    #[allow(dead_code)] // Used by tests; will be used by pod creation
+    pub fn resolve_sources(&self) -> Vec<ResolvedSource> {
+        self.sources
+            .iter()
+            .map(|(name, entry)| {
+                let (raw_path, access) = match entry {
+                    SourceEntry::Short(p) => (p.clone(), SourceAccess::Readonly),
+                    SourceEntry::Full(f) => (f.path.clone(), f.access.clone()),
+                };
+                let expanded = expand_source_path(&raw_path);
+                ResolvedSource {
+                    name: name.clone(),
+                    path: expanded,
+                    access,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Journal repository configuration
@@ -2512,5 +2636,268 @@ extra_hosts = []
             assert!(!path.to_str().unwrap().starts_with("~/"));
             assert!(path.to_str().unwrap().ends_with("/src/journal"));
         }
+    }
+
+    // =========================================================================
+    // Sources configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_sources_default_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.sources.is_empty());
+        assert!(config.resolve_sources().is_empty());
+    }
+
+    #[test]
+    fn test_parse_sources_shorthand() {
+        let toml = r#"
+[sources]
+src = "~/src"
+projects = "/opt/projects"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.sources.len(), 2);
+
+        // Verify shorthand entries are parsed as Short variant
+        assert!(matches!(config.sources["src"], SourceEntry::Short(ref p) if p == "~/src"));
+        assert!(
+            matches!(config.sources["projects"], SourceEntry::Short(ref p) if p == "/opt/projects")
+        );
+    }
+
+    #[test]
+    fn test_parse_sources_full_entry() {
+        let toml = r#"
+[sources]
+src = { path = "~/src", access = "controlplane" }
+work = { path = "/mnt/work", access = "agent" }
+readonly-src = { path = "~/readonly" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.sources.len(), 3);
+
+        // Controlplane access
+        match &config.sources["src"] {
+            SourceEntry::Full(f) => {
+                assert_eq!(f.path, "~/src");
+                assert_eq!(f.access, SourceAccess::Controlplane);
+            }
+            _ => panic!("Expected Full entry for 'src'"),
+        }
+
+        // Agent access
+        match &config.sources["work"] {
+            SourceEntry::Full(f) => {
+                assert_eq!(f.path, "/mnt/work");
+                assert_eq!(f.access, SourceAccess::Agent);
+            }
+            _ => panic!("Expected Full entry for 'work'"),
+        }
+
+        // Default (readonly) access
+        match &config.sources["readonly-src"] {
+            SourceEntry::Full(f) => {
+                assert_eq!(f.path, "~/readonly");
+                assert_eq!(f.access, SourceAccess::Readonly);
+            }
+            _ => panic!("Expected Full entry for 'readonly-src'"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sources_mixed() {
+        let toml = r#"
+[sources]
+simple = "~/simple"
+complex = { path = "~/complex", access = "agent" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.sources.len(), 2);
+        assert!(matches!(config.sources["simple"], SourceEntry::Short(_)));
+        assert!(matches!(config.sources["complex"], SourceEntry::Full(_)));
+    }
+
+    #[test]
+    fn test_source_access_deserialize() {
+        // Test all access levels
+        for (input, expected) in [
+            ("readonly", SourceAccess::Readonly),
+            ("controlplane", SourceAccess::Controlplane),
+            ("agent", SourceAccess::Agent),
+        ] {
+            let toml = format!(
+                r#"
+[sources]
+test = {{ path = "/tmp", access = "{input}" }}
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap();
+            match &config.sources["test"] {
+                SourceEntry::Full(f) => assert_eq!(f.access, expected, "for access={input}"),
+                _ => panic!("Expected Full entry"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_source_access_default() {
+        assert_eq!(SourceAccess::default(), SourceAccess::Readonly);
+    }
+
+    #[test]
+    fn test_resolve_sources_absolute_path() {
+        let toml = r#"
+[sources]
+data = "/opt/data"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_sources();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "data");
+        assert_eq!(resolved[0].path, PathBuf::from("/opt/data"));
+        assert_eq!(resolved[0].access, SourceAccess::Readonly);
+    }
+
+    #[test]
+    fn test_resolve_sources_tilde_expansion() {
+        let toml = r#"
+[sources]
+src = "~/src"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_sources();
+        assert_eq!(resolved.len(), 1);
+        // Should expand ~ using HOME
+        let path_str = resolved[0].path.to_str().unwrap();
+        assert!(!path_str.starts_with("~/"), "tilde should be expanded");
+        assert!(path_str.ends_with("/src"));
+    }
+
+    #[test]
+    fn test_resolve_sources_full_entry_access() {
+        let toml = r#"
+[sources]
+src = { path = "/opt/src", access = "controlplane" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_sources();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "src");
+        assert_eq!(resolved[0].path, PathBuf::from("/opt/src"));
+        assert_eq!(resolved[0].access, SourceAccess::Controlplane);
+    }
+
+    #[test]
+    fn test_expand_source_path_absolute() {
+        assert_eq!(expand_source_path("/opt/data"), PathBuf::from("/opt/data"));
+    }
+
+    #[test]
+    fn test_expand_source_path_tilde() {
+        let expanded = expand_source_path("~/projects");
+        let path_str = expanded.to_str().unwrap();
+        assert!(!path_str.starts_with("~/"));
+        assert!(path_str.ends_with("/projects"));
+    }
+
+    #[test]
+    fn test_expand_source_path_no_tilde_prefix() {
+        // Only ~/... triggers expansion; bare ~ or ~user does not
+        assert_eq!(expand_source_path("~"), PathBuf::from("~"));
+        assert_eq!(
+            expand_source_path("relative/path"),
+            PathBuf::from("relative/path")
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_found() {
+        let toml = r#"
+[sources]
+src = "/opt/src"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = resolve_source_shorthand("src:github/org/repo", &config);
+        assert_eq!(result, Some(PathBuf::from("/opt/src/github/org/repo")));
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_full_entry() {
+        let toml = r#"
+[sources]
+src = { path = "/opt/src", access = "controlplane" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = resolve_source_shorthand("src:myproject", &config);
+        assert_eq!(result, Some(PathBuf::from("/opt/src/myproject")));
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_not_found() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(resolve_source_shorthand("src:foo", &config), None);
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_no_colon() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(resolve_source_shorthand("no-colon-here", &config), None);
+    }
+
+    #[test]
+    fn test_validate_source_name_valid() {
+        assert!(validate_source_name("src"));
+        assert!(validate_source_name("my-sources"));
+        assert!(validate_source_name("src_2"));
+        assert!(validate_source_name("Projects123"));
+        assert!(validate_source_name("a"));
+    }
+
+    #[test]
+    fn test_validate_source_name_invalid() {
+        assert!(!validate_source_name(""));
+        assert!(!validate_source_name("has spaces"));
+        assert!(!validate_source_name("has/slash"));
+        assert!(!validate_source_name("has.dot"));
+        assert!(!validate_source_name("special!char"));
+    }
+
+    #[test]
+    fn test_source_access_serialize() {
+        // SourceAccess derives Serialize; verify round-trip
+        let access = SourceAccess::Controlplane;
+        let json = serde_json::to_string(&access).unwrap();
+        assert_eq!(json, r#""controlplane""#);
+
+        let access = SourceAccess::Agent;
+        let json = serde_json::to_string(&access).unwrap();
+        assert_eq!(json, r#""agent""#);
+
+        let access = SourceAccess::Readonly;
+        let json = serde_json::to_string(&access).unwrap();
+        assert_eq!(json, r#""readonly""#);
+    }
+
+    #[test]
+    fn test_sources_with_other_config() {
+        // Ensure sources plays well alongside other config sections
+        let toml = r#"
+default-image = "ghcr.io/devcontainers/base:ubuntu"
+
+[sources]
+src = "~/src"
+work = { path = "/opt/work", access = "agent" }
+
+[env]
+allowlist = ["HOME"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.default_image,
+            Some("ghcr.io/devcontainers/base:ubuntu".to_string())
+        );
+        assert_eq!(config.sources.len(), 2);
+        assert_eq!(config.env.allowlist.len(), 1);
     }
 }
