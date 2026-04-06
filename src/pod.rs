@@ -316,8 +316,7 @@ pub const GATOR_PORT: u16 = 8765;
 const GATOR_IMAGE: &str = "ghcr.io/cgwalters/service-gator:latest";
 
 /// Fallback image for the devaipod API sidecar container.
-// TODO: Derive this from the running control-plane container at runtime
-// (see detect_own_container_image() in main.rs for the pattern).
+// TODO: Derive this from the running control-plane container at runtime.
 const DEVAIPOD_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
 
 /// Detect the image ID (digest) of the running control plane container.
@@ -1885,8 +1884,11 @@ echo "Dotfiles installed successfully"
             .with_context(|| format!("Failed to install dotfiles in {}", container))?;
 
         if exit_code != 0 {
-            tracing::warn!(
-                "Dotfiles installation in {} exited with code {}. Continuing anyway.",
+            bail!(
+                "Dotfiles installation in {} failed (exit code {}). \
+                 The dotfiles install script must succeed because it provides \
+                 the opencode configuration. Check that all tools it requires \
+                 (e.g. rsync) are available in the container image.",
                 container,
                 exit_code
             );

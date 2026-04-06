@@ -5366,9 +5366,6 @@ async fn cmd_advisor(
     }
 }
 
-/// Default fallback image for the advisor pod (used only when auto-detection fails)
-const ADVISOR_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
-
 /// Default system prompt for the advisor agent.
 ///
 /// This prompt instructs the advisor to use its MCP tools to survey the
@@ -5410,53 +5407,6 @@ project structure and cross-repo dependencies. This helps you write better task 
 descriptions.
 
 After your initial survey, summarize what you found and what you proposed.";
-
-/// Get the container image to use for the advisor pod.
-///
-/// When running inside the devaipod container, queries podman for the
-/// image of the running `devaipod` container so the advisor uses the
-/// exact same image as the control plane. This avoids pulling a remote
-/// image when a locally-built one is available. Falls back to the
-/// published image if detection fails.
-fn advisor_image() -> String {
-    if is_inside_devaipod_container() {
-        if let Some(image) = detect_own_container_image() {
-            tracing::debug!("Detected own container image: {}", image);
-            return image;
-        }
-        tracing::warn!(
-            "Could not detect own container image, falling back to {}",
-            ADVISOR_IMAGE_FALLBACK
-        );
-    }
-    ADVISOR_IMAGE_FALLBACK.to_string()
-}
-
-/// Detect the image of the running devaipod control plane container.
-///
-/// The control plane container is named `devaipod` by default, but when
-/// `DEVAIPOD_INSTANCE` is set (e.g. `test-devaipod` for a multi-instance
-/// setup) we use that instead. We inspect it via the podman CLI to find
-/// the image name. Returns `None` if detection fails.
-fn detect_own_container_image() -> Option<String> {
-    // Use DEVAIPOD_INSTANCE if set (e.g. "test-devaipod"), otherwise "devaipod"
-    let container_name =
-        std::env::var(DEVAIPOD_INSTANCE_ENV).unwrap_or_else(|_| "devaipod".to_string());
-    let output = std::process::Command::new("podman")
-        .args(["inspect", &container_name, "--format", "{{.ImageName}}"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if image.is_empty() {
-        return None;
-    }
-    Some(image)
-}
 
 /// Detect the host-mapped port for the control plane's web server.
 ///
@@ -5511,7 +5461,6 @@ async fn create_advisor_pod(
     task: Option<&str>,
     source_dirs: &[PathBuf],
 ) -> Result<()> {
-    let image = advisor_image();
     let default_task = task.unwrap_or(ADVISOR_SYSTEM_PROMPT);
 
     // The MCP server runs as a route on the devaipod web server.
@@ -5553,7 +5502,7 @@ async fn create_advisor_pod(
         &advisor_config,
         source,
         Some(default_task),
-        Some(&image),
+        None,            // Use user's default devcontainer image, not the devaipod image
         Some("advisor"), // Becomes devaipod-advisor via normalize_pod_name
         &[],             // service-gator scopes from config
         None,
@@ -7902,12 +7851,15 @@ fn cmd_opencode_status(pod_name: &str, json_output: bool) -> Result<()> {
 fn check_agent_health(pod_name: &str) -> Option<bool> {
     let agent_container = format!("{}-agent", pod_name);
 
-    // Use nc to check if the port is accepting connections.
-    // This is more reliable than HTTP health checks since opencode's
-    // endpoints may return errors during/after initialization.
-    let check_cmd = format!("nc -z localhost {} 2>/dev/null", pod::OPENCODE_PORT);
+    // Use bash's built-in /dev/tcp to check if the port is accepting
+    // connections.  This avoids depending on `nc` which may not be
+    // installed (e.g. the devaipod image used for the advisor pod).
+    let check_cmd = format!(
+        "echo >/dev/tcp/localhost/{} 2>/dev/null",
+        pod::OPENCODE_PORT
+    );
     let result = podman_command()
-        .args(["exec", &agent_container, "/bin/sh", "-c", &check_cmd])
+        .args(["exec", &agent_container, "bash", "-c", &check_cmd])
         .status();
 
     match result {
