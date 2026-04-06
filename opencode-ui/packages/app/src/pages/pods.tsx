@@ -539,7 +539,7 @@ function timeAgo(iso: string): string {
 
 function ControlPlaneView(props: { onQuickLaunch: (repoLabel: string) => void }) {
   const ctx = useDevaipod()
-  const [showInactive, setShowInactive] = createSignal(false)
+  const [showInactive, setShowInactive] = createSignal(true)
 
   const activeRepos = createMemo(() =>
     ctx.controlPlane.filter((r) => r.active_count > 0),
@@ -568,7 +568,7 @@ function ControlPlaneView(props: { onQuickLaunch: (repoLabel: string) => void })
             </button>
             <Show when={showInactive()}>
               <For each={inactiveRepos()}>
-                {(repo) => <RepoSection repo={repo} defaultOpen={false} onQuickLaunch={props.onQuickLaunch} />}
+                {(repo) => <RepoSection repo={repo} defaultOpen={true} onQuickLaunch={props.onQuickLaunch} />}
               </For>
             </Show>
           </Show>

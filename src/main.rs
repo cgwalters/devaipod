@@ -5490,17 +5490,13 @@ fn detect_own_host_port() -> u16 {
     8080
 }
 
-/// Return the advisor pod name for this instance.
+/// Return the advisor pod name.
 ///
-/// When `DEVAIPOD_INSTANCE` is set (e.g. `test-devaipod`), the advisor pod
-/// is named `<instance>-advisor` (e.g. `test-devaipod-advisor`). Otherwise
-/// it defaults to `devaipod-advisor`.
+/// Always `devaipod-advisor` — instance isolation is handled by the
+/// `io.devaipod.instance` label, not the pod name. All pods share the
+/// `devaipod-` prefix regardless of instance.
 pub(crate) fn advisor_pod_name() -> String {
-    if let Some(instance) = get_instance_id() {
-        format!("{}-advisor", instance)
-    } else {
-        "devaipod-advisor".to_string()
-    }
+    "devaipod-advisor".to_string()
 }
 
 /// Create the advisor pod using cmd_run with advisor-specific settings.
