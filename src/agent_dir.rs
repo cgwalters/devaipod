@@ -372,8 +372,8 @@ pub struct HarvestRepoResult {
 /// Build the podman CLI argument list (binary + `--url` flag) matching how
 /// the rest of devaipod invokes podman.
 ///
-/// Returns `("podman", ["--url", "unix:///path/to/sock"])` or just
-/// `("podman", [])` when no socket is discovered. The caller can join
+/// Returns a `Vec<String>` like `["podman", "--url", "unix:///path/to/sock"]`
+/// or just `["podman"]` when no socket is discovered. The caller can join
 /// these into a shell command string for use in `ext::` URLs.
 fn podman_cli_prefix() -> Vec<String> {
     let mut args = vec!["podman".to_string()];
@@ -438,7 +438,7 @@ pub fn harvest_one_repo_via_exec(
         "ext::{} exec -i {} git-upload-pack {}",
         prefix.join(" "),
         shell_quote(container_name),
-        workspace_path,
+        shell_quote(workspace_path),
     );
 
     tracing::debug!("Using ext:: transport: {}", ext_url);

@@ -101,6 +101,12 @@ pub fn source_path_to_host(path: &Path, config: &Config) -> PathBuf {
     for source in config.resolve_sources() {
         let mount_prefix = format!("/mnt/{}", source.name);
         if let Some(suffix) = path_str.strip_prefix(&mount_prefix) {
+            // Guard against false prefix matches: `/mnt/src` must not match
+            // `/mnt/srcode/foo`. The remainder after stripping must be empty
+            // (exact match) or start with `/`.
+            if !suffix.is_empty() && !suffix.starts_with('/') {
+                continue;
+            }
             let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
             if suffix.is_empty() {
                 return source.path.clone();

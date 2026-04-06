@@ -182,6 +182,20 @@ fn get_latest_workspace() -> Result<String> {
     Ok(latest.to_string())
 }
 
+/// If `source` matches a configured source shorthand (e.g. `src:github/org/repo`),
+/// resolve it to a full container path. Otherwise return the source unchanged.
+fn maybe_resolve_shorthand(source: Option<&str>, config: &config::Config) -> Option<String> {
+    source.map(|s| {
+        if let Some(resolved) = config::resolve_source_shorthand(s, config) {
+            let resolved_str = resolved.to_string_lossy().to_string();
+            tracing::info!("Resolved source shorthand '{}' -> {}", s, resolved_str);
+            resolved_str
+        } else {
+            s.to_string()
+        }
+    })
+}
+
 /// Resolve the source for a workspace, using journal or dotfiles as fallback
 ///
 /// If source is provided, returns it. Otherwise, falls back to the journal
@@ -1543,16 +1557,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
     match cli.command {
         HostCommand::Up { source, opts } => {
             let source = resolve_source(source.as_deref(), &config);
-            // Check if source matches a configured source shorthand (e.g., "src:github/org/repo")
-            let source = source.map(|s| {
-                if let Some(resolved) = config::resolve_source_shorthand(s, &config) {
-                    let resolved_str = resolved.to_string_lossy().to_string();
-                    tracing::info!("Resolved source shorthand '{}' -> {}", s, resolved_str);
-                    resolved_str
-                } else {
-                    s.to_string()
-                }
-            });
+            let source = maybe_resolve_shorthand(source, &config);
             cmd_up(&config, source.as_deref(), opts).await
         }
 
@@ -1659,18 +1664,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
             source_dirs,
         } => {
             let source = resolve_source(source.as_deref(), &config);
-
-            // Check if source matches a configured source shorthand (e.g., "src:github/org/repo")
-            // and resolve it to a full path before any other processing.
-            let source = source.map(|s| {
-                if let Some(resolved) = config::resolve_source_shorthand(s, &config) {
-                    let resolved_str = resolved.to_string_lossy().to_string();
-                    tracing::info!("Resolved source shorthand '{}' -> {}", s, resolved_str);
-                    resolved_str
-                } else {
-                    s.to_string()
-                }
-            });
+            let source = maybe_resolve_shorthand(source, &config);
             let source = source.as_deref();
 
             // Merge task sources: positional arg takes precedence, then -c/--command

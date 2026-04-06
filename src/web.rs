@@ -4002,6 +4002,10 @@ fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, S
     let short_name = strip_pod_prefix(pod_name);
     let mut harvested = Vec::new();
 
+    // Check once whether the agent container is running (avoid per-repo overhead).
+    let agent_container = format!("{pod_name}-agent");
+    let container_running = crate::agent_dir::is_container_running(&agent_container);
+
     for (repo_name, repo_path) in &repos {
         // Check if HEAD has advanced since last harvest
         let current_head = run_git(repo_path, &["rev-parse", "HEAD"]);
@@ -4047,8 +4051,7 @@ fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, S
 
         // Try ext:: transport through podman exec first (handles workspace-v2
         // repos with container-internal alternates), falling back to direct path.
-        let agent_container = format!("{pod_name}-agent");
-        let harvest_result = if crate::agent_dir::is_container_running(&agent_container) {
+        let harvest_result = if container_running {
             let workspace_path = format!("/workspaces/{repo_name}");
             crate::agent_dir::harvest_one_repo_via_exec(
                 &target_repo,
@@ -4328,8 +4331,9 @@ fn build_app_with_cache(
 /// 4. It creates the real `$NAME` container with additional `-v` mounts for sources
 /// 5. The launcher exits; the real server container runs `devaipod web`
 ///
-/// If `DEVAIPOD_CONTAINER_NAME` is not set or no sources are configured, this is
-/// a no-op and the current process continues as the server.
+/// If `DEVAIPOD_CONTAINER_NAME` is not set or the container name does not end
+/// with `-launcher`, this is a no-op and the current process continues as the
+/// server. The server container is always created (even with zero sources).
 fn maybe_launch_server_with_sources() -> Result<()> {
     // Step (a): only act when running as a launcher container
     let container_name = match std::env::var("DEVAIPOD_CONTAINER_NAME") {
