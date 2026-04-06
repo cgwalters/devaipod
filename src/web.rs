@@ -4044,7 +4044,22 @@ fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, S
             format!("devaipod/{short_name}/{repo_name}")
         };
 
-        match crate::agent_dir::harvest_one_repo(&target_repo, repo_path, &remote_name) {
+        // Try ext:: transport through podman exec first (handles workspace-v2
+        // repos with container-internal alternates), falling back to direct path.
+        let agent_container = format!("{pod_name}-agent");
+        let harvest_result = if crate::agent_dir::is_container_running(&agent_container) {
+            let workspace_path = format!("/workspaces/{repo_name}");
+            crate::agent_dir::harvest_one_repo_via_exec(
+                &target_repo,
+                &agent_container,
+                &workspace_path,
+                &remote_name,
+            )
+        } else {
+            crate::agent_dir::harvest_one_repo(&target_repo, repo_path, &remote_name)
+        };
+
+        match harvest_result {
             Ok(result) => {
                 harvested.push(HarvestedRepo {
                     repo_name: repo_name.to_string(),

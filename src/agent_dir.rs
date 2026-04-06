@@ -369,6 +369,173 @@ pub struct HarvestRepoResult {
     pub branches: Vec<String>,
 }
 
+/// Build the podman CLI argument list (binary + `--url` flag) matching how
+/// the rest of devaipod invokes podman.
+///
+/// Returns `("podman", ["--url", "unix:///path/to/sock"])` or just
+/// `("podman", [])` when no socket is discovered. The caller can join
+/// these into a shell command string for use in `ext::` URLs.
+fn podman_cli_prefix() -> Vec<String> {
+    let mut args = vec!["podman".to_string()];
+    if let Ok(socket_path) = podman::get_container_socket() {
+        args.push("--url".to_string());
+        args.push(format!("unix://{}", socket_path.display()));
+    }
+    args
+}
+
+/// Check whether a container is currently running.
+///
+/// Uses `podman inspect` to query the container's running state. Returns
+/// `false` when the container doesn't exist or isn't running.
+pub fn is_container_running(container_name: &str) -> bool {
+    let mut cmd_args = podman_cli_prefix();
+    cmd_args.extend([
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{.State.Running}}".to_string(),
+        container_name.to_string(),
+    ]);
+
+    let output = std::process::Command::new(&cmd_args[0])
+        .args(&cmd_args[1..])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
+        _ => false,
+    }
+}
+
+/// Harvest commits from an agent repo via `ext::` git transport.
+///
+/// Instead of pointing git at a host-side filesystem path (which breaks
+/// for workspace-v2 repos that use container-internal alternates), this
+/// tunnels git-upload-pack through `podman exec` into the running agent
+/// container where the alternates resolve correctly.
+///
+/// `container_name` is the full podman container name (e.g.
+/// `devaipod-myproject-abc-agent`).
+///
+/// `workspace_path` is the repo path *inside* the container (e.g.
+/// `/workspaces/myproject`).
+pub fn harvest_one_repo_via_exec(
+    target_repo: &Path,
+    container_name: &str,
+    workspace_path: &str,
+    remote_name: &str,
+) -> Result<HarvestRepoResult> {
+    use color_eyre::eyre::bail;
+
+    // Build the ext:: URL. We hardcode `git-upload-pack` (used by fetch)
+    // rather than using git's `%S` placeholder, since we only need the
+    // upload-pack direction. The full podman invocation including `--url`
+    // matches how the control plane talks to the host podman daemon.
+    let prefix = podman_cli_prefix();
+    let ext_url = format!(
+        "ext::{} exec -i {} git-upload-pack {}",
+        prefix.join(" "),
+        shell_quote(container_name),
+        workspace_path,
+    );
+
+    tracing::debug!("Using ext:: transport: {}", ext_url);
+
+    // Add or update the remote
+    let add_result = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_repo)
+        .args(["remote", "add", remote_name, &ext_url])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run git remote add")?;
+
+    if !add_result.status.success() {
+        let stderr = String::from_utf8_lossy(&add_result.stderr);
+        if stderr.contains("already exists") {
+            let set_result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(target_repo)
+                .args(["remote", "set-url", remote_name, &ext_url])
+                .output()
+                .context("Failed to run git remote set-url")?;
+            if !set_result.status.success() {
+                let stderr = String::from_utf8_lossy(&set_result.stderr);
+                tracing::warn!(
+                    "Failed to update remote '{}' URL: {}",
+                    remote_name,
+                    stderr.trim()
+                );
+            }
+        } else {
+            bail!("Failed to add remote '{}': {}", remote_name, stderr.trim());
+        }
+    }
+
+    // Fetch with protocol.ext.allow=always so git permits the ext:: URL.
+    let fetch_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_repo)
+        .args(["-c", "protocol.ext.allow=always"])
+        .args(["fetch", remote_name])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run git fetch via ext:: transport")?;
+
+    let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+    let real_errors: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.contains("unable to normalize alternate"))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if !fetch_output.status.success() && !real_errors.is_empty() {
+        bail!(
+            "Failed to fetch from '{}' via ext:: transport: {}",
+            remote_name,
+            real_errors.join("\n")
+        );
+    }
+
+    // List branches
+    let branch_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_repo)
+        .args(["branch", "-r", "--list", &format!("{remote_name}/*")])
+        .output()
+        .context("Failed to list remote branches")?;
+
+    let branches: Vec<String> = if branch_output.status.success() {
+        String::from_utf8_lossy(&branch_output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else {
+        vec![]
+    };
+
+    Ok(HarvestRepoResult {
+        remote_name: remote_name.to_string(),
+        branches,
+    })
+}
+
+/// Shell-quote a string for safe embedding in an ext:: URL.
+///
+/// Wraps the value in single quotes and escapes any embedded single quotes
+/// using the `'\''` idiom (end quote, escaped quote, restart quote).
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Add or update a git remote in `target_repo` pointing at `agent_repo`,
 /// then fetch from it. Returns the list of fetched branches.
 ///

@@ -3991,12 +3991,36 @@ fn verify_current_dir_is_git_repo() -> Result<()> {
 /// Discovers all git repos in the agent's workspace and fetches each one.
 /// For single-repo workspaces the remote is named `devaipod/<workspace>`;
 /// for multi-repo workspaces each remote is `devaipod/<workspace>/<repo>`.
+///
+/// When the agent container is running, uses `ext::` git transport to tunnel
+/// git-upload-pack through `podman exec`. This avoids the broken-alternates
+/// problem with workspace-v2 repos whose git alternates point to
+/// container-internal paths that don't exist on the host.
+///
+/// Falls back to direct filesystem access when the container is not running
+/// (works for self-contained repos without alternates).
 fn cmd_fetch(pod_name: &str) -> Result<()> {
     verify_current_dir_is_git_repo()?;
 
     let repos = find_all_agent_git_repos(pod_name)?;
     let short_name = strip_pod_prefix(pod_name);
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
+
+    // Check if the agent container is running for ext:: transport
+    let agent_container = get_attach_container_name(pod_name, AttachTarget::Agent);
+    let container_running = agent_dir::is_container_running(&agent_container);
+
+    if container_running {
+        tracing::debug!(
+            "Agent container '{}' is running, using ext:: transport",
+            agent_container
+        );
+    } else {
+        tracing::debug!(
+            "Agent container '{}' is not running, using direct filesystem access",
+            agent_container
+        );
+    }
 
     for (repo_name, agent_repo) in &repos {
         let remote_name = if repos.len() == 1 {
@@ -4005,9 +4029,33 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
             format!("devaipod/{}/{}", short_name, repo_name)
         };
 
-        tracing::info!("Fetching from agent workspace: {}", agent_repo.display());
-
-        let result = agent_dir::harvest_one_repo(&cwd, agent_repo, &remote_name)?;
+        let result = if container_running {
+            // Use ext:: transport through podman exec
+            let workspace_path = format!("/workspaces/{}", repo_name);
+            tracing::info!(
+                "Fetching from agent container via ext:: transport: {}:{}",
+                agent_container,
+                workspace_path
+            );
+            agent_dir::harvest_one_repo_via_exec(
+                &cwd,
+                &agent_container,
+                &workspace_path,
+                &remote_name,
+            )?
+        } else {
+            // Fall back to direct filesystem path
+            tracing::info!("Fetching from agent workspace: {}", agent_repo.display());
+            agent_dir::harvest_one_repo(&cwd, agent_repo, &remote_name).with_context(|| {
+                format!(
+                    "Failed to fetch from '{}'. If this workspace uses git alternates \
+                         (workspace-v2), the agent container must be running. \
+                         Try: devaipod start {}",
+                    agent_repo.display(),
+                    short_name
+                )
+            })?
+        };
 
         // Print branch information (CLI-specific output)
         if !result.branches.is_empty() {
