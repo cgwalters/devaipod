@@ -330,6 +330,8 @@ pub enum Action {
     Advisor,
     /// Open the review TUI for the specified instance
     Review(String),
+    /// Rebuild (recreate) the selected instance
+    Rebuild(String),
 }
 
 /// Application state for the TUI
@@ -1166,6 +1168,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 refresh_interval.reset();
                                 let _ = app.refresh_from_api().await;
                             }
+                            Action::Rebuild(name) => {
+                                app.status_message =
+                                    Some(format!("Rebuilding {}...", name));
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                match run_subprocess_silent(&["rebuild", "--", &name])
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        app.status_message =
+                                            Some(format!("Rebuilt {}", name));
+                                    }
+                                    Err(e) => {
+                                        app.status_message = Some(format!(
+                                            "Failed to rebuild {}: {}",
+                                            name, e
+                                        ));
+                                    }
+                                }
+                                refresh_interval.reset();
+                                let _ = app.refresh_from_api().await;
+                            }
                         }
                     }
             }
@@ -1268,6 +1291,15 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
             // Open review TUI for selected instance
             if let Some(instance) = app.selected_instance() {
                 Some(Action::Review(instance.name.clone()))
+            } else {
+                app.status_message = Some("No instance selected".to_string());
+                None
+            }
+        }
+        KeyCode::Char('B') => {
+            // Rebuild (recreate) selected instance
+            if let Some(instance) = app.selected_instance() {
+                Some(Action::Rebuild(instance.name.clone()))
             } else {
                 app.status_message = Some("No instance selected".to_string());
                 None
@@ -1655,7 +1687,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Nav │ a: Attach │ →: Menu │ e: Exec │ S: Stop │ d: Del │ L: Launch │ A: Advisor │ R: Review │ r: Refresh",
+            " q: Quit │ j/k: Nav │ a: Attach │ →: Menu │ e: Exec │ S: Stop │ B: Rebuild │ d: Del │ L: Launch │ A: Advisor │ R: Review │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (
