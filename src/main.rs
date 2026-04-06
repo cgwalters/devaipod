@@ -186,31 +186,22 @@ fn get_latest_workspace() -> Result<String> {
 ///
 /// If source is provided, returns it. Otherwise, falls back to the journal
 /// repo (if configured), then the dotfiles URL, or returns an error.
-fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Result<&'a str> {
+fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Option<&'a str> {
     if let Some(s) = source {
-        return Ok(s);
+        return Some(s);
     }
 
     // Fall back to journal repo if configured
     if let Some(ref repo) = config.journal.repo {
         tracing::info!("No source specified, using journal repo: {}", repo);
-        return Ok(repo.as_str());
+        return Some(repo.as_str());
     }
 
-    config
-        .dotfiles
-        .as_ref()
-        .map(|d| d.url.as_str())
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "No source specified and no journal or dotfiles repository configured.\n\
-                 Either provide a source argument, or configure a fallback in your config:\n\n\
-                 [journal]\n\
-                 repo = \"~/src/journal\"\n\n\
-                 [dotfiles]\n\
-                 url = \"https://github.com/youruser/dotfiles\""
-            )
-        })
+    if let Some(ref dotfiles) = config.dotfiles {
+        return Some(dotfiles.url.as_str());
+    }
+
+    None
 }
 
 /// Sanitize a name for use in pod names (alphanumeric and hyphens only)
@@ -1551,7 +1542,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
 
     match cli.command {
         HostCommand::Up { source, opts } => {
-            let source = resolve_source(source.as_deref(), &config)?;
+            let source = resolve_source(source.as_deref(), &config);
             cmd_up(&config, source, opts).await
         }
 
@@ -1657,42 +1648,59 @@ async fn run_host(cli: HostCli) -> Result<()> {
             no_auto_approve,
             source_dirs,
         } => {
-            let source = resolve_source(source.as_deref(), &config)?;
+            let source = resolve_source(source.as_deref(), &config);
+
+            // Merge task sources: positional arg takes precedence, then -c/--command
+            let explicit_task = task.or(command);
+
+            // If no source and no explicit task, error out early with guidance
+            if source.is_none() && explicit_task.is_none() {
+                bail!(
+                    "No source specified. Either provide a git URL, or use -c to specify a task for a scratch workspace.\n\
+                     You can also configure a fallback in your config:\n\n\
+                     [journal]\n\
+                     repo = \"~/src/journal\"\n\n\
+                     [dotfiles]\n\
+                     url = \"https://github.com/youruser/dotfiles\""
+                );
+            }
 
             // Check if source is an issue or PR URL - if so, set default task
             // Format: "<url> - work on" so human can easily edit the action
-            let (effective_source, default_task) =
-                if let Some(issue_ref) = forge::parse_issue_url(source) {
-                    let issue_url = issue_ref.issue_url();
-                    let repo_url = issue_ref.repo_url();
-                    tracing::info!("Issue URL detected: {}", issue_ref.short_display());
-                    (repo_url, Some(format!("{} - work on", issue_url)))
-                } else if let Some(pr_ref) = forge::parse_pr_url(source) {
-                    let pr_url = pr_ref.pr_url();
-                    tracing::info!("PR URL detected: {}", pr_ref.short_display());
-                    // For PRs, keep the PR URL as source (will be handled by create_workspace_from_pr)
-                    (source.to_string(), Some(format!("{} - work on", pr_url)))
-                } else {
-                    (source.to_string(), None)
-                };
-
-            // Merge task sources: positional arg takes precedence, then -c/--command
-            // Note: default_task from issue URL is NOT merged here - it's used as
-            // the pre-filled text in the interactive prompt instead
-            let explicit_task = task.or(command);
+            let (effective_source, default_task) = match source {
+                Some(source) => {
+                    if let Some(issue_ref) = forge::parse_issue_url(source) {
+                        let issue_url = issue_ref.issue_url();
+                        let repo_url = issue_ref.repo_url();
+                        tracing::info!("Issue URL detected: {}", issue_ref.short_display());
+                        (Some(repo_url), Some(format!("{} - work on", issue_url)))
+                    } else if let Some(pr_ref) = forge::parse_pr_url(source) {
+                        let pr_url = pr_ref.pr_url();
+                        tracing::info!("PR URL detected: {}", pr_ref.short_display());
+                        (
+                            Some(source.to_string()),
+                            Some(format!("{} - work on", pr_url)),
+                        )
+                    } else {
+                        (Some(source.to_string()), None)
+                    }
+                }
+                None => (None, None),
+            };
 
             // Determine final source and task: explicit task, or prompt interactively
             let (effective_source, effective_task) = match explicit_task {
                 Some(t) => (effective_source, Some(t)),
-                None if std::io::stdin().is_terminal() => {
+                None if effective_source.is_some() && std::io::stdin().is_terminal() => {
                     // Use TUI-style editable prompt for both source and task
+                    // (only when we have a source to show)
                     match tui::prompt_launch_input(
-                        &effective_source,
+                        effective_source.as_deref().unwrap(),
                         default_task.as_deref().unwrap_or(""),
                     )
                     .await?
                     {
-                        Some(result) => (result.url, Some(result.task)),
+                        Some(result) => (Some(result.url), Some(result.task)),
                         None => {
                             // User cancelled with Esc
                             std::process::exit(130)
@@ -1700,7 +1708,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                     }
                 }
                 // Non-interactive: try to read from stdin (for piped input), fall back to default_task
-                None => {
+                None if effective_source.is_some() => {
                     use std::io::BufRead;
                     let stdin = std::io::stdin();
                     let mut line = String::new();
@@ -1717,11 +1725,13 @@ async fn run_host(cli: HostCli) -> Result<()> {
                         Err(_) => (effective_source, default_task), // Read error, use default
                     }
                 }
+                // No source and explicit_task was None — we already bailed above
+                None => (effective_source, None),
             };
 
             let pod_name = cmd_run(
                 &config,
-                &effective_source,
+                effective_source.as_deref(),
                 effective_task.as_deref(),
                 image.as_deref(),
                 name.as_deref(),
@@ -1843,16 +1853,26 @@ async fn cmd_devcontainer(config: &config::Config, action: DevcontainerAction) -
             devcontainer_json,
             use_default_devcontainer,
         } => {
-            let source = resolve_source(source.as_deref(), config)?;
-            cmd_devcontainer_run(
-                config,
-                source,
-                image.as_deref(),
-                name.as_deref(),
-                devcontainer_json.as_deref(),
-                use_default_devcontainer,
-            )
-            .await
+            let source = resolve_source(source.as_deref(), config);
+            match source {
+                Some(source) => {
+                    cmd_devcontainer_run(
+                        config,
+                        source,
+                        image.as_deref(),
+                        name.as_deref(),
+                        devcontainer_json.as_deref(),
+                        use_default_devcontainer,
+                    )
+                    .await
+                }
+                None => {
+                    bail!(
+                        "No source specified for devcontainer.\n\
+                         Either provide a source argument, or configure a fallback in your config."
+                    );
+                }
+            }
         }
         DevcontainerAction::List { json } => cmd_devcontainer_list(json),
         DevcontainerAction::Rm { name, force } => cmd_delete(&normalize_pod_name(&name), force),
@@ -2635,12 +2655,9 @@ fn write_workspace_state(
 /// the pod but doesn't perform any interactive operations afterward.
 async fn create_workspace(
     config: &config::Config,
-    source: &str,
+    source: Option<&str>,
     opts: &CreateOptions,
 ) -> Result<CreateResult> {
-    let source = normalize_source(source, &config.git.extra_hosts);
-    let source = source.as_ref();
-
     // Merge CLI --mcp servers into config if any were provided.
     // We need to create a modified config since Config doesn't derive Clone.
     // Instead, we merge into a local McpServersConfig and swap it in via
@@ -2654,15 +2671,22 @@ async fn create_workspace(
     };
 
     // Dispatch based on source type
-    let result = if let Some(pr_ref) = forge::parse_pr_url(source) {
-        create_workspace_from_pr(config, pr_ref, opts).await?
-    } else if source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("git@")
-    {
-        create_workspace_from_remote(config, source, opts).await?
+    let result = if let Some(source) = source {
+        let source = normalize_source(source, &config.git.extra_hosts);
+        let source = source.as_ref();
+
+        if let Some(pr_ref) = forge::parse_pr_url(source) {
+            create_workspace_from_pr(config, pr_ref, opts).await?
+        } else if source.starts_with("http://")
+            || source.starts_with("https://")
+            || source.starts_with("git@")
+        {
+            create_workspace_from_remote(config, source, opts).await?
+        } else {
+            create_workspace_from_local(config, source, opts).await?
+        }
     } else {
-        create_workspace_from_local(config, source, opts).await?
+        create_workspace_without_source(config, opts).await?
     };
 
     // Auto-create SSH config entry if enabled (default: true)
@@ -3033,6 +3057,100 @@ async fn create_workspace_from_local(
 
     drop(podman);
 
+    Ok(CreateResult { pod_name })
+}
+
+/// Create a scratch workspace without a git repo source.
+///
+/// The devcontainer image is resolved from fallback sources (dotfiles repo
+/// devcontainer.json, --image flag, or default-image in config). The workspace
+/// gets an empty directory instead of a git clone.
+async fn create_workspace_without_source(
+    config: &config::Config,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    tracing::info!("Creating scratch workspace (no source repo)...");
+
+    // Resolve devcontainer config without a project path — this will use
+    // fallback sources (dotfiles repo, --image, or default-image config)
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let (devcontainer_config, effective_image) =
+        resolve_devcontainer_config(config, temp_dir.path(), opts, "scratch workspace").await?;
+
+    let pod_name = if let Some(ref name) = opts.name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name("scratch")
+    };
+
+    check_api_keys_configured();
+
+    // Use base service-gator config (no repo-specific scopes)
+    let service_gator_config = if !opts.service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
+            .context("Failed to parse --service-gator scopes")?;
+        service_gator::merge_configs(&config.service_gator, &cli_scopes)
+    } else {
+        config.service_gator.clone()
+    };
+
+    let enable_gator = service_gator_config.is_enabled();
+
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    let source = pod::WorkspaceSource::Scratch;
+
+    let mut extra_labels = Vec::new();
+    extra_labels.push((
+        "io.devaipod.mode".to_string(),
+        opts.mode.as_str().to_string(),
+    ));
+    if let Some(ref task_desc) = opts.task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+    if let Some(ref title) = opts.title {
+        extra_labels.push(("io.devaipod.title".to_string(), title.clone()));
+    }
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
+    }
+
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
+    let devaipod_pod = pod::DevaipodPod::create(
+        &podman,
+        temp_dir.path(),
+        &devcontainer_config,
+        &pod_name,
+        enable_gator,
+        config,
+        &source,
+        &extra_labels,
+        Some(&service_gator_config),
+        effective_image.as_deref(),
+        opts.service_gator_image.as_deref(),
+        opts.task.as_deref(),
+        config.orchestration.is_enabled(),
+        config.orchestration.worker.gator.clone(),
+        opts.auto_approve,
+        &source_dirs,
+    )
+    .await
+    .context("Failed to create scratch workspace pod")?;
+
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    write_workspace_state(
+        &pod_name,
+        "scratch".to_string(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
+
+    drop(podman);
     Ok(CreateResult { pod_name })
 }
 
@@ -3433,7 +3551,7 @@ async fn create_workspace_from_pr(
 /// - agent: Container running opencode serve
 /// - api: Pod-api sidecar for git/PTY endpoints
 /// - gator (optional): Service-gator MCP server container
-async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Result<()> {
+async fn cmd_up(config: &config::Config, source: Option<&str>, opts: UpOptions) -> Result<()> {
     // Handle dry-run mode
     if opts.dry_run {
         return cmd_dry_run(config, source, &opts).await;
@@ -3470,7 +3588,7 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     config: &config::Config,
-    source: &str,
+    source: Option<&str>,
     command: Option<&str>,
     image: Option<&str>,
     explicit_name: Option<&str>,
@@ -3678,7 +3796,30 @@ fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result
 /// Handle dry-run mode for the up command
 ///
 /// Prints what would be created without actually creating anything.
-async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) -> Result<()> {
+async fn cmd_dry_run(
+    config: &config::Config,
+    source: Option<&str>,
+    opts: &UpOptions,
+) -> Result<()> {
+    let source = match source {
+        Some(s) => s,
+        None => {
+            let pod_name = if let Some(ref name) = opts.name {
+                normalize_pod_name(name)
+            } else {
+                make_pod_name("scratch")
+            };
+            tracing::info!("Dry run mode - would create scratch pod '{}'", pod_name);
+            tracing::info!("  source: (none — scratch workspace)");
+            if let Some(ref img) = opts.image {
+                tracing::info!("  image: {}", img);
+            }
+            if let Some(ref task) = opts.task {
+                tracing::info!("  Task: {}", task);
+            }
+            return Ok(());
+        }
+    };
     // Dispatch based on source type for dry-run info
     if let Some(pr_ref) = forge::parse_pr_url(source) {
         // PR dry-run
@@ -5173,7 +5314,7 @@ async fn cmd_advisor(
 ) -> Result<()> {
     let advisor_pod = match name_override {
         Some(n) => normalize_pod_name(n),
-        None => "devaipod-advisor".to_string(),
+        None => advisor_pod_name(),
     };
 
     let existing = check_advisor_pod_state(&advisor_pod);
@@ -5293,12 +5434,16 @@ fn advisor_image() -> String {
 
 /// Detect the image of the running devaipod control plane container.
 ///
-/// The control plane container is named `devaipod` (by convention from
-/// `just container-run`). We inspect it via the podman CLI to find
+/// The control plane container is named `devaipod` by default, but when
+/// `DEVAIPOD_INSTANCE` is set (e.g. `test-devaipod` for a multi-instance
+/// setup) we use that instead. We inspect it via the podman CLI to find
 /// the image name. Returns `None` if detection fails.
 fn detect_own_container_image() -> Option<String> {
+    // Use DEVAIPOD_INSTANCE if set (e.g. "test-devaipod"), otherwise "devaipod"
+    let container_name =
+        std::env::var(DEVAIPOD_INSTANCE_ENV).unwrap_or_else(|_| "devaipod".to_string());
     let output = std::process::Command::new("podman")
-        .args(["inspect", "devaipod", "--format", "{{.ImageName}}"])
+        .args(["inspect", &container_name, "--format", "{{.ImageName}}"])
         .output()
         .ok()?;
 
@@ -5313,12 +5458,57 @@ fn detect_own_container_image() -> Option<String> {
     Some(image)
 }
 
+/// Detect the host-mapped port for the control plane's web server.
+///
+/// The web server inside the container always listens on 8080, but when the
+/// advisor connects from another container via `host.containers.internal`, it
+/// needs the host-mapped port (e.g. 8081 for a `test-devaipod` instance).
+///
+/// Checks `DEVAIPOD_HOST_PORT` env var first, then falls back to inspecting
+/// our own container's port mappings via `podman port`.
+fn detect_own_host_port() -> u16 {
+    if let Ok(port) = std::env::var("DEVAIPOD_HOST_PORT")
+        && let Ok(p) = port.parse::<u16>()
+    {
+        return p;
+    }
+    let container_name =
+        std::env::var(DEVAIPOD_INSTANCE_ENV).unwrap_or_else(|_| "devaipod".to_string());
+    if let Ok(output) = std::process::Command::new("podman")
+        .args(["port", &container_name, "8080/tcp"])
+        .output()
+        && output.status.success()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        // Output format: "0.0.0.0:8081" or ":::8081"
+        if let Some(port_str) = s.trim().rsplit(':').next()
+            && let Ok(p) = port_str.parse::<u16>()
+        {
+            return p;
+        }
+    }
+    8080
+}
+
+/// Return the advisor pod name for this instance.
+///
+/// When `DEVAIPOD_INSTANCE` is set (e.g. `test-devaipod`), the advisor pod
+/// is named `<instance>-advisor` (e.g. `test-devaipod-advisor`). Otherwise
+/// it defaults to `devaipod-advisor`.
+pub(crate) fn advisor_pod_name() -> String {
+    if let Some(instance) = get_instance_id() {
+        format!("{}-advisor", instance)
+    } else {
+        "devaipod-advisor".to_string()
+    }
+}
+
 /// Create the advisor pod using cmd_run with advisor-specific settings.
 ///
 /// The advisor doesn't work on a specific repo — it's a meta-agent that
-/// observes other pods and suggests actions. We use the dotfiles repo as
-/// the workspace source (same default as `devaipod up` with no args),
-/// and override the image to use our own container which has opencode
+/// observes other pods and suggests actions. It uses the dotfiles repo as
+/// the workspace source if configured, otherwise creates a scratch workspace.
+/// The image is overridden to use our own container which has opencode
 /// installed.
 async fn create_advisor_pod(
     config: &config::Config,
@@ -5329,22 +5519,23 @@ async fn create_advisor_pod(
     let default_task = task.unwrap_or(ADVISOR_SYSTEM_PROMPT);
 
     // The MCP server runs as a route on the devaipod web server.
-    // The advisor agent reaches it via host.containers.internal:8080
-    // (or 127.0.0.1:8080 on the host).
+    // The advisor agent reaches it via host.containers.internal:<host_port>.
+    // The host port may differ from the internal 8080 in multi-instance
+    // setups (e.g. test-devaipod maps 8081:8080).
+    let host_port = detect_own_host_port();
     let mcp_url = format!(
-        "http://{}:8080/api/devaipod/mcp",
-        crate::podman::host_for_pod_services()
+        "http://{}:{}/api/devaipod/mcp",
+        crate::podman::host_for_pod_services(),
+        host_port
     );
 
     // Load the MCP token so the advisor can authenticate to the MCP endpoint.
     // This is a separate shared secret scoped to MCP, not the web API token.
     let mcp_token = crate::web::load_or_generate_mcp_token();
 
-    // Use the dotfiles repo as the advisor's workspace source — same
-    // fallback that `devaipod up` / `devaipod run` use when no source
-    // is given. This satisfies the requirement that every pod has a git
-    // repo to clone, and gives the advisor a familiar dev environment.
-    let source = resolve_source(None, config)?;
+    // The advisor is a scratch-like workspace — it doesn't need a specific
+    // git repo. Use the dotfiles repo if configured, otherwise None (scratch).
+    let source = resolve_source(None, config);
 
     // Build a modified config that includes the MCP server entry with the
     // Authorization header. We reload the config and insert the entry
@@ -6816,6 +7007,8 @@ async fn cmd_rebuild(
             fork_url,
         };
         pod::WorkspaceSource::RemoteRepo(remote_info)
+    } else if ws_state.as_ref().is_some_and(|s| s.source == "scratch") {
+        pod::WorkspaceSource::Scratch
     } else {
         bail!(
             "Cannot determine source for rebuild. Pod '{}' has no repo label and no workspace state.",

@@ -326,6 +326,10 @@ pub enum Action {
     ExecWorker(String),
     /// Launch new instances with URLs and a task
     Launch { urls: Vec<String>, task: String },
+    /// Launch/attach the advisor
+    Advisor,
+    /// Open the review TUI for the specified instance
+    Review(String),
 }
 
 /// Application state for the TUI
@@ -1104,33 +1108,63 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 let _ = app.refresh_from_api().await;
                             }
                             Action::Launch { urls, task } => {
-                                let count = urls.len();
-                                app.status_message = Some(format!(
-                                    "Launching {} instance{}...",
-                                    count,
-                                    if count == 1 { "" } else { "s" }
-                                ));
-                                terminal.draw(|f| ui(f, &mut app))?;
+                                if urls.is_empty() {
+                                    // Scratch workspace — no source URL
+                                    app.status_message =
+                                        Some("Launching scratch workspace...".to_string());
+                                    terminal.draw(|f| ui(f, &mut app))?;
 
-                                let mut errors = Vec::new();
-                                for url in &urls {
-                                    if let Err(e) = run_subprocess_silent(&["run", url, "-c", &task]).await {
-                                        errors.push(format!("{}: {}", url, e));
+                                    if let Err(e) =
+                                        run_subprocess_silent(&["run", "-c", &task]).await
+                                    {
+                                        app.status_message =
+                                            Some(format!("Error: {}", e));
+                                    } else {
+                                        app.status_message =
+                                            Some("Launched scratch workspace".to_string());
+                                    }
+                                } else {
+                                    let count = urls.len();
+                                    app.status_message = Some(format!(
+                                        "Launching {} instance{}...",
+                                        count,
+                                        if count == 1 { "" } else { "s" }
+                                    ));
+                                    terminal.draw(|f| ui(f, &mut app))?;
+
+                                    let mut errors = Vec::new();
+                                    for url in &urls {
+                                        if let Err(e) =
+                                            run_subprocess_silent(&["run", url, "-c", &task]).await
+                                        {
+                                            errors.push(format!("{}: {}", url, e));
+                                        }
+                                    }
+
+                                    if errors.is_empty() {
+                                        app.status_message = Some(format!(
+                                            "Launched {} instance{}",
+                                            count,
+                                            if count == 1 { "" } else { "s" }
+                                        ));
+                                    } else {
+                                        app.status_message =
+                                            Some(format!("Errors: {}", errors.join(", ")));
                                     }
                                 }
 
                                 refresh_interval.reset();
                                 let _ = app.refresh_from_api().await;
-
-                                if errors.is_empty() {
-                                    app.status_message = Some(format!(
-                                        "Launched {} instance{}",
-                                        count,
-                                        if count == 1 { "" } else { "s" }
-                                    ));
-                                } else {
-                                    app.status_message = Some(format!("Errors: {}", errors.join(", ")));
-                                }
+                            }
+                            Action::Advisor => {
+                                run_subprocess(terminal, &["advisor"]).await?;
+                                refresh_interval.reset();
+                                let _ = app.refresh_from_api().await;
+                            }
+                            Action::Review(name) => {
+                                run_subprocess(terminal, &["review", &name]).await?;
+                                refresh_interval.reset();
+                                let _ = app.refresh_from_api().await;
                             }
                         }
                     }
@@ -1225,6 +1259,19 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
             app.launch_input = LaunchInput::default();
             app.status_message = None;
             None
+        }
+        KeyCode::Char('A') => {
+            // Launch/attach the advisor
+            Some(Action::Advisor)
+        }
+        KeyCode::Char('R') => {
+            // Open review TUI for selected instance
+            if let Some(instance) = app.selected_instance() {
+                Some(Action::Review(instance.name.clone()))
+            } else {
+                app.status_message = Some("No instance selected".to_string());
+                None
+            }
         }
         KeyCode::Right | KeyCode::Char('l') => {
             // Open container access menu
@@ -1407,15 +1454,12 @@ fn try_submit_launch(app: &mut App) -> Option<Action> {
 
     let task = app.launch_input.task.trim().to_string();
 
-    if urls.is_empty() {
-        app.status_message = Some("Enter at least one URL".to_string());
-        app.launch_input.active_field = LaunchField::Urls;
-        None
-    } else if task.is_empty() {
+    if task.is_empty() {
         app.status_message = Some("Enter a task".to_string());
         app.launch_input.active_field = LaunchField::Task;
         None
     } else {
+        // URLs are optional — an empty list creates a scratch workspace
         app.mode = TuiMode::Normal;
         app.launch_input = LaunchInput::default();
         Some(Action::Launch { urls, task })
@@ -1611,7 +1655,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Nav │ a/Enter: Attach │ →/l: Menu │ e: Exec │ S: Start/Stop │ d: Del │ L: Launch │ r: Refresh",
+            " q: Quit │ j/k: Nav │ a: Attach │ →: Menu │ e: Exec │ S: Stop │ d: Del │ L: Launch │ A: Advisor │ R: Review │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (

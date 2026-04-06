@@ -190,9 +190,9 @@ export function effectiveTimestamp(pod: PodInfo): number {
  */
 export function frecencySortPods(pods: PodInfo[]): PodInfo[] {
   return [...pods].sort((a, b) => {
-    // Advisor always first
-    const aAdvisor = a.Name === "devaipod-advisor" ? 1 : 0
-    const bAdvisor = b.Name === "devaipod-advisor" ? 1 : 0
+    // Advisor always first (name ends with -advisor for multi-instance support)
+    const aAdvisor = a.Name.endsWith("-advisor") ? 1 : 0
+    const bAdvisor = b.Name.endsWith("-advisor") ? 1 : 0
     if (aAdvisor !== bAdvisor) return bAdvisor - aAdvisor
 
     // Running before stopped
@@ -603,7 +603,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
 
     // -- Derived state ------------------------------------------------------
 
-    const hasAdvisor = createMemo(() => store.pods.some((p) => p.Name === "devaipod-advisor"))
+    const hasAdvisor = createMemo(() => store.pods.some((p) => p.Name.endsWith("-advisor")))
 
     const hasActiveLaunches = createMemo(
       () => Object.values(store.launches).some((l) => l.state === "launching"),

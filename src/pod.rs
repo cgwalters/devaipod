@@ -53,7 +53,7 @@ impl AgentWorkspaceSource {
     }
 }
 
-/// Source for workspace content - local git repo, remote URL, or PR/MR
+/// Source for workspace content - local git repo, remote URL, PR/MR, or scratch (no repo)
 #[derive(Debug, Clone)]
 pub enum WorkspaceSource {
     /// Local git repository
@@ -62,6 +62,8 @@ pub enum WorkspaceSource {
     RemoteRepo(RemoteRepoInfo),
     /// Pull/Merge request from a forge
     PullRequest(PullRequestInfo),
+    /// No git repo — empty workspace with just the devcontainer image
+    Scratch,
 }
 
 impl WorkspaceSource {
@@ -89,6 +91,7 @@ impl WorkspaceSource {
                 labels
             }
             WorkspaceSource::PullRequest(pr_info) => pr_info.to_labels(),
+            WorkspaceSource::Scratch => vec![],
         }
     }
 
@@ -98,6 +101,7 @@ impl WorkspaceSource {
             WorkspaceSource::LocalRepo(git_info) => git_info.remote_url.clone(),
             WorkspaceSource::RemoteRepo(remote_info) => Some(remote_info.remote_url.clone()),
             WorkspaceSource::PullRequest(pr_info) => Some(pr_info.pr_ref.upstream_url()),
+            WorkspaceSource::Scratch => None,
         }
     }
 
@@ -107,6 +111,7 @@ impl WorkspaceSource {
             WorkspaceSource::LocalRepo(git_info) => git_info.branch.clone(),
             WorkspaceSource::RemoteRepo(remote_info) => Some(remote_info.default_branch.clone()),
             WorkspaceSource::PullRequest(pr_info) => Some(pr_info.head_ref.clone()),
+            WorkspaceSource::Scratch => None,
         }
     }
 
@@ -125,6 +130,7 @@ impl WorkspaceSource {
             WorkspaceSource::PullRequest(pr_info) => {
                 format!("PR #{}", pr_info.pr_ref.number)
             }
+            WorkspaceSource::Scratch => "scratch workspace".to_string(),
         }
     }
 
@@ -140,6 +146,7 @@ impl WorkspaceSource {
                 .unwrap_or_else(|| "project".to_string()),
             WorkspaceSource::RemoteRepo(remote_info) => remote_info.repo_name.clone(),
             WorkspaceSource::PullRequest(pr_info) => pr_info.pr_ref.repo.clone(),
+            WorkspaceSource::Scratch => "scratch".to_string(),
         }
     }
 }
@@ -617,6 +624,16 @@ impl DevaipodPod {
                     );
                     (script, vec![])
                 }
+                WorkspaceSource::Scratch => {
+                    // No clone needed — just create the workspace directory with correct ownership
+                    let chown = if let Some(ref user) = effective_user {
+                        format!(" && chown -R {user}:{user} '{workspace_folder}'")
+                    } else {
+                        String::new()
+                    };
+                    let script = format!("mkdir -p '{workspace_folder}'{chown}");
+                    (script, vec![])
+                }
             };
 
             let exit_code = podman
@@ -823,9 +840,19 @@ impl DevaipodPod {
                         Some(slug),
                     )
                 }
+                WorkspaceSource::Scratch => {
+                    // No clone needed — just create an empty workspace directory
+                    let chown = if let Some(ref user) = effective_user {
+                        format!(" && chown -R {user}:{user} '{workspace_folder}'")
+                    } else {
+                        String::new()
+                    };
+                    format!("mkdir -p '{workspace_folder}'{chown}")
+                }
             };
 
             // Mount main workspace volume read-only as reference for git --reference clone
+            // (not needed for Scratch but harmless to include)
             let extra_binds = vec![format!("{}:/mnt/main-workspace:ro", volume_name)];
 
             tracing::debug!("Cloning agent workspace with reference to main workspace...");
@@ -1079,6 +1106,15 @@ impl DevaipodPod {
                             &git_info,
                             effective_user.as_deref(),
                         )
+                    }
+                    WorkspaceSource::Scratch => {
+                        // No clone needed — just create the workspace directory
+                        let chown = if let Some(ref user) = effective_user {
+                            format!(" && chown -R {user}:{user} '{workspace_folder}'")
+                        } else {
+                            String::new()
+                        };
+                        format!("mkdir -p '{workspace_folder}'{chown}")
                     }
                 };
 
@@ -1397,6 +1433,15 @@ impl DevaipodPod {
                         &workspace_folder,
                         gh_token.as_deref(),
                     );
+                    (script, vec![])
+                }
+                WorkspaceSource::Scratch => {
+                    let chown = if let Some(ref user) = effective_user {
+                        format!(" && chown -R {user}:{user} '{workspace_folder}'")
+                    } else {
+                        String::new()
+                    };
+                    let script = format!("mkdir -p '{workspace_folder}'{chown}");
                     (script, vec![])
                 }
             };

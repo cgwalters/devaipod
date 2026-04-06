@@ -435,6 +435,7 @@ container-run: container-build
         $ADD_HOST \
         -v "$HOST_SOCKET":/run/docker.sock \
         -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
+        -e DEVAIPOD_HOST_PORT="$PORT" \
         -v "$WORKSPACES_DIR":/var/lib/devaipod-workspaces \
         -e DEVAIPOD_HOST_WORKDIR="$WORKSPACES_DIR" \
         -v "$STATE_VOL":/var/lib/devaipod \

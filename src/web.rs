@@ -1501,7 +1501,7 @@ fn compute_pod_name(req: &RunRequest) -> String {
             .and_then(|s| s.rsplit('/').next())
             .map(|s| s.trim_end_matches(".git"))
             .filter(|s| !s.is_empty())
-            .unwrap_or("workspace");
+            .unwrap_or("scratch");
         crate::make_pod_name(project)
     }
 }
@@ -1526,9 +1526,9 @@ async fn run_workspace(
         cmd.arg(source);
     }
 
-    // Add task if provided (as positional argument after source)
+    // Add task if provided (use -c flag so it works with or without source)
     if let Some(ref task) = req.task {
-        cmd.arg(task);
+        cmd.args(["-c", task]);
     }
 
     // Always pass --name so the pod name matches what we told the UI.
@@ -1666,14 +1666,9 @@ async fn launch_advisor(
     Json(req): Json<AdvisorLaunchRequest>,
 ) -> Result<Json<RunResponse>, StatusCode> {
     // Check if advisor pod already exists
+    let advisor_name = crate::advisor_pod_name();
     let check = std::process::Command::new("podman")
-        .args([
-            "pod",
-            "inspect",
-            "devaipod-advisor",
-            "--format",
-            "{{.State}}",
-        ])
+        .args(["pod", "inspect", &advisor_name, "--format", "{{.State}}"])
         .output();
 
     if let Ok(output) = check
@@ -1699,7 +1694,7 @@ async fn launch_advisor(
         } else {
             // Advisor exists but stopped — start it
             let start = tokio::process::Command::new("podman")
-                .args(["pod", "start", "devaipod-advisor"])
+                .args(["pod", "start", &advisor_name])
                 .output()
                 .await;
             if let Ok(o) = start
@@ -1768,14 +1763,9 @@ struct AdvisorStatusResponse {
 }
 
 async fn advisor_status() -> Result<Json<AdvisorStatusResponse>, StatusCode> {
+    let advisor_name = crate::advisor_pod_name();
     let check = std::process::Command::new("podman")
-        .args([
-            "pod",
-            "inspect",
-            "devaipod-advisor",
-            "--format",
-            "{{.State}}",
-        ])
+        .args(["pod", "inspect", &advisor_name, "--format", "{{.State}}"])
         .output();
 
     match check {
@@ -2384,9 +2374,10 @@ async fn refresh_pod_cache(
         .collect();
 
     // Sort: advisor first, then running pods, then by creation date descending
+    let advisor_name = crate::advisor_pod_name();
     pods.sort_by(|a, b| {
-        let a_advisor = u8::from(a.name == "devaipod-advisor");
-        let b_advisor = u8::from(b.name == "devaipod-advisor");
+        let a_advisor = u8::from(a.name == advisor_name);
+        let b_advisor = u8::from(b.name == advisor_name);
         if b_advisor != a_advisor {
             return b_advisor.cmp(&a_advisor);
         }
@@ -4370,8 +4361,17 @@ pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Resu
         .await
         .with_context(|| format!("Failed to bind to {}", addr))?;
 
-    // Print startup message with URL including token
-    let url = format!("http://127.0.0.1:{}/_devaipod/login?token={}", port, token);
+    // Print startup message with URL including token.
+    // Use DEVAIPOD_HOST_PORT if set (the host-mapped port may differ from the
+    // internal listen port when running inside a container, e.g. -p 8081:8080).
+    let display_port = std::env::var("DEVAIPOD_HOST_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(port);
+    let url = format!(
+        "http://127.0.0.1:{}/_devaipod/login?token={}",
+        display_port, token
+    );
     tracing::info!("Web server started at {}", url);
     println!("Control plane URL: {}", url);
 
