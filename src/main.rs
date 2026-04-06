@@ -1543,7 +1543,17 @@ async fn run_host(cli: HostCli) -> Result<()> {
     match cli.command {
         HostCommand::Up { source, opts } => {
             let source = resolve_source(source.as_deref(), &config);
-            cmd_up(&config, source, opts).await
+            // Check if source matches a configured source shorthand (e.g., "src:github/org/repo")
+            let source = source.map(|s| {
+                if let Some(resolved) = config::resolve_source_shorthand(s, &config) {
+                    let resolved_str = resolved.to_string_lossy().to_string();
+                    tracing::info!("Resolved source shorthand '{}' -> {}", s, resolved_str);
+                    resolved_str
+                } else {
+                    s.to_string()
+                }
+            });
+            cmd_up(&config, source.as_deref(), opts).await
         }
 
         HostCommand::Attach {
@@ -1649,6 +1659,19 @@ async fn run_host(cli: HostCli) -> Result<()> {
             source_dirs,
         } => {
             let source = resolve_source(source.as_deref(), &config);
+
+            // Check if source matches a configured source shorthand (e.g., "src:github/org/repo")
+            // and resolve it to a full path before any other processing.
+            let source = source.map(|s| {
+                if let Some(resolved) = config::resolve_source_shorthand(s, &config) {
+                    let resolved_str = resolved.to_string_lossy().to_string();
+                    tracing::info!("Resolved source shorthand '{}' -> {}", s, resolved_str);
+                    resolved_str
+                } else {
+                    s.to_string()
+                }
+            });
+            let source = source.as_deref();
 
             // Merge task sources: positional arg takes precedence, then -c/--command
             let explicit_task = task.or(command);

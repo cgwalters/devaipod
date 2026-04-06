@@ -595,8 +595,12 @@ impl DevaipodPod {
                         &workspace_folder,
                         effective_user.as_deref(),
                     );
-                    // Mount the local .git directory read-only
-                    let git_dir = git_info.local_path.join(".git");
+                    // Mount the local .git directory read-only.
+                    // Translate container-internal source paths (e.g. /mnt/src/...)
+                    // back to host-side paths for the init container bind mount.
+                    let host_path =
+                        crate::config::source_path_to_host(&git_info.local_path, global_config);
+                    let git_dir = host_path.join(".git");
                     let bind = format!("{}:/mnt/host-git:ro", git_dir.display());
                     (script, vec![bind])
                 }
@@ -890,14 +894,22 @@ impl DevaipodPod {
         // Build source directory mounts for the agent container.
         // For LocalRepo, the repo itself is mounted at /mnt/source/<repo-dirname>.
         // Additional --source-dir paths are mounted at /mnt/source/<dirname>.
-        let mut source_mounts: Vec<(PathBuf, String)> = Vec::new();
+        // Sources from [sources] config are mounted at /mnt/<name>.
+        //
+        // Each entry is (host_path, container_target, readonly).
+        let mut source_mounts: Vec<(PathBuf, String, bool)> = Vec::new();
 
-        // Add the local repo as a source mount (replaces old source_repo_host_path)
+        // Add the local repo as a source mount (replaces old source_repo_host_path).
+        // Translate container-internal source paths back to host paths for the
+        // bind mount (agent containers are created via host podman).
         if let WorkspaceSource::LocalRepo(git_info) = source {
+            let host_path =
+                crate::config::source_path_to_host(&git_info.local_path, global_config);
             let dirname = source_dir_name(&git_info.local_path);
             source_mounts.push((
-                git_info.local_path.clone(),
+                host_path,
                 format!("/mnt/source/{}", dirname),
+                true, // read-only
             ));
         }
 
@@ -906,20 +918,43 @@ impl DevaipodPod {
             let dirname = source_dir_name(dir);
             let target = format!("/mnt/source/{}", dirname);
             // Avoid duplicate mount targets (e.g., --source-dir . when . is the local repo)
-            if source_mounts.iter().any(|(_, t)| t == &target) {
+            if source_mounts.iter().any(|(_, t, _)| t == &target) {
                 tracing::warn!(
                     "Skipping --source-dir {}: mount target {} already in use",
                     dir.display(),
                     target
                 );
             } else {
-                source_mounts.push((dir.clone(), target));
+                source_mounts.push((dir.clone(), target, true));
+            }
+        }
+
+        // Add source mounts from [sources] config.
+        // - readonly: mount read-only in agent containers
+        // - agent: mount read-write in agent containers
+        // - controlplane: do NOT mount into agent containers (control plane only)
+        for resolved in global_config.resolve_sources() {
+            match resolved.access {
+                crate::config::SourceAccess::Controlplane => {
+                    tracing::debug!(
+                        "Source '{}': controlplane-only, not mounting in agent",
+                        resolved.name
+                    );
+                }
+                crate::config::SourceAccess::Readonly => {
+                    let target = format!("/mnt/{}", resolved.name);
+                    source_mounts.push((resolved.path, target, true));
+                }
+                crate::config::SourceAccess::Agent => {
+                    let target = format!("/mnt/{}", resolved.name);
+                    source_mounts.push((resolved.path, target, false));
+                }
             }
         }
 
         // Convenience: for each --source-dir that is a git repo, clone it into
         // the agent workspace so the agent can work on it immediately.
-        for (host_path, container_target) in &source_mounts {
+        for (host_path, container_target, _readonly) in &source_mounts {
             // Skip the main repo source (already cloned above for LocalRepo)
             if let WorkspaceSource::LocalRepo(git_info) = source
                 && git_info.local_path == *host_path
@@ -2916,7 +2951,7 @@ exec sleep infinity
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
         auto_approve: bool,
-        source_mounts: &[(PathBuf, String)],
+        source_mounts: &[(PathBuf, String, bool)],
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
         let agent_home = AGENT_HOME_PATH.to_string();
@@ -2993,20 +3028,20 @@ exec sleep infinity
             });
         }
 
-        // Mount source directories read-only.
-        // Each entry is (host_path, container_target). For LocalRepo, this includes
-        // the repo itself at /mnt/source/<repo-dirname>. Additional --source-dir
-        // paths are also included.
+        // Mount source directories.
+        // Each entry is (host_path, container_target, readonly). For LocalRepo, this
+        // includes the repo itself at /mnt/source/<repo-dirname>. Additional
+        // --source-dir paths and [sources] config entries are also included.
         //
         // Note: host paths come from the controlplane process. In host mode they are
         // real host paths and podman resolves them correctly. In container mode the
         // path is container-internal, which only works if the directory is also
         // accessible to the host podman daemon (e.g. via a shared bind mount).
-        for (host_path, container_target) in source_mounts {
+        for (host_path, container_target, readonly) in source_mounts {
             mounts.push(crate::podman::MountConfig {
                 source: host_path.to_string_lossy().to_string(),
                 target: container_target.clone(),
-                readonly: true,
+                readonly: *readonly,
             });
         }
 
@@ -5471,14 +5506,16 @@ mod tests {
         let container_home = "/home/vscode";
 
         let global_config = crate::config::Config::default();
-        let source_mounts: Vec<(PathBuf, String)> = vec![
+        let source_mounts: Vec<(PathBuf, String, bool)> = vec![
             (
                 PathBuf::from("/home/user/src/api"),
                 "/mnt/source/api".to_string(),
+                true,
             ),
             (
                 PathBuf::from("/home/user/docs"),
                 "/mnt/source/docs".to_string(),
+                true,
             ),
         ];
         let container_config = DevaipodPod::agent_container_config(

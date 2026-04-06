@@ -430,12 +430,20 @@ container-run: container-build
     if [ -n "{{prefix}}" ]; then
         INSTANCE_ENV="-e DEVAIPOD_INSTANCE=$NAME"
     fi
-    podman run -d --name "$NAME" --privileged --replace \
-        -p "$PORT":8080 \
+    # The launcher container reads the config, resolves [sources], and creates
+    # the real server container with the appropriate bind mounts.
+    # The launcher does NOT bind the host port — only the server container does.
+    # When no sources are configured, the launcher skips relaunching and serves
+    # directly, but without port publishing. The wait loop detects this and
+    # re-creates the container with port publishing.
+    LAUNCHER="${NAME}-launcher"
+    podman run -d --name "$LAUNCHER" --privileged --replace \
         $ADD_HOST \
         -v "$HOST_SOCKET":/run/docker.sock \
         -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
         -e DEVAIPOD_HOST_PORT="$PORT" \
+        -e DEVAIPOD_HOST_HOME="$HOME" \
+        -e DEVAIPOD_CONTAINER_NAME="$LAUNCHER" \
         -v "$WORKSPACES_DIR":/var/lib/devaipod-workspaces \
         -e DEVAIPOD_HOST_WORKDIR="$WORKSPACES_DIR" \
         -v "$STATE_VOL":/var/lib/devaipod \
@@ -443,11 +451,24 @@ container-run: container-build
         -v "$SSH_DIR":/run/devaipod-ssh:Z \
         $INSTANCE_ENV \
         {{ CONTAINER_IMAGE }}:latest
+    echo "Launcher started; waiting for server container '$NAME'..."
+    # The launcher always creates the server container (with or without
+    # source mounts) and then exits. Wait for it to appear.
+    for i in $(seq 1 30); do
+        if podman inspect "$NAME" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    if ! podman inspect "$NAME" >/dev/null 2>&1; then
+        echo "ERROR: Server container '$NAME' did not start. Check: podman logs $LAUNCHER"
+        exit 1
+    fi
     echo "$NAME container started (port $PORT)"
     echo "Web UI: http://127.0.0.1:$PORT/"
     echo "SSH configs will be written to $SSH_DIR/"
     echo ""
-    echo "Ensure your ~/.ssh/config has: Include config.d/$NAME/*"
+    echo "Ensure your ~/.ssh/config has: Include config.d/${NAME}/*"
     echo ""
     echo "TUI: podman exec -ti $NAME devaipod tui"
     echo ""

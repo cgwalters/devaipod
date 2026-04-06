@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 /// Source access level for bind mounts.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
-#[allow(dead_code)] // Preparatory for source bind-mount integration
 pub enum SourceAccess {
     /// Read-only everywhere (control plane + agent). Default.
     #[default]
@@ -37,7 +36,6 @@ pub enum SourceAccess {
 /// Full: `src = { path = "~/src", access = "controlplane" }`
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-#[allow(dead_code)] // Preparatory for source bind-mount integration
 pub enum SourceEntry {
     /// Shorthand: just a path string (defaults to readonly access)
     Short(String),
@@ -48,7 +46,6 @@ pub enum SourceEntry {
 /// Full source entry with all options.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // Preparatory for source bind-mount integration
 pub struct SourceEntryFull {
     pub path: String,
     #[serde(default)]
@@ -57,7 +54,6 @@ pub struct SourceEntryFull {
 
 /// Resolved source information after path expansion.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Preparatory for source bind-mount integration
 pub struct ResolvedSource {
     pub name: String,
     pub path: PathBuf,
@@ -66,7 +62,6 @@ pub struct ResolvedSource {
 
 /// Environment variable for the host's home directory.
 /// Set by the launcher so container-side tilde expansion resolves to host paths.
-#[allow(dead_code)] // Preparatory for source bind-mount integration
 pub const HOST_HOME_ENV: &str = "DEVAIPOD_HOST_HOME";
 
 /// Expand `~` in a path to the host home directory.
@@ -85,20 +80,39 @@ fn expand_source_path(path: &str) -> PathBuf {
 /// Resolve a source shorthand like `src:github/org/repo` to a full path.
 /// Returns None if the source name is not found in the config or the path doesn't
 /// start with `<name>:`.
-#[allow(dead_code)] // Preparatory for source shorthand resolution
 pub fn resolve_source_shorthand(source: &str, config: &Config) -> Option<PathBuf> {
     let (name, subpath) = source.split_once(':')?;
-    let entry = config.sources.get(name)?;
-    let (raw_path, _access) = match entry {
-        SourceEntry::Short(p) => (p.clone(), SourceAccess::Readonly),
-        SourceEntry::Full(f) => (f.path.clone(), f.access.clone()),
-    };
-    let expanded = expand_source_path(&raw_path);
-    Some(expanded.join(subpath))
+    // Verify the source name exists in config
+    config.sources.get(name)?;
+    // Sources are mounted at /mnt/<name> inside the container
+    Some(PathBuf::from(format!("/mnt/{}", name)).join(subpath))
+}
+
+/// Translate a container-internal source path (e.g. `/mnt/src/github/org/repo`)
+/// back to the host-side path using the resolved sources config.
+///
+/// This is needed when creating init containers via the host's podman daemon:
+/// the container sees paths under `/mnt/<name>/...` but the host needs the
+/// actual filesystem path (e.g. `~/src/github/org/repo`).
+///
+/// Returns the original path unchanged if it doesn't match any source mount.
+pub fn source_path_to_host(path: &Path, config: &Config) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    for source in config.resolve_sources() {
+        let mount_prefix = format!("/mnt/{}", source.name);
+        if let Some(suffix) = path_str.strip_prefix(&mount_prefix) {
+            let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+            if suffix.is_empty() {
+                return source.path.clone();
+            }
+            return source.path.join(suffix);
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Validate a source name. Must be non-empty, alphanumeric + hyphens/underscores.
-#[allow(dead_code)] // Preparatory for source validation
+#[allow(dead_code)] // Used by tests; will be used for source validation
 fn validate_source_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -200,7 +214,6 @@ pub struct Config {
     /// Named source directories to bind-mount into containers.
     /// Keys are names (used as mount point: /mnt/<name>), values are paths.
     #[serde(default)]
-    #[allow(dead_code)] // Preparatory for source bind-mount integration
     pub sources: HashMap<String, SourceEntry>,
 }
 
@@ -208,7 +221,6 @@ impl Config {
     /// Resolve all configured sources, expanding ~ to the host home directory.
     /// Uses DEVAIPOD_HOST_HOME if set (for container-side resolution to host paths),
     /// otherwise falls back to HOME.
-    #[allow(dead_code)] // Used by tests; will be used by pod creation
     pub fn resolve_sources(&self) -> Vec<ResolvedSource> {
         self.sources
             .iter()
@@ -2819,7 +2831,7 @@ src = "/opt/src"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let result = resolve_source_shorthand("src:github/org/repo", &config);
-        assert_eq!(result, Some(PathBuf::from("/opt/src/github/org/repo")));
+        assert_eq!(result, Some(PathBuf::from("/mnt/src/github/org/repo")));
     }
 
     #[test]
@@ -2830,7 +2842,7 @@ src = { path = "/opt/src", access = "controlplane" }
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let result = resolve_source_shorthand("src:myproject", &config);
-        assert_eq!(result, Some(PathBuf::from("/opt/src/myproject")));
+        assert_eq!(result, Some(PathBuf::from("/mnt/src/myproject")));
     }
 
     #[test]

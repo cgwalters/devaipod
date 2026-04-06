@@ -33,6 +33,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::advisor;
+use crate::config::SourceAccess;
 use crate::podman::{get_container_socket, host_for_pod_services};
 
 /// Path to the token file when using podman/Kubernetes secrets (highest priority).
@@ -4317,7 +4318,230 @@ fn build_app_with_cache(
         .with_state(state)
 }
 
+/// Check if this process is a launcher container and, if so, create the real
+/// server container with source bind mounts and exit.
+///
+/// The launcher pattern works as follows:
+/// 1. The Justfile creates a `$NAME-launcher` container with the config file mounted
+/// 2. This function reads `~/.config/devaipod.toml`, resolves `[sources]`
+/// 3. It inspects its own container to copy mounts/env/network settings
+/// 4. It creates the real `$NAME` container with additional `-v` mounts for sources
+/// 5. The launcher exits; the real server container runs `devaipod web`
+///
+/// If `DEVAIPOD_CONTAINER_NAME` is not set or no sources are configured, this is
+/// a no-op and the current process continues as the server.
+fn maybe_launch_server_with_sources() -> Result<()> {
+    // Step (a): only act when running as a launcher container
+    let container_name = match std::env::var("DEVAIPOD_CONTAINER_NAME") {
+        Ok(name) => name,
+        Err(_) => return Ok(()), // not in launcher pattern
+    };
+
+    // Must end with -launcher to be a launcher
+    let server_name = match container_name.strip_suffix("-launcher") {
+        Some(name) => name.to_string(),
+        None => return Ok(()), // already the server container
+    };
+
+    // Step (b): load config and resolve sources (may be empty)
+    let config = crate::config::load_config(None)?;
+    let sources = config.resolve_sources();
+
+    tracing::info!(
+        "Launcher: creating server container '{}' with {} source mount(s)",
+        server_name,
+        sources.len()
+    );
+
+    // Step (c): inspect our own container to get image, mounts, env, etc.
+    let socket_path = get_container_socket()?;
+    let inspect_output = std::process::Command::new("podman")
+        .args([
+            "--url",
+            &format!("unix://{}", socket_path.display()),
+            "inspect",
+            &container_name,
+        ])
+        .output()
+        .context("Failed to run podman inspect on launcher container")?;
+
+    if !inspect_output.status.success() {
+        let stderr = String::from_utf8_lossy(&inspect_output.stderr);
+        color_eyre::eyre::bail!(
+            "podman inspect {} failed: {}",
+            container_name,
+            stderr.trim()
+        );
+    }
+
+    let inspect_json: serde_json::Value =
+        serde_json::from_slice(&inspect_output.stdout).context("Failed to parse podman inspect")?;
+
+    // podman inspect returns an array; take the first element
+    let info = inspect_json
+        .as_array()
+        .and_then(|a| a.first())
+        .unwrap_or(&inspect_json);
+
+    // Extract image
+    let image = info
+        .pointer("/ImageName")
+        .or_else(|| info.pointer("/Image"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("localhost/devaipod:latest")
+        .to_string();
+
+    // Extract existing mounts (bind mounts and volumes)
+    let mut existing_mounts: Vec<String> = Vec::new();
+    if let Some(mounts) = info.pointer("/Mounts").and_then(|v| v.as_array()) {
+        for mount in mounts {
+            let source = mount
+                .get("Source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let destination = mount
+                .get("Destination")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if source.is_empty() || destination.is_empty() {
+                continue;
+            }
+            let options = mount.get("Options").and_then(|v| v.as_array());
+            let is_ro = options
+                .map(|opts| opts.iter().any(|o| o.as_str() == Some("ro")))
+                .unwrap_or(false);
+            let mount_type = mount.get("Type").and_then(|v| v.as_str()).unwrap_or("");
+            // For named volumes, use the volume name as source
+            let source_str = if mount_type == "volume" {
+                mount
+                    .get("Name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(source)
+            } else {
+                source
+            };
+            if is_ro {
+                existing_mounts.push(format!("{}:{}:ro", source_str, destination));
+            } else {
+                existing_mounts.push(format!("{}:{}", source_str, destination));
+            }
+        }
+    }
+
+    // Extract existing environment variables
+    let mut existing_env: Vec<String> = Vec::new();
+    if let Some(env_arr) = info
+        .pointer("/Config/Env")
+        .and_then(|v| v.as_array())
+    {
+        for env_val in env_arr {
+            if let Some(env_str) = env_val.as_str() {
+                // Skip internal vars that we'll set ourselves
+                if env_str.starts_with("DEVAIPOD_CONTAINER_NAME=") {
+                    continue;
+                }
+                existing_env.push(env_str.to_string());
+            }
+        }
+    }
+
+    // Check if privileged
+    let is_privileged = info
+        .pointer("/HostConfig/Privileged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Get host port from env var
+    let host_port = std::env::var("DEVAIPOD_HOST_PORT").unwrap_or_else(|_| "8080".to_string());
+
+    // Step (d) + (e): build the podman run command for the server container
+    let mut cmd = std::process::Command::new("podman");
+    cmd.args([
+        "--url",
+        &format!("unix://{}", socket_path.display()),
+        "run",
+        "-d",
+        "--name",
+        &server_name,
+        "--replace",
+    ]);
+
+    if is_privileged {
+        cmd.arg("--privileged");
+    }
+
+    // Re-add existing mounts
+    for mount in &existing_mounts {
+        cmd.args(["-v", mount]);
+    }
+
+    // Re-add existing env vars
+    for env_str in &existing_env {
+        cmd.args(["-e", env_str]);
+    }
+
+    // Set the server container name
+    cmd.args(["-e", &format!("DEVAIPOD_CONTAINER_NAME={}", server_name)]);
+
+    // Publish the host port
+    cmd.args(["-p", &format!("{}:8080", host_port)]);
+
+    // Check for --add-host from extra hosts
+    if let Some(extra_hosts) = info.pointer("/HostConfig/ExtraHosts").and_then(|v| v.as_array()) {
+        for host in extra_hosts {
+            if let Some(h) = host.as_str() {
+                cmd.args(["--add-host", h]);
+            }
+        }
+    }
+
+    // Step (e): add source bind mounts
+    for source in &sources {
+        let mount_target = format!("/mnt/{}", source.name);
+        let mount_str = match source.access {
+            SourceAccess::Readonly => format!("{}:{}:ro", source.path.display(), mount_target),
+            SourceAccess::Controlplane | SourceAccess::Agent => {
+                format!("{}:{}", source.path.display(), mount_target)
+            }
+        };
+        tracing::info!(
+            "Source mount: {} -> {} ({:?})",
+            source.path.display(),
+            mount_target,
+            source.access
+        );
+        cmd.args(["-v", &mount_str]);
+    }
+
+    // Image and command
+    cmd.arg(&image);
+    cmd.args(["devaipod", "web", "--port", "8080"]);
+
+    tracing::info!("Creating server container: {:?}", cmd);
+
+    // Step (f): run the command
+    let output = cmd
+        .output()
+        .context("Failed to create server container")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        color_eyre::eyre::bail!("Failed to create server container: {}", stderr.trim());
+    }
+
+    tracing::info!(
+        "Server container '{}' created successfully, launcher exiting",
+        server_name
+    );
+    std::process::exit(0);
+}
+
 pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Result<()> {
+    // Check if we should act as a launcher (inspect config, create server container with
+    // source mounts, then exit). This is a no-op if DEVAIPOD_CONTAINER_NAME is not set
+    // or if no [sources] are configured.
+    maybe_launch_server_with_sources()?;
+
     // Try to get the podman socket path, but don't fail if not found
     // (allows server to start for static file serving even without podman)
     let socket_path = get_container_socket().ok();
