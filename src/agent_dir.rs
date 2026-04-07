@@ -465,7 +465,7 @@ pub fn harvest_one_repo_via_transient(
 
     let prefix = podman_cli_prefix();
     let ext_url = format!(
-        "ext::{} run --rm -i \
+        "ext::{} run --rm --privileged -i \
          -v {volume}:/mnt/main-workspace:ro \
          -v {host_dir}:/workspaces:ro \
          {image} \
@@ -574,15 +574,24 @@ fn harvest_via_ext_url(
 
 /// Shell-quote a string for safe embedding in an ext:: URL.
 ///
-/// Wraps the value in single quotes and escapes any embedded single quotes
-/// using the `'\''` idiom (end quote, escaped quote, restart quote).
+/// Quote a value for embedding in a git `ext::` URL.
+///
+/// Git's ext:: transport splits the URL on whitespace and passes each
+/// token as an argv element — it does NOT invoke a shell. So we only
+/// need to avoid whitespace and ensure no token splitting. Single-quote
+/// wrapping would cause literal quote characters to reach the command.
 fn shell_quote(s: &str) -> String {
+    // Characters safe in ext:: URL tokens (no shell involved).
     if s.chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
     {
         return s.to_string();
     }
-    format!("'{}'", s.replace('\'', "'\\''"))
+    // If we somehow have whitespace or exotic chars, this is an error
+    // condition for ext:: URLs. Log and return as-is — the fetch will
+    // fail with a clear error rather than silently mangling the value.
+    tracing::warn!("ext:: URL token contains unusual characters: {s:?}");
+    s.to_string()
 }
 
 /// Add or update a git remote in `target_repo` pointing at `agent_repo`,
