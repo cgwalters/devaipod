@@ -110,13 +110,37 @@ fn get_attach_container_name(pod_name: &str, target: AttachTarget) -> String {
 
 /// Resolve a workspace name, handling the --latest flag
 ///
-/// If a workspace name is provided, normalizes it. If --latest is set,
-/// finds the most recently created running workspace.
+/// If a workspace name is provided, normalizes it. If --latest is set (or no
+/// workspace is given and `latest` is true — the default for diff/fetch/etc.),
+/// first tries to scope to workspaces for the current git repo. When multiple
+/// workspaces exist for the same repo, shows an interactive chooser on TTYs or
+/// picks the most recent one on non-TTYs.
 fn resolve_workspace(workspace: Option<&str>, latest: bool) -> Result<String> {
     match (workspace, latest) {
         (Some(name), false) => Ok(normalize_pod_name(name)),
         (None, true) | (Some(_), true) => {
-            // Find the most recent workspace
+            // If we're inside a git repo, try to scope to workspaces for it
+            if let Ok(repo_root) = repo_root_path() {
+                let workspaces = find_workspaces_for_repo(&repo_root);
+                match workspaces.len() {
+                    0 => {
+                        // No workspaces for this repo; fall through to global latest
+                    }
+                    1 => {
+                        let ws = &workspaces[0];
+                        tracing::info!(
+                            "Using workspace for this repo: {}",
+                            ws.short_name
+                        );
+                        return Ok(ws.pod_name.clone());
+                    }
+                    _ => {
+                        return resolve_workspace_interactive(&workspaces);
+                    }
+                }
+            }
+
+            // Fall back to globally latest workspace
             let pod_name = get_latest_workspace()?;
             tracing::info!("Using latest workspace: {}", strip_pod_prefix(&pod_name));
             Ok(pod_name)
@@ -127,6 +151,66 @@ fn resolve_workspace(workspace: Option<&str>, latest: bool) -> Result<String> {
             );
         }
     }
+}
+
+/// Present an interactive chooser when multiple workspaces match the current repo.
+///
+/// On non-TTY stdin (e.g. piped), automatically picks the most recent workspace
+/// and prints a hint about specifying a name explicitly.
+fn resolve_workspace_interactive(workspaces: &[RepoWorkspaceInfo]) -> Result<String> {
+    // Build display labels for each workspace
+    let labels: Vec<String> = workspaces
+        .iter()
+        .map(|ws| {
+            let commits = if ws.commit_count == 1 {
+                "1 commit".to_string()
+            } else {
+                format!("{} commits", ws.commit_count)
+            };
+            let task = ws
+                .task_summary
+                .as_deref()
+                .map(|t| format!("  \"{}\"", t))
+                .unwrap_or_default();
+            format!(
+                "{:<10} {:<12} {:<14}{}",
+                ws.short_name, commits, ws.age_display, task
+            )
+        })
+        .collect();
+
+    if !std::io::stdin().is_terminal() {
+        // Non-interactive: pick the first (most recent, since list_workspaces
+        // sorts newest-first) and print a hint.
+        let ws = &workspaces[0];
+        let commits = if ws.commit_count == 1 {
+            "1 commit".to_string()
+        } else {
+            format!("{} commits", ws.commit_count)
+        };
+        eprintln!(
+            "Using most recent workspace: {} ({}, {})",
+            ws.short_name, commits, ws.age_display
+        );
+        eprintln!(
+            "Tip: specify a workspace name to choose: devaipod diff {}",
+            if workspaces.len() > 1 {
+                &workspaces[1].short_name
+            } else {
+                &ws.short_name
+            }
+        );
+        return Ok(ws.pod_name.clone());
+    }
+
+    let selection = dialoguer::Select::new()
+        .with_prompt("Multiple agents have worked on this repo. Select one")
+        .items(&labels)
+        .default(0)
+        .interact()
+        .context("Failed to show workspace chooser")?;
+
+    Ok(workspaces[selection].pod_name.clone())
 }
 
 /// Get the most recently created devaipod workspace
@@ -4449,13 +4533,19 @@ fn cmd_repo_status() -> Result<()> {
             } else {
                 "\u{2014}".to_string() // —
             };
+            let task = ws
+                .task_summary
+                .as_deref()
+                .map(|t| format!("  \"{}\"", t))
+                .unwrap_or_default();
             println!(
-                "  {} {:<30} {:<8} {:<12} {}",
+                "  {} {:<30} {:<8} {:<12} {}{}",
                 status_icon,
                 ws.short_name,
                 ws.completion_status.as_deref().unwrap_or("unknown"),
                 commit_info,
                 ws.age_display,
+                task,
             );
         }
         println!();
@@ -4676,15 +4766,89 @@ fn repo_root_path() -> Result<PathBuf> {
 
 /// Summary of a workspace relevant to the current repo.
 struct RepoWorkspaceInfo {
+    /// Full pod name (e.g. `devaipod-myproject-abc123`).
+    pod_name: String,
     short_name: String,
     completion_status: Option<String>,
     commit_count: usize,
     age_display: String,
+    /// Truncated task description for display in choosers.
+    task_summary: Option<String>,
+}
+
+/// Extract a forge-style repo suffix from a path or URL.
+///
+/// Given a path like `/var/home/ai/src/github/org/repo` or a URL like
+/// `https://github.com/org/repo`, extracts the trailing `github.com/org/repo`
+/// (or equivalent for other forges). Returns `None` if no forge host is found.
+fn extract_repo_suffix(s: &str) -> Option<String> {
+    // Strip common URL parts first
+    let s = s
+        .strip_suffix(".git")
+        .unwrap_or(s)
+        .trim_end_matches('/');
+    let hosts = [
+        "github.com",
+        "gitlab.com",
+        "codeberg.org",
+        "bitbucket.org",
+        "sr.ht",
+        "gitea.com",
+    ];
+    for host in &hosts {
+        // Match the host appearing as a path component (preceded by `/` or start)
+        // or as a URL authority (preceded by `://` or `@`).
+        if let Some(idx) = s.find(host) {
+            // Grab "host/org/repo" from the match position onward
+            let suffix = &s[idx..];
+            return Some(suffix.to_string());
+        }
+    }
+    None
+}
+
+/// Check whether a workspace's source matches the given repo root.
+///
+/// Handles the container-vs-host path mismatch (e.g. `/mnt/src/github/org/repo`
+/// vs `/var/home/ai/src/github/org/repo`) and URL sources by comparing the
+/// forge-qualified repo suffix when direct path comparison fails.
+fn source_matches_repo(source: &str, source_dirs: &[PathBuf], repo_root: &Path) -> bool {
+    let repo_str = repo_root.to_string_lossy();
+
+    // Direct path match
+    if source == repo_str
+        || source_dirs
+            .iter()
+            .any(|d| d.to_string_lossy() == repo_str)
+    {
+        return true;
+    }
+
+    // Fall back to forge-suffix comparison
+    let repo_suffix = extract_repo_suffix(&repo_str);
+    if let Some(ref rs) = repo_suffix {
+        if let Some(ref ss) = extract_repo_suffix(source)
+            && rs == ss
+        {
+            return true;
+        }
+
+        // Also check source_dirs suffixes
+        for d in source_dirs {
+            let ds = d.to_string_lossy();
+            if let Some(ref ds_suffix) = extract_repo_suffix(&ds)
+                && rs == ds_suffix
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Scan the workspaces directory for workspaces whose source matches this repo.
 fn find_workspaces_for_repo(repo_root: &Path) -> Vec<RepoWorkspaceInfo> {
-    let repo_str = repo_root.to_string_lossy();
     let workspaces = match agent_dir::list_workspaces() {
         Ok(w) => w,
         Err(e) => {
@@ -4697,13 +4861,7 @@ fn find_workspaces_for_repo(repo_root: &Path) -> Vec<RepoWorkspaceInfo> {
     for (_dir_name, ws_dir, state) in &workspaces {
         let Some(state) = state else { continue };
 
-        // Check if this workspace is for our repo (source path or source_dirs)
-        let matches = state.source == repo_str
-            || state
-                .source_dirs
-                .iter()
-                .any(|d| d.to_string_lossy() == repo_str);
-        if !matches {
+        if !source_matches_repo(&state.source, &state.source_dirs, repo_root) {
             continue;
         }
 
@@ -4734,11 +4892,23 @@ fn find_workspaces_for_repo(repo_root: &Path) -> Vec<RepoWorkspaceInfo> {
         // Format age from created timestamp
         let age_display = format_relative_time(&state.created);
 
+        // Truncate task to ~60 chars for display
+        let task_summary = state.task.as_ref().map(|t| {
+            let trimmed = t.trim();
+            if trimmed.len() > 60 {
+                format!("{}...", &trimmed[..57])
+            } else {
+                trimmed.to_string()
+            }
+        });
+
         results.push(RepoWorkspaceInfo {
+            pod_name: state.pod_name.clone(),
             short_name,
             completion_status: state.completion_status.clone(),
             commit_count,
             age_display,
+            task_summary,
         });
     }
     results
@@ -8748,5 +8918,93 @@ mod tests {
             normalize_source("gitea.local:3000/owner/repo", no_extra).as_ref(),
             "gitea.local:3000/owner/repo",
         );
+    }
+
+    #[test]
+    fn test_extract_repo_suffix() {
+        // Host path
+        assert_eq!(
+            extract_repo_suffix("/var/home/ai/src/github.com/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // Container-internal path (different prefix, same suffix)
+        assert_eq!(
+            extract_repo_suffix("/mnt/src/github.com/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // HTTPS URL
+        assert_eq!(
+            extract_repo_suffix("https://github.com/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // HTTPS URL with .git suffix
+        assert_eq!(
+            extract_repo_suffix("https://github.com/org/repo.git"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // GitLab
+        assert_eq!(
+            extract_repo_suffix("/home/user/src/gitlab.com/group/project"),
+            Some("gitlab.com/group/project".to_string()),
+        );
+        // No forge host => None
+        assert_eq!(extract_repo_suffix("/tmp/myrepo"), None);
+        // Path without host separator (e.g. "github" directory name without ".com")
+        assert_eq!(extract_repo_suffix("/home/user/github/org/repo"), None);
+    }
+
+    #[test]
+    fn test_source_matches_repo_direct_path() {
+        let repo = Path::new("/var/home/ai/src/myproject");
+        assert!(source_matches_repo(
+            "/var/home/ai/src/myproject",
+            &[],
+            repo
+        ));
+        assert!(!source_matches_repo("/var/home/ai/src/other", &[], repo));
+    }
+
+    #[test]
+    fn test_source_matches_repo_via_source_dirs() {
+        let repo = Path::new("/var/home/ai/src/myproject");
+        assert!(source_matches_repo(
+            "https://github.com/unrelated/url",
+            &[PathBuf::from("/var/home/ai/src/myproject")],
+            repo
+        ));
+    }
+
+    #[test]
+    fn test_source_matches_repo_cross_path_via_suffix() {
+        // Container path vs host path — different prefixes but same forge suffix
+        let repo = Path::new("/var/home/ai/src/github.com/org/repo");
+        assert!(source_matches_repo(
+            "/mnt/src/github.com/org/repo",
+            &[],
+            repo
+        ));
+    }
+
+    #[test]
+    fn test_source_matches_repo_url_vs_path() {
+        // URL source vs local path with forge suffix
+        let repo = Path::new("/home/user/src/github.com/org/repo");
+        assert!(source_matches_repo(
+            "https://github.com/org/repo",
+            &[],
+            repo
+        ));
+        assert!(source_matches_repo(
+            "https://github.com/org/repo.git",
+            &[],
+            repo
+        ));
+    }
+
+    #[test]
+    fn test_source_matches_repo_no_forge_no_match() {
+        // When neither side has a forge host, only direct match works
+        let repo = Path::new("/tmp/myproject");
+        assert!(!source_matches_repo("/other/myproject", &[], repo));
     }
 }
