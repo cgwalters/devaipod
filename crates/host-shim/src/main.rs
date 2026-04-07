@@ -5,6 +5,10 @@
 //! and transparently proxies the command into the running container via
 //! `podman exec`.
 //!
+//! The shim also handles lifecycle commands (`start`, `stop`, `status`) that
+//! manage the devaipod container itself, replacing the Justfile's
+//! `container-run` recipe.
+//!
 //! The key feature is **cwd translation**: if the user's working directory
 //! falls under a configured `[sources]` path, the shim maps it to the
 //! corresponding `/mnt/<name>/...` path inside the container. This lets
@@ -22,6 +26,7 @@ use std::env;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 // --- Minimal config parsing (just enough for [sources]) ---
 
@@ -63,10 +68,10 @@ impl SourceEntry {
 
 /// Expand `~/...` to `$HOME/...`.
 fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(suffix) = path.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(suffix);
-        }
+    if let Some(suffix) = path.strip_prefix("~/")
+        && let Ok(home) = env::var("HOME")
+    {
+        return PathBuf::from(home).join(suffix);
     }
     PathBuf::from(path)
 }
@@ -151,6 +156,297 @@ fn translate_cwd_inner(cwd: &Path, sources: &[SourceMount], canonicalize: bool) 
     None
 }
 
+// --- Lifecycle commands (start / stop / status) ---
+
+/// Default port for the web UI.
+const DEFAULT_PORT: &str = "8080";
+/// Default container image.
+const DEFAULT_IMAGE: &str = "localhost/devaipod:latest";
+/// How long to wait for the server container to appear.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Find the podman socket path. Returns the path or exits with an error.
+fn find_podman_socket() -> PathBuf {
+    // Linux: $XDG_RUNTIME_DIR/podman/podman.sock
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        let sock = PathBuf::from(&xdg).join("podman/podman.sock");
+        if sock.exists() {
+            return sock;
+        }
+    }
+    // macOS: ask podman machine
+    if let Ok(output) = Command::new("podman")
+        .args(["machine", "inspect", "--format", "{{.ConnectionInfo.PodmanSocket.Path}}"])
+        .output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            let sock = PathBuf::from(&path);
+            if sock.exists() {
+                return sock;
+            }
+        }
+    }
+    eprintln!("devaipod: could not find podman socket");
+    eprintln!("  Linux: set XDG_RUNTIME_DIR and ensure podman socket is active");
+    eprintln!("  macOS: run 'podman machine start'");
+    std::process::exit(1);
+}
+
+/// Determine the socket path to pass as HOST_SOCKET (what the container
+/// uses as a bind-mount source for sibling containers).
+///
+/// When `has_xdg_runtime` is true (Linux), this is the real socket path.
+/// Otherwise (macOS) the container runs in the podman VM, so we use the
+/// VM's well-known path.
+fn host_socket_for_container(actual_socket: &Path, has_xdg_runtime: bool) -> PathBuf {
+    if has_xdg_runtime {
+        actual_socket.to_path_buf()
+    } else {
+        PathBuf::from("/run/podman/podman.sock")
+    }
+}
+
+/// Parse `--flag VALUE` pairs from a slice, returning a simple map.
+/// Unrecognised flags cause an error exit.
+fn parse_start_flags(args: &[String]) -> (String, String) {
+    let mut port = DEFAULT_PORT.to_string();
+    let mut image = DEFAULT_IMAGE.to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                i += 1;
+                port = args.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("devaipod server start: --port requires a value");
+                    std::process::exit(1);
+                });
+            }
+            "--image" => {
+                i += 1;
+                image = args.get(i).cloned().unwrap_or_else(|| {
+                    eprintln!("devaipod server start: --image requires a value");
+                    std::process::exit(1);
+                });
+            }
+            other => {
+                eprintln!("devaipod server start: unknown flag '{other}'");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+    (port, image)
+}
+
+/// `devaipod server start [--port PORT] [--image IMAGE]`
+fn cmd_start(args: &[String], container_name: &str) {
+    let (port, image) = parse_start_flags(args);
+    let home = env::var("HOME").unwrap_or_else(|_| {
+        eprintln!("devaipod server start: HOME is not set");
+        std::process::exit(1);
+    });
+
+    // 1. Find podman socket
+    let socket = find_podman_socket();
+    eprintln!("Using podman socket: {}", socket.display());
+
+    // 2. Create directories
+    let ssh_dir = PathBuf::from(&home).join(format!(".ssh/config.d/{container_name}"));
+    let workspaces_dir =
+        PathBuf::from(&home).join(format!(".local/share/{container_name}/workspaces"));
+    for dir in [&ssh_dir, &workspaces_dir] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!(
+                "devaipod server start: failed to create {}: {e}",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // 3. Create state volume if needed
+    let state_vol = format!("{container_name}-state");
+    let vol_exists = Command::new("podman")
+        .args(["volume", "exists", &state_vol])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !vol_exists {
+        let status = Command::new("podman")
+            .args(["volume", "create", &state_vol])
+            .status();
+        match status {
+            Ok(s) if s.success() => eprintln!("Created volume {state_vol}"),
+            _ => {
+                eprintln!("devaipod server start: failed to create volume {state_vol}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 4. Determine HOST_SOCKET
+    let is_linux = env::var("XDG_RUNTIME_DIR").is_ok();
+    let host_socket = host_socket_for_container(&socket, is_linux);
+
+    // 5. Config file path
+    let config_path = PathBuf::from(&home).join(".config/devaipod.toml");
+    if !config_path.exists() {
+        eprintln!(
+            "Warning: {} not found; container may exit. Run 'devaipod init' on the host first.",
+            config_path.display()
+        );
+    }
+
+    // 6. Run the launcher container
+    let launcher_name = format!("{container_name}-launcher");
+    let mut cmd = Command::new("podman");
+    cmd.args(["run", "-d", "--name", &launcher_name, "--privileged", "--replace"]);
+
+    if is_linux {
+        cmd.args(["--add-host", "host.containers.internal:host-gateway"]);
+    }
+
+    cmd.args(["-v", &format!("{}:/run/docker.sock", host_socket.display())]);
+    cmd.args(["-e", &format!("DEVAIPOD_HOST_SOCKET={}", host_socket.display())]);
+    cmd.args(["-e", &format!("DEVAIPOD_HOST_PORT={port}")]);
+    cmd.args(["-e", &format!("DEVAIPOD_HOST_HOME={home}")]);
+    cmd.args(["-e", &format!("DEVAIPOD_CONTAINER_NAME={launcher_name}")]);
+    cmd.args([
+        "-v",
+        &format!("{}:/var/lib/devaipod-workspaces", workspaces_dir.display()),
+    ]);
+    cmd.args([
+        "-e",
+        &format!("DEVAIPOD_HOST_WORKDIR={}", workspaces_dir.display()),
+    ]);
+    cmd.args(["-v", &format!("{state_vol}:/var/lib/devaipod")]);
+    cmd.args([
+        "-v",
+        &format!("{}:/root/.config/devaipod.toml:ro", config_path.display()),
+    ]);
+    cmd.args([
+        "-v",
+        &format!("{}:/run/devaipod-ssh:Z", ssh_dir.display()),
+    ]);
+    cmd.arg(&image);
+
+    let status = cmd.status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("devaipod server start: podman run failed (exit {})", s.code().unwrap_or(-1));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("devaipod server start: failed to exec podman: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // 7. Wait for the server container to appear
+    eprintln!(
+        "Launcher started; waiting for server container '{container_name}'..."
+    );
+    let deadline = Instant::now() + START_TIMEOUT;
+    let mut found = false;
+    while Instant::now() < deadline {
+        if Command::new("podman")
+            .args(["inspect", container_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    if !found {
+        eprintln!(
+            "ERROR: Server container '{container_name}' did not start within {}s.",
+            START_TIMEOUT.as_secs()
+        );
+        eprintln!("Check: podman logs {launcher_name}");
+        std::process::exit(1);
+    }
+
+    eprintln!("devaipod started (port {port})");
+    eprintln!("Web UI: http://127.0.0.1:{port}/");
+}
+
+/// `devaipod stop`
+fn cmd_stop(container_name: &str) {
+    let launcher_name = format!("{container_name}-launcher");
+
+    // Stop & remove both containers, ignoring errors (they may not exist).
+    for name in [container_name, launcher_name.as_str()] {
+        let _ = Command::new("podman")
+            .args(["stop", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = Command::new("podman")
+            .args(["rm", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    eprintln!("devaipod stopped");
+}
+
+/// `devaipod status`
+fn cmd_status(container_name: &str) {
+    let output = Command::new("podman")
+        .args([
+            "inspect",
+            container_name,
+            "--format",
+            "{{.State.Status}}|{{.State.StartedAt}}|{{.State.Running}}",
+        ])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            let raw = raw.trim();
+            let parts: Vec<&str> = raw.splitn(3, '|').collect();
+            let state = parts.first().unwrap_or(&"unknown");
+            let started = parts.get(1).unwrap_or(&"");
+            let running = parts.get(2).unwrap_or(&"false");
+
+            eprintln!("Container: {container_name}");
+            eprintln!("State:     {state} (running={running})");
+
+            if *running == "true" {
+                // Show port mapping
+                if let Ok(port_out) = Command::new("podman")
+                    .args(["port", container_name])
+                    .output()
+                    && port_out.status.success()
+                {
+                    let ports = String::from_utf8_lossy(&port_out.stdout);
+                    let ports = ports.trim();
+                    if !ports.is_empty() {
+                        eprintln!("Ports:     {ports}");
+                    }
+                }
+                // Show uptime (just the started-at timestamp)
+                if !started.is_empty() {
+                    eprintln!("Started:   {started}");
+                }
+            }
+        }
+        _ => {
+            eprintln!("Container '{container_name}' not found");
+            std::process::exit(1);
+        }
+    }
+}
+
 // --- Main ---
 
 fn main() {
@@ -165,6 +461,64 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let container_name =
         env::var("DEVAIPOD_NAME").unwrap_or_else(|_| "devaipod".to_string());
+
+    // Intercept `server` subcommand — these manage the container itself and
+    // must NOT be proxied via `podman exec`.
+    if args.first().map(|s| s.as_str()) == Some("server") {
+        let subcmd = args.get(1).map(|s| s.as_str());
+        match subcmd {
+            Some("start") => {
+                cmd_start(&args[2..], &container_name);
+                return;
+            }
+            Some("stop") => {
+                cmd_stop(&container_name);
+                return;
+            }
+            Some("status") => {
+                cmd_status(&container_name);
+                return;
+            }
+            Some(other) => {
+                eprintln!("devaipod server: unknown subcommand '{other}'");
+                eprintln!("Usage: devaipod server <start|stop|status>");
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("Usage: devaipod server <start|stop|status>");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // --- Proxy all other commands into the container via podman exec ---
+
+    // Check the container is running before trying to exec into it.
+    let running = Command::new("podman")
+        .args(["inspect", "--format", "{{.State.Running}}", &container_name])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        });
+
+    match running.as_deref() {
+        Some("true") => {} // good
+        Some(_) => {
+            eprintln!("devaipod: container '{container_name}' is not running");
+            eprintln!("Start it with: devaipod server start");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("devaipod: container '{container_name}' not found");
+            eprintln!("Start it with: devaipod server start");
+            std::process::exit(1);
+        }
+    }
 
     let config = load_config();
     let sources = resolve_sources(&config);
@@ -271,5 +625,57 @@ mod tests {
 
         // Relative paths pass through
         assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_parse_start_flags_defaults() {
+        let (port, image) = parse_start_flags(&[]);
+        assert_eq!(port, DEFAULT_PORT);
+        assert_eq!(image, DEFAULT_IMAGE);
+    }
+
+    #[test]
+    fn test_parse_start_flags_custom() {
+        let args: Vec<String> = vec![
+            "--port".into(),
+            "9090".into(),
+            "--image".into(),
+            "ghcr.io/example/devaipod:v1".into(),
+        ];
+        let (port, image) = parse_start_flags(&args);
+        assert_eq!(port, "9090");
+        assert_eq!(image, "ghcr.io/example/devaipod:v1");
+    }
+
+    #[test]
+    fn test_parse_start_flags_port_only() {
+        let args: Vec<String> = vec!["--port".into(), "3000".into()];
+        let (port, image) = parse_start_flags(&args);
+        assert_eq!(port, "3000");
+        assert_eq!(image, DEFAULT_IMAGE);
+    }
+
+    #[test]
+    fn test_parse_start_flags_image_only() {
+        let args: Vec<String> = vec!["--image".into(), "my-image:latest".into()];
+        let (port, image) = parse_start_flags(&args);
+        assert_eq!(port, DEFAULT_PORT);
+        assert_eq!(image, "my-image:latest");
+    }
+
+    #[test]
+    fn test_host_socket_linux() {
+        // When XDG_RUNTIME_DIR is set (has_xdg_runtime=true), use actual socket path
+        let actual = PathBuf::from("/run/user/1000/podman/podman.sock");
+        let result = host_socket_for_container(&actual, true);
+        assert_eq!(result, actual);
+    }
+
+    #[test]
+    fn test_host_socket_macos() {
+        // Without XDG_RUNTIME_DIR (has_xdg_runtime=false), use the VM well-known path
+        let actual = PathBuf::from("/some/mac/path/podman.sock");
+        let result = host_socket_for_container(&actual, false);
+        assert_eq!(result, PathBuf::from("/run/podman/podman.sock"));
     }
 }
