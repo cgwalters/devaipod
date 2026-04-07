@@ -3988,6 +3988,78 @@ fn find_all_agent_git_repos(pod_name: &str) -> Result<Vec<(String, PathBuf)>> {
     Ok(repos)
 }
 
+/// Ensure we have a writable git repo for fetch/diff operations.
+///
+/// If the current repo's `.git/config` is writable, returns the path as-is.
+/// If it's read-only (e.g. on a read-only source mount inside the container),
+/// creates a lightweight clone in a persistent cache directory that shares
+/// objects via git alternates. The cache directory is based on the repo path
+/// so repeated calls return the same clone.
+fn ensure_writable_git_repo(repo: &Path) -> Result<std::path::PathBuf> {
+    let git_config = repo.join(".git/config");
+    // Quick check: try opening the config for writing
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&git_config)
+        .is_ok()
+    {
+        return Ok(repo.to_path_buf());
+    }
+
+    tracing::info!(
+        "Source repo at {} is read-only; using writable clone for fetch",
+        repo.display()
+    );
+
+    // Deterministic cache path based on repo location
+    let cache_dir = PathBuf::from("/tmp/devaipod-fetch-cache");
+    // Use a hash-like name derived from the repo path
+    let repo_id: String = repo
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' { '_' } else { c })
+        .collect();
+    let clone_path = cache_dir.join(&repo_id);
+
+    // If cache already exists, just fetch to update it
+    if clone_path.join(".git").exists() {
+        let _ = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&clone_path)
+            .args(["fetch", "origin"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        return Ok(clone_path);
+    }
+
+    std::fs::create_dir_all(&cache_dir)
+        .context("Failed to create fetch cache directory")?;
+
+    // Use git clone --shared for fast clone with shared objects
+    let status = ProcessCommand::new("git")
+        .args([
+            "clone",
+            "--shared",
+            "--no-checkout",
+            &repo.to_string_lossy(),
+            &clone_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .context("Failed to create writable git clone")?;
+
+    if !status.success() {
+        color_eyre::eyre::bail!(
+            "Failed to create writable clone of {}",
+            repo.display()
+        );
+    }
+
+    Ok(clone_path)
+}
+
 /// Verify the current directory is a git repo.
 fn verify_current_dir_is_git_repo() -> Result<()> {
     let output = ProcessCommand::new("git")
@@ -4023,6 +4095,11 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
     let short_name = strip_pod_prefix(pod_name);
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
 
+    // If the git repo is on a read-only mount (e.g. /mnt/src inside the
+    // control plane container), we can't add remotes. Create a writable
+    // clone in a cache dir that shares objects with the source.
+    let effective_cwd = ensure_writable_git_repo(&cwd)?;
+
     // Check if the agent container is running for ext:: transport
     let agent_container = get_attach_container_name(pod_name, AttachTarget::Agent);
     let container_running = agent_dir::is_container_running(&agent_container);
@@ -4055,7 +4132,7 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
                 workspace_path
             );
             agent_dir::harvest_one_repo_via_exec(
-                &cwd,
+                &effective_cwd,
                 &agent_container,
                 &workspace_path,
                 &remote_name,
@@ -4069,7 +4146,7 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
                 pod_name
             );
             agent_dir::harvest_one_repo_via_transient(
-                &cwd,
+                &effective_cwd,
                 pod_name,
                 &workspace_path,
                 &remote_name,
@@ -4114,9 +4191,16 @@ fn cmd_fetch(pod_name: &str) -> Result<()> {
 /// Returns a fully-qualified ref like `refs/remotes/devaipod/ws/main` that
 /// git will resolve unambiguously even when the remote name contains slashes.
 fn resolve_remote_default_ref(remote_name: &str) -> Result<Option<String>> {
+    resolve_remote_default_ref_in(remote_name, &std::env::current_dir()?)
+}
+
+/// Like [`resolve_remote_default_ref`] but operates on a specified repo path.
+fn resolve_remote_default_ref_in(remote_name: &str, repo: &Path) -> Result<Option<String>> {
     // Try the remote's symbolic HEAD (set by `git clone` or `git remote set-head`)
     let head_ref = format!("refs/remotes/{}/HEAD", remote_name);
     let head_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
         .args(["symbolic-ref", &head_ref])
         .output()
         .ok();
@@ -4131,6 +4215,8 @@ fn resolve_remote_default_ref(remote_name: &str) -> Result<Option<String>> {
     for branch in ["main", "master"] {
         let ref_name = format!("refs/remotes/{}/{}", remote_name, branch);
         let verify = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
             .args(["rev-parse", "--verify", &ref_name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -4142,6 +4228,8 @@ fn resolve_remote_default_ref(remote_name: &str) -> Result<Option<String>> {
 
     // Fall back to the first available branch (skip HEAD symref)
     let branch_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
         .args([
             "for-each-ref",
             "--format=%(refname)",
@@ -4171,12 +4259,16 @@ fn cmd_diff(pod_name: &str, stat: bool) -> Result<()> {
     // Fetch first (reuses the same logic)
     cmd_fetch(pod_name)?;
 
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    // Use the same writable repo as cmd_fetch (the remotes were added there)
+    let effective_cwd = ensure_writable_git_repo(&cwd)?;
+
     let short_name = strip_pod_prefix(pod_name);
     let remote_name = format!("devaipod/{}", short_name);
 
     // Find the remote's default branch using fully-qualified refs to avoid
     // ambiguity (remote names with slashes can confuse git's ref resolution).
-    let remote_ref = resolve_remote_default_ref(&remote_name)?;
+    let remote_ref = resolve_remote_default_ref_in(&remote_name, &effective_cwd)?;
     let Some(remote_ref) = remote_ref else {
         println!("No changes from agent yet.");
         return Ok(());
@@ -4184,6 +4276,8 @@ fn cmd_diff(pod_name: &str, stat: bool) -> Result<()> {
 
     // Check if there are any commits beyond the merge base
     let merge_base = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&effective_cwd)
         .args(["merge-base", "HEAD", &remote_ref])
         .output()
         .context("Failed to find merge base")?;
@@ -4193,6 +4287,8 @@ fn cmd_diff(pod_name: &str, stat: bool) -> Result<()> {
             .trim()
             .to_string();
         let remote_sha_output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&effective_cwd)
             .args(["rev-parse", &remote_ref])
             .output()
             .context("Failed to get remote HEAD")?;
@@ -4209,7 +4305,11 @@ fn cmd_diff(pod_name: &str, stat: bool) -> Result<()> {
     }
 
     // Run the diff
-    let mut diff_args = vec!["diff".to_string()];
+    let mut diff_args = vec![
+        "-C".to_string(),
+        effective_cwd.to_string_lossy().to_string(),
+        "diff".to_string(),
+    ];
     if stat {
         diff_args.push("--stat".to_string());
     }

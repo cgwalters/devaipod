@@ -578,7 +578,7 @@ fn harvest_via_ext_url(
 /// using the `'\''` idiom (end quote, escaped quote, restart quote).
 fn shell_quote(s: &str) -> String {
     if s.chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
     {
         return s.to_string();
     }

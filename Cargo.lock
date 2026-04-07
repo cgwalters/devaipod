@@ -1142,6 +1142,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "devaipod-host"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "dialoguer"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
