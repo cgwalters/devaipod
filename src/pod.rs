@@ -264,6 +264,26 @@ pub const AGENT_HOME_PATH: &str = "/home/devenv";
 /// after a container rebuild (which re-runs the full setup flow).
 const AGENT_STATE_PATH: &str = "/var/lib/devaipod-state.json";
 
+/// Base name for the shared dotfiles cache volume.
+///
+/// This volume persists across workspace creates so that each new workspace
+/// only needs a fast `git fetch` + `git reset` instead of a full clone.
+/// When `DEVAIPOD_INSTANCE` is set, the volume name is suffixed with
+/// `-{instance}` to avoid collisions between independent sessions.
+const DOTFILES_CACHE_VOLUME_PREFIX: &str = "devaipod-dotfiles-cache";
+
+/// Mount point for the dotfiles cache volume inside init containers.
+const DOTFILES_CACHE_MOUNT: &str = "/cache";
+
+/// Return the dotfiles cache volume name, suffixed with the instance ID if set.
+fn dotfiles_cache_volume_name() -> String {
+    if let Some(instance_id) = crate::get_instance_id() {
+        format!("{}-{}", DOTFILES_CACHE_VOLUME_PREFIX, instance_id)
+    } else {
+        DOTFILES_CACHE_VOLUME_PREFIX.to_string()
+    }
+}
+
 /// Python script for worker control (send tasks, monitor, get status).
 /// Replaces `opencode run --attach --format json` which returns excessive JSON.
 const WORKER_CTL_SCRIPT: &str = include_str!("../scripts/devaipod-workerctl.py");
@@ -2303,9 +2323,11 @@ chmod 644 '{config_path}'
 
     /// Clone dotfiles repository to the agent home volume before containers start
     ///
-    /// This uses a one-shot init container with access to GH_TOKEN for private repos.
-    /// The dotfiles are cloned to a staging directory, and the install script is run
-    /// after the container starts.
+    /// Uses a shared cache volume (`devaipod-dotfiles-cache`) so that subsequent
+    /// workspaces only need an incremental `git fetch` instead of a full clone.
+    /// The init container mounts both the cache volume and the per-workspace
+    /// agent-home volume: dotfiles are fetched/cloned into the cache, then
+    /// copied to the workspace.
     async fn clone_dotfiles_to_volume(
         podman: &PodmanService,
         image: &str,
@@ -2313,22 +2335,50 @@ chmod 644 '{config_path}'
         dotfiles: &DotfilesConfig,
         global_config: &Config,
     ) -> Result<()> {
-        let dotfiles_dir = format!("{}/.dotfiles", AGENT_HOME_PATH);
+        let cache_dotfiles_dir = format!("{}/.dotfiles", DOTFILES_CACHE_MOUNT);
+        let workspace_dotfiles_dir = format!("{}/.dotfiles", AGENT_HOME_PATH);
+
+        // Ensure the shared cache volume exists
+        let cache_volume = dotfiles_cache_volume_name();
+        if !podman.volume_exists(&cache_volume).await? {
+            podman
+                .create_volume(&cache_volume)
+                .await
+                .context("Failed to create dotfiles cache volume")?;
+            tracing::debug!("Created dotfiles cache volume '{}'", cache_volume);
+        }
 
         // Get GH_TOKEN for private repos
         let gh_token = crate::git::get_github_token_with_secret(global_config);
 
-        let clone_script =
-            crate::git::clone_dotfiles_script(&dotfiles.url, &dotfiles_dir, gh_token.as_deref());
+        // Clone/update dotfiles into the cache volume, then copy to workspace.
+        // The cache script is wrapped in flock to serialize concurrent access —
+        // two simultaneous `devaipod up` calls would otherwise race on git ops.
+        let cache_script =
+            crate::git::clone_dotfiles_script(&dotfiles.url, &cache_dotfiles_dir, gh_token.as_deref());
+        let full_script = format!(
+            "exec 9>{cache_mount}/.dotfiles.lock\n\
+             flock 9\n\
+             {cache_script}\n\
+             flock -u 9\n\
+             cp -a {cache_dotfiles_dir} {workspace_dotfiles_dir}\n",
+            cache_mount = DOTFILES_CACHE_MOUNT,
+            cache_script = cache_script,
+            cache_dotfiles_dir = cache_dotfiles_dir,
+            workspace_dotfiles_dir = workspace_dotfiles_dir,
+        );
 
-        tracing::debug!("Cloning dotfiles to agent home volume...");
+        // Mount the cache volume alongside the agent-home volume
+        let cache_bind = format!("{}:{}", cache_volume, DOTFILES_CACHE_MOUNT);
+
+        tracing::debug!("Cloning dotfiles to agent home volume (via cache)...");
         let (exit_code, stdout) = podman
             .run_init_container_with_output(
                 image,
                 agent_home_volume,
                 AGENT_HOME_PATH,
-                &["/bin/sh", "-c", &clone_script],
-                &[],
+                &["/bin/sh", "-c", &full_script],
+                &[cache_bind],
             )
             .await
             .context("Failed to clone dotfiles to agent volume")?;
