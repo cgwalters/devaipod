@@ -19,7 +19,7 @@ Full documentation including quick start is available at **[cgwalters.github.io/
 
 ## Related Projects
 
-See the [full comparison](https://cgwalters.github.io/devaipod/related-projects.html) in the docs. Key projects in this space include [OpenHands](https://github.com/All-Hands-AI/OpenHands), [SWE-agent](https://github.com/princeton-nlp/SWE-agent), [Ambient Code](https://github.com/ambient-code/platform), [Auto-Claude](https://github.com/AndyMik90/Auto-Claude), [Continue](https://github.com/continuedev/continue), and [Goose](https://github.com/block/goose).
+See the [full comparison](https://cgwalters.github.io/devaipod/related-projects.html) in the docs. Key projects in this space include [OpenHands](https://github.com/All-Hands-AI/OpenHands), [SWE-agent](https://github.com/princeton-nlp/SWE-agent), [Ambient Code](https://github.com/ambient-code/platform), [Scion](https://github.com/GoogleCloudPlatform/scion), [Auto-Claude](https://github.com/AndyMik90/Auto-Claude), [Continue](https://github.com/continuedev/continue), and [Goose](https://github.com/block/goose).
 
 ## Contributing
 
