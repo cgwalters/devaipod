@@ -546,6 +546,17 @@ struct UpOptions {
     ///   --source-dir .   # Current directory as read-only source
     #[arg(long = "source-dir", value_name = "DIR")]
     source_dirs: Vec<PathBuf>,
+    /// Forward a port from the container to the host.
+    ///
+    /// Uses devcontainer.json forwardPorts syntax: a plain port number
+    /// (random host port) or hostPort:containerPort (explicit mapping).
+    /// Can be specified multiple times.
+    ///
+    /// Examples:
+    ///   -p 3000           # Forward container port 3000 to a random host port
+    ///   -p 8080:3000      # Forward container port 3000 to host port 8080
+    #[arg(short = 'p', long = "port", value_name = "PORT")]
+    ports: Vec<String>,
 }
 
 /// Internal options for workspace creation (like `podman create` vs `podman run`)
@@ -581,6 +592,8 @@ struct CreateOptions {
     auto_approve: bool,
     /// Additional source directories to mount read-only
     source_dirs: Vec<PathBuf>,
+    /// Ports to forward (CLI --port flags)
+    ports: Vec<String>,
 }
 
 impl CreateOptions {
@@ -601,6 +614,7 @@ impl CreateOptions {
             use_default_devcontainer: opts.use_default_devcontainer,
             auto_approve: !opts.no_auto_approve,
             source_dirs: opts.source_dirs.clone(),
+            ports: opts.ports.clone(),
         }
     }
 }
@@ -986,6 +1000,24 @@ enum HostCommand {
         /// Additional source directories to mount read-only in the agent container
         #[arg(long = "source-dir", value_name = "DIR")]
         source_dirs: Vec<PathBuf>,
+        /// Forward a port from the container to the host.
+        ///
+        /// Uses devcontainer.json forwardPorts syntax: a plain port number
+        /// (random host port) or hostPort:containerPort (explicit mapping).
+        /// Can be specified multiple times.
+        ///
+        /// Examples:
+        ///   -p 3000           # Forward container port 3000 to a random host port
+        ///   -p 8080:3000      # Forward container port 3000 to host port 8080
+        #[arg(short = 'p', long = "port", value_name = "PORT")]
+        ports: Vec<String>,
+        /// Create a scratch workspace without source context
+        ///
+        /// By default, `run` auto-detects the current git repo. This flag
+        /// creates a clean workspace using only the default devcontainer image,
+        /// similar to how the advisor pod works.
+        #[arg(short = 'N', long = "no-context")]
+        no_context: bool,
     },
     /// Generate shell completions
     ///
@@ -1466,6 +1498,17 @@ enum DevcontainerAction {
         /// Use the devcontainer.json from your dotfiles repo instead of the project's
         #[arg(long)]
         use_default_devcontainer: bool,
+        /// Forward a port from the container to the host.
+        ///
+        /// Uses devcontainer.json forwardPorts syntax: a plain port number
+        /// (random host port) or hostPort:containerPort (explicit mapping).
+        /// Can be specified multiple times.
+        ///
+        /// Examples:
+        ///   -p 3000           # Forward container port 3000 to a random host port
+        ///   -p 8080:3000      # Forward container port 3000 to host port 8080
+        #[arg(short = 'p', long = "port", value_name = "PORT")]
+        ports: Vec<String>,
     },
     /// List running devcontainer pods
     ///
@@ -1813,16 +1856,26 @@ async fn run_host(cli: HostCli) -> Result<()> {
             no_auto_approve,
             title,
             source_dirs,
+            ports,
+            no_context,
         } => {
-            let source = resolve_source(source.as_deref(), &config);
-            let source = maybe_resolve_shorthand(source, &config);
+            let source = if no_context {
+                if source.is_some() {
+                    tracing::warn!("--no-context: ignoring source argument");
+                }
+                None
+            } else {
+                let source = resolve_source(source.as_deref(), &config);
+                maybe_resolve_shorthand(source, &config)
+            };
             let source = source.as_deref();
 
             // Merge task sources: positional arg takes precedence, then -c/--command
             let explicit_task = task.or(command);
 
             // If no source and no explicit task, error out early with guidance
-            if source.is_none() && explicit_task.is_none() {
+            // (skip this check when --no-context is set — scratch workspace is intentional)
+            if !no_context && source.is_none() && explicit_task.is_none() {
                 bail!(
                     "No source specified. Either provide a git URL, or use -c to specify a task for a scratch workspace.\n\
                      You can also configure a fallback in your config:\n\n\
@@ -1950,6 +2003,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 !no_auto_approve,
                 title.as_deref(),
                 &source_dirs,
+                &ports,
             )
             .await?;
 
@@ -2084,6 +2138,7 @@ async fn cmd_devcontainer(config: &config::Config, action: DevcontainerAction) -
             name,
             devcontainer_json,
             use_default_devcontainer,
+            ports,
         } => {
             let source = resolve_source(source.as_deref(), config);
             match source {
@@ -2095,6 +2150,7 @@ async fn cmd_devcontainer(config: &config::Config, action: DevcontainerAction) -
                         name.as_deref(),
                         devcontainer_json.as_deref(),
                         use_default_devcontainer,
+                        &ports,
                     )
                     .await
                 }
@@ -2119,6 +2175,7 @@ async fn cmd_devcontainer_run(
     explicit_name: Option<&str>,
     devcontainer_json: Option<&str>,
     use_default_devcontainer: bool,
+    ports: &[String],
 ) -> Result<()> {
     let source = normalize_source(source, &config.git.extra_hosts);
     let source = source.as_ref();
@@ -2138,6 +2195,7 @@ async fn cmd_devcontainer_run(
         use_default_devcontainer,
         auto_approve: false,
         source_dirs: vec![],
+        ports: ports.to_vec(),
     };
 
     // Resolve the source (local vs remote)
@@ -2194,13 +2252,16 @@ async fn cmd_devcontainer_run_local(
         );
     }
 
-    let (devcontainer_config, effective_image) = resolve_devcontainer_config(
+    let (mut devcontainer_config, effective_image) = resolve_devcontainer_config(
         config,
         project_path,
         opts,
         &project_path.display().to_string(),
     )
     .await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     let project_name = project_path
         .file_name()
@@ -2290,8 +2351,11 @@ async fn cmd_devcontainer_run_remote(
         "main".to_string()
     };
 
-    let (devcontainer_config, effective_image) =
+    let (mut devcontainer_config, effective_image) =
         resolve_devcontainer_config(config, temp_path, opts, remote_url).await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     let pod_name = if let Some(ref name) = opts.name {
         normalize_pod_name(name)
@@ -3136,6 +3200,29 @@ async fn clone_dotfiles_for_devcontainer(
     }
 }
 
+/// Merge CLI `--port` flags into a devcontainer config's `forward_ports`.
+///
+/// Each port spec is either a plain port number (e.g. "3000") or a
+/// "hostPort:containerPort" mapping (e.g. "8080:3000"), matching the
+/// devcontainer.json `forwardPorts` syntax.
+fn merge_cli_ports_into_config(
+    devcontainer_config: &mut devcontainer::DevcontainerConfig,
+    ports: &[String],
+) {
+    for port_spec in ports {
+        if let Ok(port_num) = port_spec.parse::<u16>() {
+            devcontainer_config
+                .forward_ports
+                .push(serde_json::json!(port_num));
+        } else {
+            // "host:container" string format
+            devcontainer_config
+                .forward_ports
+                .push(serde_json::json!(port_spec));
+        }
+    }
+}
+
 /// Create a workspace from a local git repository
 async fn create_workspace_from_local(
     config: &config::Config,
@@ -3205,13 +3292,16 @@ async fn create_workspace_from_local(
         git_info.fork_url = Some(fork_info.clone_url);
     }
 
-    let (devcontainer_config, effective_image) = resolve_devcontainer_config(
+    let (mut devcontainer_config, effective_image) = resolve_devcontainer_config(
         config,
         project_path,
         opts,
         &project_path.display().to_string(),
     )
     .await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     // Derive project/pod name from path
     let project_name = project_path
@@ -3371,8 +3461,11 @@ async fn create_workspace_without_source(
     // Resolve devcontainer config without a project path — this will use
     // fallback sources (dotfiles repo, --image, or default-image config)
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    let (devcontainer_config, effective_image) =
+    let (mut devcontainer_config, effective_image) =
         resolve_devcontainer_config(config, temp_dir.path(), opts, "scratch workspace").await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     let pod_name = if let Some(ref name) = opts.name {
         normalize_pod_name(name)
@@ -3507,8 +3600,11 @@ async fn create_workspace_from_remote(
         "main".to_string() // Fallback
     };
 
-    let (devcontainer_config, effective_image) =
+    let (mut devcontainer_config, effective_image) =
         resolve_devcontainer_config(config, temp_path, opts, remote_url).await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     // Use explicit name if provided, otherwise generate a unique name
     let pod_name = if let Some(ref name) = opts.name {
@@ -3709,8 +3805,11 @@ async fn create_workspace_from_pr(
     }
 
     let pr_description = format!("{}#{}", pr_ref.repo, pr_ref.number);
-    let (devcontainer_config, effective_image) =
+    let (mut devcontainer_config, effective_image) =
         resolve_devcontainer_config(config, temp_path, opts, &pr_description).await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     // Use explicit name if provided, otherwise generate a unique name
     let pod_name = if let Some(ref name) = opts.name {
@@ -3900,6 +3999,7 @@ async fn cmd_run(
     auto_approve: bool,
     title: Option<&str>,
     source_dirs: &[PathBuf],
+    ports: &[String],
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
@@ -3916,6 +4016,7 @@ async fn cmd_run(
         use_default_devcontainer,
         auto_approve,
         source_dirs: source_dirs.to_vec(),
+        ports: ports.to_vec(),
     };
 
     // Create the workspace - no SSH by default (async execution)
@@ -6216,6 +6317,39 @@ pub(crate) fn advisor_pod_name() -> String {
     "devaipod-advisor".to_string()
 }
 
+/// Apply advisor-specific config mutations: insert the devaipod MCP server
+/// entry (with authentication) and force-enable service-gator for GitHub access.
+///
+/// Returns a fresh config loaded from disk with the mutations applied.
+/// We reload rather than cloning because `Config` doesn't derive `Clone`.
+fn apply_advisor_config() -> Result<config::Config> {
+    let host_port = detect_own_host_port();
+    let mcp_url = format!(
+        "http://{}:{}/api/devaipod/mcp",
+        crate::podman::host_for_pod_services(),
+        host_port
+    );
+    let mcp_token = crate::web::load_or_generate_mcp_token();
+
+    let mut advisor_config = config::load_config(None)?;
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", mcp_token));
+    advisor_config.mcp.servers.insert(
+        "devaipod".to_string(),
+        config::McpServerEntry {
+            url: mcp_url,
+            enabled: true,
+            headers,
+        },
+    );
+
+    if !advisor_config.service_gator.is_enabled() {
+        advisor_config.service_gator.gh.read = true;
+    }
+
+    Ok(advisor_config)
+}
+
 /// Create the advisor pod using cmd_run with advisor-specific settings.
 ///
 /// The advisor doesn't work on a specific repo — it's a meta-agent that
@@ -6230,47 +6364,13 @@ async fn create_advisor_pod(
 ) -> Result<()> {
     let default_task = task.unwrap_or(ADVISOR_SYSTEM_PROMPT);
 
-    // The MCP server runs as a route on the devaipod web server.
-    // The advisor agent reaches it via host.containers.internal:<host_port>.
-    // The host port may differ from the internal 8080 in multi-instance
-    // setups (e.g. test-devaipod maps 8081:8080).
-    let host_port = detect_own_host_port();
-    let mcp_url = format!(
-        "http://{}:{}/api/devaipod/mcp",
-        crate::podman::host_for_pod_services(),
-        host_port
-    );
-
-    // Load the MCP token so the advisor can authenticate to the MCP endpoint.
-    // This is a separate shared secret scoped to MCP, not the web API token.
-    let mcp_token = crate::web::load_or_generate_mcp_token();
-
     // The advisor is a scratch-like workspace — it doesn't need a specific
     // git repo. Use the dotfiles repo if configured, otherwise None (scratch).
     let source = resolve_source(None, config);
 
-    // Build a modified config that includes the MCP server entry with the
-    // Authorization header. We reload the config and insert the entry
-    // directly so it flows through the normal config -> pod.rs pipeline
-    // (which now supports headers on McpServerEntry).
-    let mut advisor_config = config::load_config(None)?;
-    let mut headers = std::collections::HashMap::new();
-    headers.insert("Authorization".to_string(), format!("Bearer {}", mcp_token));
-    advisor_config.mcp.servers.insert(
-        "devaipod".to_string(),
-        config::McpServerEntry {
-            url: mcp_url,
-            enabled: true,
-            headers,
-        },
-    );
-
-    // The advisor needs service-gator for GitHub access (checking PRs,
-    // notifications, issues, etc.). Ensure at least global read access
-    // is enabled so the gator sidecar is always created.
-    if !advisor_config.service_gator.is_enabled() {
-        advisor_config.service_gator.gh.read = true;
-    }
+    // Build a modified config that includes the MCP server entry and
+    // service-gator access for the advisor.
+    let advisor_config = apply_advisor_config()?;
 
     let pod_name = cmd_run(
         &advisor_config,
@@ -6287,6 +6387,7 @@ async fn create_advisor_pod(
         true,  // auto_approve
         None,  // no title for advisor
         &canonicalize_source_dirs(source_dirs), // read-only source dirs
+        &[],   // no port forwarding for advisor
     )
     .await?;
 
@@ -8013,6 +8114,19 @@ async fn cmd_rebuild(
         bail!("Failed to remove pod: {}", stderr.trim());
     }
 
+    // If rebuilding the advisor pod, re-apply the MCP server entry and
+    // service-gator mutations that create_advisor_pod applies at creation
+    // time. These are ephemeral (in-memory only) and lost on rebuild.
+    let is_advisor = pod_name == advisor_pod_name();
+    let effective_config;
+    let config = if is_advisor {
+        tracing::info!("Rebuilding advisor pod — re-applying MCP server configuration");
+        effective_config = apply_advisor_config()?;
+        &effective_config
+    } else {
+        config
+    };
+
     let enable_gator = config.service_gator.is_enabled();
 
     // Build extra labels (including instance tag if set)
@@ -9707,5 +9821,51 @@ mod tests {
         // When neither side has a forge host, only direct match works
         let repo = Path::new("/tmp/myproject");
         assert!(!source_matches_repo("/other/myproject", &[], repo));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_plain_number() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(&mut config, &["3000".to_string()]);
+        assert_eq!(config.forward_ports.len(), 1);
+        assert_eq!(config.forward_ports[0], serde_json::json!(3000u16));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_host_container() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(&mut config, &["8080:3000".to_string()]);
+        assert_eq!(config.forward_ports.len(), 1);
+        assert_eq!(config.forward_ports[0], serde_json::json!("8080:3000"));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_mixed() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(
+            &mut config,
+            &["3000".to_string(), "8080:9090".to_string(), "443".to_string()],
+        );
+        assert_eq!(config.forward_ports.len(), 3);
+        assert_eq!(config.forward_ports[0], serde_json::json!(3000u16));
+        assert_eq!(config.forward_ports[1], serde_json::json!("8080:9090"));
+        assert_eq!(config.forward_ports[2], serde_json::json!(443u16));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_appends_to_existing() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        config.forward_ports.push(serde_json::json!(5000));
+        merge_cli_ports_into_config(&mut config, &["3000".to_string()]);
+        assert_eq!(config.forward_ports.len(), 2);
+        assert_eq!(config.forward_ports[0], serde_json::json!(5000));
+        assert_eq!(config.forward_ports[1], serde_json::json!(3000u16));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_empty() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(&mut config, &[]);
+        assert!(config.forward_ports.is_empty());
     }
 }
