@@ -1,0 +1,29 @@
+# Devcontainer image with multiple ACP-compatible AI agents.
+#
+# Includes OpenCode (already in base), Goose, and Claude Code.
+# The agent auto-detection in devaipod will select the first
+# available agent from the configured priority list.
+#
+# Build:
+#   podman build -t localhost/devenv-multi-agent:latest \
+#       -f contrib/Containerfile.devenv-multi-agent .
+#
+# Use as image override:
+#   devaipod up . --image localhost/devenv-multi-agent:latest
+#
+FROM ghcr.io/bootc-dev/devenv-debian:latest
+
+# Goose: copy binary from official image
+COPY --from=ghcr.io/block/goose:latest /usr/local/bin/goose /usr/local/bin/goose
+
+# Claude Code ACP adapter: wraps Claude Agent SDK with ACP stdio transport
+# https://github.com/agentclientprotocol/claude-agent-acp
+USER root
+RUN npm install -g @agentclientprotocol/claude-agent-acp
+USER devenv
+
+# Configure Claude Code for autonomous/headless operation.
+# This only affects agent containers using this image — not the user's host.
+RUN mkdir -p /home/devenv/.claude && \
+    echo '{"permissions":{"defaultMode":"bypassPermissions"}}' \
+    > /home/devenv/.claude/settings.json

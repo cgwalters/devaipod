@@ -18,7 +18,8 @@
 
 # Agents
 
-- [OpenCode](opencode.md)
+- [Agent Client Protocol (ACP)](acp.md)
+- [Supported Agents](agents.md)
 
 # Development
 

@@ -131,6 +131,7 @@ fn validate_source_name(name: &str) -> bool {
 /// section, it treats it as `sources.bind` rather than the top-level `bind`
 /// array — a silent misparse that produces confusing errors downstream.
 const RESERVED_SOURCE_NAMES: &[&str] = &[
+    "agent",
     "bind",
     "env",
     "trusted",
@@ -159,6 +160,207 @@ pub enum ContainerTarget {
     /// Named container
     #[serde(untagged)]
     Named(String),
+}
+
+/// Agent configuration section
+///
+/// Controls which AI agent backend is used and how it's started.
+/// Profiles define named agent configurations with specific commands
+/// and environment variables.
+///
+/// The `default` field accepts either a single profile name or an ordered
+/// list of profile names for auto-detection:
+///
+/// Example configuration:
+/// ```toml
+/// [agent]
+/// # Single default (backwards compatible)
+/// default = "opencode"
+///
+/// # Or: ordered list for auto-detection (tries goose, falls back to opencode)
+/// default = ["goose", "opencode"]
+///
+/// [agent.profiles.opencode]
+/// command = ["opencode", "acp"]
+/// env = { OPENCODE_CONFIG = "~/.config/devaipod/agents/opencode/config.json" }
+///
+/// [agent.profiles.goose]
+/// command = ["goose", "acp"]
+/// env = { GOOSE_MODE = "auto", GOOSE_CONFIG_DIR = "~/.config/devaipod/agents/goose" }
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct AgentConfig {
+    /// Default agent profile name(s). Accepts a single string or an array.
+    /// When multiple profiles are specified, they're tried in order during
+    /// auto-detection. Falls back to "opencode" if empty or not set.
+    pub default: Vec<String>,
+    /// Named agent profiles
+    pub profiles: HashMap<String, AgentProfile>,
+}
+
+/// Helper for deserializing `default` field: accepts string or array of strings.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DefaultField {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for AgentConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AgentConfigRaw {
+            #[serde(default)]
+            default: Option<DefaultField>,
+            #[serde(default)]
+            profiles: HashMap<String, AgentProfile>,
+        }
+
+        let raw = AgentConfigRaw::deserialize(deserializer)?;
+        let default = match raw.default {
+            None => vec![],
+            Some(DefaultField::Single(s)) => vec![s],
+            Some(DefaultField::Multiple(v)) => v,
+        };
+
+        Ok(AgentConfig {
+            default,
+            profiles: raw.profiles,
+        })
+    }
+}
+
+impl AgentConfig {
+    /// Resolve which agent profile to use.
+    ///
+    /// Priority: CLI flag → config default → hardcoded "opencode" fallback.
+    /// If the resolved name matches a profile, returns (name, Some(profile)).
+    /// If no profile exists, returns (name, None) — the caller uses the
+    /// hardcoded default command.
+    ///
+    /// This returns the first candidate from the priority list for backwards
+    /// compatibility with callers that expect a single profile.
+    pub fn resolve_profile<'a>(
+        &'a self,
+        cli_agent: Option<&'a str>,
+    ) -> (String, Option<&'a AgentProfile>) {
+        // If CLI override is provided, use it directly (even if profile doesn't exist)
+        if let Some(name) = cli_agent.filter(|s| !s.is_empty()) {
+            let profile = self.profiles.get(name);
+            return (name.to_string(), profile);
+        }
+
+        // Otherwise use the first candidate from the priority list
+        let candidates = self.candidates_internal(None);
+        if let Some((name, profile)) = candidates.first() {
+            (name.to_string(), Some(profile))
+        } else {
+            // Empty list — use hardcoded opencode fallback
+            ("opencode".to_string(), None)
+        }
+    }
+
+    /// Get candidate agent profiles in priority order.
+    ///
+    /// Returns a list of (name, profile) pairs to try in order. If a CLI
+    /// override is provided, returns only that profile. Otherwise, returns
+    /// profiles from the `default` list (filtered to only those that exist
+    /// in `profiles`), followed by the hardcoded "opencode" fallback if it's
+    /// not already in the list.
+    ///
+    /// This is used for auto-detection: the container startup will probe for
+    /// each binary in order and use the first one available.
+    pub fn candidates(&self) -> Vec<(&str, &AgentProfile)> {
+        self.candidates_internal(None)
+    }
+
+    fn candidates_internal<'a>(
+        &'a self,
+        cli_agent: Option<&'a str>,
+    ) -> Vec<(&'a str, &'a AgentProfile)> {
+        let mut result = Vec::new();
+
+        // If CLI override is provided, only return that profile
+        if let Some(name) = cli_agent.filter(|s| !s.is_empty()) {
+            if let Some(profile) = self.profiles.get(name) {
+                result.push((name, profile));
+            }
+            return result;
+        }
+
+        // Collect profiles from the default list
+        let mut seen = std::collections::HashSet::new();
+        for name in &self.default {
+            if let Some(profile) = self.profiles.get(name) {
+                result.push((name.as_str(), profile));
+                seen.insert(name.as_str());
+            }
+        }
+
+        // Add hardcoded opencode fallback if not already present
+        if !seen.contains("opencode") {
+            if let Some(profile) = self.profiles.get("opencode") {
+                result.push(("opencode", profile));
+            } else {
+                // No opencode profile defined — caller will use hardcoded default
+                // This is represented by returning the name with a default profile
+                // But we can't construct a profile here without adding a field.
+                // Instead, return empty list to signal fallback needed.
+                if result.is_empty() {
+                    // No profiles found at all — return empty to trigger fallback
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Get the list of candidate binary names to check for availability.
+    ///
+    /// Extracts the first element of each candidate profile's command
+    /// (the binary name), in priority order. Used by the startup script
+    /// to verify at least one agent binary is available in the container.
+    pub fn candidate_binaries(&self) -> Vec<&str> {
+        self.candidates()
+            .iter()
+            .filter_map(|(_, profile)| profile.command.first().map(|s| s.as_str()))
+            .collect()
+    }
+}
+
+/// A named agent profile defining how to start a specific agent.
+///
+/// The command is what pod-api spawns as a child process. The env vars
+/// are set on the child process. Agent config files live in the user's
+/// dotfiles repo, pointed to by env vars.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfile {
+    /// Command to start the agent (e.g., ["opencode", "acp"])
+    pub command: Vec<String>,
+    /// Environment variables to set when starting the agent.
+    /// Values support ~ expansion to the container home path.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// Expand `~` prefix in a string value to the given home directory.
+///
+/// Used for agent profile env values where `~` should resolve to
+/// the container's home directory, not the host's.
+#[allow(dead_code)] // Used by pod.rs when wiring agent profiles in Phase 3
+pub fn expand_tilde(value: &str, home: &str) -> String {
+    if let Some(suffix) = value.strip_prefix("~/") {
+        format!("{}/{}", home, suffix)
+    } else if value == "~" {
+        home.to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 /// Top-level configuration
@@ -235,6 +437,10 @@ pub struct Config {
     /// Journal repository configuration (fallback source for agents without a specific repo)
     #[serde(default)]
     pub journal: JournalConfig,
+
+    /// Agent configuration (profiles, default agent selection)
+    #[serde(default)]
+    pub agent: AgentConfig,
 
     /// Named source directories to bind-mount into containers.
     /// Keys are names (used as mount point: /mnt/<name>), values are paths.
@@ -1127,7 +1333,7 @@ impl Default for SshConfig {
 /// Configuration for additional MCP servers attached to agent pods
 ///
 /// These are HTTP-based MCP servers that run as sidecar containers or
-/// external services, connected to the agent via the opencode MCP config.
+/// external services, connected to the agent via MCP config.
 ///
 /// Example configuration:
 /// ```toml
@@ -1142,7 +1348,7 @@ impl Default for SshConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct McpServersConfig {
     /// Named MCP server configurations.
-    /// The key is the server name used in the opencode config.
+    /// The key is the server name used in the agent config.
     #[serde(flatten)]
     pub servers: HashMap<String, McpServerEntry>,
 }
@@ -3147,5 +3353,298 @@ bind = ["/tmp/data:/data:ro"]
         let resolved = config.resolve_sources();
         assert_eq!(resolved.len(), 1, "only 'src' should resolve");
         assert_eq!(resolved[0].name, "src");
+    }
+
+    // =========================================================================
+    // Agent configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_agent_config() {
+        let toml = r#"
+[agent]
+default = "opencode"
+
+[agent.profiles.opencode]
+command = ["opencode", "acp"]
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+env = { GOOSE_MODE = "auto" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default, vec!["opencode"]);
+        assert_eq!(config.agent.profiles.len(), 2);
+
+        let oc = &config.agent.profiles["opencode"];
+        assert_eq!(oc.command, vec!["opencode", "acp"]);
+        assert!(oc.env.is_empty());
+
+        let goose = &config.agent.profiles["goose"];
+        assert_eq!(goose.command, vec!["goose", "acp"]);
+        assert_eq!(goose.env["GOOSE_MODE"], "auto");
+    }
+
+    #[test]
+    fn test_parse_agent_config_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.agent.default.is_empty());
+        assert!(config.agent.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_agent_resolve_profile_cli_override() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string()];
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        let (name, profile) = config.resolve_profile(Some("opencode"));
+        assert_eq!(name, "opencode");
+        assert!(profile.is_some());
+    }
+
+    #[test]
+    fn test_agent_resolve_profile_config_default() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string()];
+        config.profiles.insert(
+            "goose".to_string(),
+            AgentProfile {
+                command: vec!["goose".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        let (name, profile) = config.resolve_profile(None);
+        assert_eq!(name, "goose");
+        assert!(profile.is_some());
+    }
+
+    #[test]
+    fn test_agent_resolve_profile_hardcoded_fallback() {
+        let config = AgentConfig::default();
+        let (name, profile) = config.resolve_profile(None);
+        assert_eq!(name, "opencode");
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn test_expand_tilde_in_env() {
+        assert_eq!(
+            expand_tilde("~/config/file.json", "/home/dev"),
+            "/home/dev/config/file.json"
+        );
+        assert_eq!(expand_tilde("~", "/home/dev"), "/home/dev");
+        assert_eq!(
+            expand_tilde("/absolute/path", "/home/dev"),
+            "/absolute/path"
+        );
+        assert_eq!(expand_tilde("relative/path", "/home/dev"), "relative/path");
+        assert_eq!(expand_tilde("~user/path", "/home/dev"), "~user/path");
+    }
+
+    #[test]
+    fn test_parse_agent_config_with_env() {
+        let toml = r#"
+[agent.profiles.claude]
+command = ["claude", "--dangerously-skip-permissions"]
+env = { CLAUDE_CONFIG_DIR = "~/.config/devaipod/agents/claude" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let claude = &config.agent.profiles["claude"];
+        assert_eq!(
+            claude.command,
+            vec!["claude", "--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            claude.env["CLAUDE_CONFIG_DIR"],
+            "~/.config/devaipod/agents/claude"
+        );
+    }
+
+    #[test]
+    fn test_multiple_agent_profiles_generic_framework() {
+        // Prove that the config system is fully generic: multiple agent
+        // profiles with different commands and env vars coexist, and
+        // resolution works for any of them without agent-specific code.
+        let toml = r#"
+[agent]
+default = "goose"
+
+[agent.profiles.opencode]
+command = ["opencode", "acp"]
+env = { OPENCODE_CONFIG = "~/.config/opencode/config.json" }
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+env = { GOOSE_MODE = "auto", GOOSE_CONFIG_DIR = "~/.config/goose" }
+
+[agent.profiles.claude-code]
+command = ["claude", "--dangerously-skip-permissions"]
+env = { CLAUDE_CONFIG_DIR = "~/.config/claude" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.profiles.len(), 3);
+
+        // Default resolves to goose (from config).
+        let (name, profile) = config.agent.resolve_profile(None);
+        assert_eq!(name, "goose");
+        let p = profile.expect("goose profile should exist");
+        assert_eq!(p.command, vec!["goose", "acp"]);
+
+        // CLI override to claude-code.
+        let (name, profile) = config.agent.resolve_profile(Some("claude-code"));
+        assert_eq!(name, "claude-code");
+        let p = profile.expect("claude-code profile should exist");
+        assert_eq!(p.command, vec!["claude", "--dangerously-skip-permissions"]);
+
+        // CLI override to opencode.
+        let (name, profile) = config.agent.resolve_profile(Some("opencode"));
+        assert_eq!(name, "opencode");
+        let p = profile.expect("opencode profile should exist");
+        assert_eq!(p.command, vec!["opencode", "acp"]);
+
+        // All profiles have distinct env vars — no agent-specific parsing.
+        assert!(
+            config.agent.profiles["goose"]
+                .env
+                .contains_key("GOOSE_MODE")
+        );
+        assert_eq!(config.agent.profiles["goose"].env["GOOSE_MODE"], "auto");
+        assert!(
+            config.agent.profiles["goose"]
+                .env
+                .contains_key("GOOSE_CONFIG_DIR")
+        );
+        assert!(
+            config.agent.profiles["claude-code"]
+                .env
+                .contains_key("CLAUDE_CONFIG_DIR")
+        );
+        assert!(
+            config.agent.profiles["opencode"]
+                .env
+                .contains_key("OPENCODE_CONFIG")
+        );
+
+        // Unknown agent name returns (name, None) — caller uses hardcoded
+        // fallback, no panic or special handling needed.
+        let (name, profile) = config.agent.resolve_profile(Some("nonexistent"));
+        assert_eq!(name, "nonexistent");
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn test_parse_agent_config_array_default() {
+        // Test that default accepts an array of profile names
+        let toml = r#"
+[agent]
+default = ["goose", "opencode"]
+
+[agent.profiles.opencode]
+command = ["opencode", "acp"]
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default, vec!["goose", "opencode"]);
+
+        // First candidate should be goose
+        let (name, profile) = config.agent.resolve_profile(None);
+        assert_eq!(name, "goose");
+        assert!(profile.is_some());
+    }
+
+    #[test]
+    fn test_agent_candidates_priority_order() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string(), "opencode".to_string()];
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        config.profiles.insert(
+            "goose".to_string(),
+            AgentProfile {
+                command: vec!["goose".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+
+        let candidates = config.candidates();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0, "goose");
+        assert_eq!(candidates[1].0, "opencode");
+    }
+
+    #[test]
+    fn test_agent_candidate_binaries() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string(), "opencode".to_string()];
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        config.profiles.insert(
+            "goose".to_string(),
+            AgentProfile {
+                command: vec!["goose".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+
+        let binaries = config.candidate_binaries();
+        assert_eq!(binaries, vec!["goose", "opencode"]);
+    }
+
+    #[test]
+    fn test_agent_candidates_with_hardcoded_fallback() {
+        // When no default is set and no opencode profile exists,
+        // candidates should be empty (signaling hardcoded fallback needed)
+        let config = AgentConfig::default();
+        let candidates = config.candidates();
+        assert_eq!(candidates.len(), 0);
+
+        // When opencode profile exists, it should be included even if not in default
+        let mut config = AgentConfig::default();
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        let candidates = config.candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "opencode");
+    }
+
+    #[test]
+    fn test_parse_agent_config_string_backwards_compat() {
+        // Ensure single string still works (backwards compatibility)
+        let toml = r#"
+[agent]
+default = "goose"
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default, vec!["goose"]);
+
+        let (name, profile) = config.agent.resolve_profile(None);
+        assert_eq!(name, "goose");
+        assert!(profile.is_some());
     }
 }

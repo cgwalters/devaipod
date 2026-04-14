@@ -59,6 +59,10 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "cors", "compression-full"] }
 
+# Agent Client Protocol (ACP) for agent-agnostic communication
+agent-client-protocol = "0.10"
+agent-client-protocol-schema = "0.11"
+
 # SSH server for remote development (VSCode/Zed integration)
 russh = { version = "0.59", features = ["aws-lc-rs"] }
 russh-sftp = "2.1"

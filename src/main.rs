@@ -11,7 +11,10 @@ use std::process::Command as ProcessCommand;
 use clap::{Args, CommandFactory, Parser};
 use color_eyre::eyre::{Context, Result, bail};
 
+mod acp_client;
 mod advisor;
+mod agent;
+mod agent_acp;
 mod agent_dir;
 mod config;
 mod devcontainer;
@@ -619,6 +622,42 @@ impl CreateOptions {
     }
 }
 
+/// Create an [`AgentBackend`] from the resolved agent name and optional profile.
+///
+/// If a profile is provided, uses AcpBackend with the profile's command.
+/// Otherwise, uses ACP backend with default command `["opencode", "acp"]`.
+///
+/// The `agent_config` parameter is used to extract candidate binaries for
+/// auto-detection in the startup script.
+fn create_agent_backend(
+    _name: &str,
+    profile: Option<&crate::config::AgentProfile>,
+    agent_config: &crate::config::AgentConfig,
+) -> color_eyre::Result<Box<dyn crate::agent::AgentBackend>> {
+    let candidate_binaries: Vec<String> = agent_config
+        .candidate_binaries()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    if let Some(profile) = profile {
+        return Ok(Box::new(crate::agent_acp::AcpBackend::new_with_candidates(
+            profile.command.clone(),
+            candidate_binaries,
+        )));
+    }
+
+    // No profile — use ACP backend with default opencode command
+    Ok(Box::new(crate::agent_acp::AcpBackend::new_with_candidates(
+        vec!["opencode".to_string(), "acp".to_string()],
+        if candidate_binaries.is_empty() {
+            vec!["opencode".to_string()]
+        } else {
+            candidate_binaries
+        },
+    )))
+}
+
 #[derive(Debug, Parser)]
 enum HostCommand {
     /// Create/start a workspace with AI agent
@@ -1129,18 +1168,6 @@ enum HostCommand {
     #[command(hide = true)]
     PodApi(pod_api::PodApiArgs),
 
-    /// Mock opencode server for integration testing.
-    ///
-    /// Serves a minimal HTTP API on the specified port that mimics the opencode
-    /// session/message endpoints. Used by integration tests so the pod-api
-    /// sidecar has a functioning "opencode" to talk to without needing a real
-    /// AI provider.
-    #[command(hide = true)]
-    MockOpencode {
-        /// Port to listen on
-        #[arg(long, default_value = "4096")]
-        port: u16,
-    },
     /// Manage service-gator scopes for a workspace
     ///
     /// Service-gator provides scope-restricted access to external services
@@ -1652,7 +1679,6 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
         HostCommand::Init { .. }
             | HostCommand::Completions { .. }
             | HostCommand::PodApi(_)
-            | HostCommand::MockOpencode { .. }
             | HostCommand::Internals { .. }
             | HostCommand::Fetch { .. }
             | HostCommand::Diff { .. }
@@ -1674,7 +1700,6 @@ fn command_allowed_on_host(cmd: &HostCommand) -> bool {
         HostCommand::Init { .. }
             | HostCommand::Completions { .. }
             | HostCommand::PodApi(_)
-            | HostCommand::MockOpencode { .. }
             | HostCommand::Internals { .. }
             | HostCommand::Fetch { .. }
             | HostCommand::Diff { .. }
@@ -2105,7 +2130,6 @@ async fn run_host(cli: HostCli) -> Result<()> {
             cmd_title(&normalize_pod_name(&name), title.as_deref()).await
         }
         HostCommand::PodApi(args) => crate::pod_api::run(args).await,
-        HostCommand::MockOpencode { port } => crate::pod_api::run_mock_opencode(port).await,
         HostCommand::Advisor {
             task,
             status,
@@ -3410,6 +3434,10 @@ async fn create_workspace_from_local(
 
     let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
 
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         project_path,
@@ -3427,6 +3455,7 @@ async fn create_workspace_from_local(
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
         &source_dirs,
+        backend.as_ref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -3509,6 +3538,10 @@ async fn create_workspace_without_source(
 
     let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
 
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         temp_dir.path(),
@@ -3526,6 +3559,7 @@ async fn create_workspace_without_source(
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
         &source_dirs,
+        backend.as_ref(),
     )
     .await
     .context("Failed to create scratch workspace pod")?;
@@ -3712,6 +3746,10 @@ async fn create_workspace_from_remote(
 
     let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
 
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -3731,6 +3769,7 @@ async fn create_workspace_from_remote(
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
         &source_dirs,
+        backend.as_ref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -3896,6 +3935,10 @@ async fn create_workspace_from_pr(
 
     let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
 
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -3915,6 +3958,7 @@ async fn create_workspace_from_pr(
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
         &source_dirs,
+        backend.as_ref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
@@ -5250,11 +5294,19 @@ fn resolve_url_to_local_source(url: &str, config: &config::Config) -> Option<Pat
     }
 
     for resolved in config.resolve_sources() {
-        let source_path = &resolved.path;
-        for s in &suffixes {
-            let candidate = source_path.join(s);
-            if candidate.join(".git").exists() || candidate.join(".git").is_file() {
-                return Some(candidate);
+        // Check both the host-expanded path and the container mount point
+        // (/mnt/<name>). When running inside the container, the host path
+        // won't exist on disk but the mount point will.
+        let candidates_bases = [
+            resolved.path.clone(),
+            PathBuf::from(format!("/mnt/{}", resolved.name)),
+        ];
+        for base in &candidates_bases {
+            for s in &suffixes {
+                let candidate = base.join(s);
+                if candidate.join(".git").exists() || candidate.join(".git").is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
@@ -8149,6 +8201,10 @@ async fn cmd_rebuild(
         .or(dotfiles_image)
         .or_else(|| config.default_image.clone());
 
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         temp_path,
@@ -8166,6 +8222,7 @@ async fn cmd_rebuild(
         config.orchestration.worker.gator.clone(),
         true, // auto_approve: rebuilds keep default behavior
         &[],  // source_dirs: not supported for rebuild yet
+        backend.as_ref(),
     )
     .await
     .context("Failed to recreate pod")?;
@@ -9867,5 +9924,26 @@ mod tests {
         let mut config = devcontainer::DevcontainerConfig::default();
         merge_cli_ports_into_config(&mut config, &[]);
         assert!(config.forward_ports.is_empty());
+    }
+
+    #[test]
+    fn test_create_agent_backend_any_name_returns_acp() {
+        // All agents use ACP now — name is informational
+        let agent_config = crate::config::AgentConfig::default();
+        let backend = create_agent_backend("anything", None, &agent_config).unwrap();
+        assert_eq!(backend.name(), "acp");
+    }
+
+    #[test]
+    fn test_create_agent_backend_with_profile() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let profile = crate::config::AgentProfile {
+            command: vec!["goose".to_string(), "acp".to_string()],
+            env,
+        };
+        let agent_config = crate::config::AgentConfig::default();
+        let backend = create_agent_backend("goose", Some(&profile), &agent_config).unwrap();
+        assert_eq!(backend.name(), "acp");
     }
 }

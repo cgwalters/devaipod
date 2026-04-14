@@ -4,7 +4,7 @@
 //! and instructions for AI agents, including orchestration-specific instructions
 //! for the task owner agent in multi-agent mode.
 
-use crate::pod::{AGENT_HOME_PATH, WORKER_OPENCODE_PORT};
+use crate::pod::AGENT_HOME_PATH;
 
 /// Format git context section for inclusion in prompts.
 ///
@@ -27,9 +27,10 @@ fn format_git_context(repo_url: Option<&str>, branch: Option<&str>) -> String {
 
 /// Generate orchestration-specific instructions for the task owner agent.
 ///
+/// // Legacy: Worker orchestration uses OpenCode HTTP backend
 /// These instructions explain to the task owner:
 /// - That it MUST delegate implementation to the worker agent
-/// - How to communicate with the worker via the OpenCode API
+/// - How to communicate with the worker via the worker API
 /// - How to monitor worker progress with the worker_monitor script
 /// - That it MUST fetch and review worker's commits
 /// - That it should only accept valid incremental progress
@@ -57,6 +58,7 @@ changes yourself. Your job is to:
 ### Worker Connection
 
 The environment variable `OPENCODE_WORKER_URL` is set to `http://localhost:{worker_port}`.
+<!-- Legacy: OpenCode HTTP backend for worker orchestration -->
 There is a worker control tool at `{agent_home}/scripts/devaipod-workerctl`.
 
 ### Step 1: Delegate to Worker and Wait (REQUIRED)
@@ -197,7 +199,7 @@ git merge worker/main --no-edit
 git log --oneline -5  # Show recent commits
 ```
 "#,
-        worker_port = WORKER_OPENCODE_PORT,
+        worker_port = crate::pod::WORKER_PORT,
         agent_home = AGENT_HOME_PATH,
     )
 }
@@ -321,7 +323,7 @@ mod tests {
     fn test_orchestration_instructions_contains_worker_port() {
         let instructions = orchestration_instructions();
         assert!(
-            instructions.contains(&format!("localhost:{}", WORKER_OPENCODE_PORT)),
+            instructions.contains(&format!("localhost:{}", crate::pod::WORKER_PORT)),
             "Should contain worker port"
         );
     }

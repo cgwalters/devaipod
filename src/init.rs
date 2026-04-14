@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use color_eyre::eyre::{Context, Result, bail};
+use color_eyre::eyre::{bail, Context, Result};
 use dialoguer::{Confirm, Input, Password, Select};
 
 use crate::config;
@@ -130,8 +130,8 @@ pub fn cmd_init(config_path: Option<&Path>) -> Result<()> {
     println!("Configuration written to {}", config_path.display());
     println!();
 
-    // Suggest OpenCode configuration
-    suggest_opencode_config(&init_config);
+    // Suggest agent configuration
+    suggest_agent_config(&init_config);
 
     println!("You can now run 'devaipod up <path>' to start a workspace!");
     println!();
@@ -159,7 +159,7 @@ fn configure_dotfiles(config: &mut InitConfig) -> Result<()> {
 
         if !url.is_empty() {
             println!();
-            println!("Tip: Consider storing your devaipod and opencode configuration");
+            println!("Tip: Consider storing your devaipod and agent configuration");
             println!("     in this repository for a consistent experience across machines.");
             println!();
             config.dotfiles_url = Some(url);
@@ -453,11 +453,11 @@ fn write_config(path: &Path, config: &InitConfig) -> Result<()> {
     Ok(())
 }
 
-/// Suggest OpenCode configuration
-fn suggest_opencode_config(config: &InitConfig) {
-    println!("--- OpenCode Configuration ---");
+/// Suggest agent configuration
+fn suggest_agent_config(config: &InitConfig) {
+    println!("--- Agent Configuration ---");
     println!();
-    println!("devaipod uses OpenCode as the AI agent interface.");
+    println!("devaipod supports any ACP-compatible agent (OpenCode, Goose, etc.).");
     println!();
     println!("Recommended next steps:");
     println!();
@@ -470,16 +470,16 @@ fn suggest_opencode_config(config: &InitConfig) {
     println!();
 
     if let Some(ref dotfiles_url) = config.dotfiles_url {
-        println!("  2. Consider adding OpenCode config to your dotfiles:");
-        println!("     ~/.config/opencode/config.toml  - OpenCode settings");
-        println!("     ~/.config/opencode/AGENTS.md    - Custom agent instructions");
+        println!("  2. Consider adding agent config to your dotfiles:");
+        println!("     Agent config files are pointed to via env vars in agent profiles.");
+        println!("     See the [agent.profiles] section in devaipod.toml.");
         println!();
         println!("     Your dotfiles repo: {}", dotfiles_url);
         println!();
     } else {
-        println!("  2. Create OpenCode configuration:");
-        println!("     mkdir -p ~/.config/opencode");
-        println!("     # Add config.toml and AGENTS.md as needed");
+        println!("  2. Configure agent profiles in ~/.config/devaipod.toml:");
+        println!("     [agent.profiles.opencode]");
+        println!("     command = [\"opencode\", \"acp\"]");
         println!();
     }
 

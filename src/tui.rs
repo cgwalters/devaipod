@@ -195,10 +195,10 @@ pub struct InstanceInfo {
     /// Last time agent state was refreshed for this instance
     #[allow(dead_code)]
     pub last_agent_refresh: Option<std::time::Instant>,
-    /// API password for the opencode server (from pod labels)
+    /// API password for the agent backend (from pod labels)
     #[allow(dead_code)]
     pub api_password: Option<String>,
-    /// Published host port for the opencode API
+    /// Published host port for the agent API
     #[allow(dead_code)]
     pub api_port: Option<u16>,
     /// Whether service-gator container is running
@@ -259,8 +259,8 @@ impl ContainerMenuItem {
     /// Get description for menu item
     fn description(&self) -> &'static str {
         match self {
-            ContainerMenuItem::OrchestratorAgent => "opencode attach to task owner",
-            ContainerMenuItem::WorkerAgent => "opencode attach to worker",
+            ContainerMenuItem::OrchestratorAgent => "attach to task owner agent",
+            ContainerMenuItem::WorkerAgent => "attach to worker agent",
             ContainerMenuItem::WorkerShell => "bash shell in worker container",
             ContainerMenuItem::WorkspaceShell => "bash shell in workspace container",
         }

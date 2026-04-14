@@ -936,7 +936,7 @@ function AgentRow(props: { agent: ControlPlaneAgent }) {
   const isDone = () => a().completion_status === "done"
 
   function navigate() {
-    window.location.href = `/_devaipod/agent/${encodeURIComponent(a().name)}`
+    window.location.href = `/agent/${encodeURIComponent(a().name)}/`
   }
 
   return (

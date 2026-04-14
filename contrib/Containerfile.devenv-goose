@@ -1,0 +1,26 @@
+# Devcontainer image with Goose (ACP-compatible AI agent).
+#
+# Based on the same devenv-debian image used for OpenCode workspaces,
+# with the Goose binary added. Use this as the devcontainer image
+# when testing with Goose as the agent:
+#
+#   podman build -t localhost/devenv-goose:latest \
+#       -f contrib/Containerfile.devenv-goose .
+#
+# Then configure devaipod.toml:
+#
+#   [agent.profiles.goose]
+#   command = ["goose", "acp"]
+#   env = { GOOSE_MODE = "auto" }
+#
+# And set the devcontainer image override when creating a workspace,
+# or update devcontainer.json:
+#
+#   { "image": "localhost/devenv-goose:latest" }
+#
+FROM ghcr.io/bootc-dev/devenv-debian:latest AS base
+
+# Install Goose from the official container image.
+# The binary is statically-ish linked; we just need a few runtime libs
+# that devenv-debian already has (libssl, libdbus, etc.).
+COPY --from=ghcr.io/block/goose:latest /usr/local/bin/goose /usr/local/bin/goose

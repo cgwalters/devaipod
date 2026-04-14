@@ -11,37 +11,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
-use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::prelude::*;
 use bollard::Docker;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use color_eyre::eyre::{Context, Result};
 use futures_util::{SinkExt, Stream, StreamExt};
-use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::{RwLock, broadcast};
-use tower::ServiceExt;
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tower_http::compression::CompressionLayer;
-use tower_http::services::{ServeDir, ServeFile};
+
+use crate::acp_client::{AcpClient, AcpEvent};
 
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
-
-/// Path to the vendored opencode UI files.
-const OPENCODE_UI_PATH: &str = "/usr/share/devaipod/opencode";
-
-/// Default port for the opencode server inside the pod.
-const DEFAULT_OPENCODE_PORT: u16 = 4096;
 
 /// Default directory for pod-api state (admin token, completion status, etc.).
 ///
@@ -76,13 +67,16 @@ struct AppState {
     workspace_container: String,
     /// Name of the agent container to exec into for agent PTY sessions.
     agent_container: String,
-    /// Password for authenticating to the opencode server (Basic auth).
-    opencode_password: String,
-    /// Port of the opencode server to connect to (default 4096).
-    opencode_port: u16,
     /// Admin token for authenticating control plane requests (e.g. gator scope updates).
     /// Only the control plane knows this token; the agent does not.
     admin_token: String,
+    /// ACP event broadcast channel for WebSocket clients.
+    acp_event_tx: broadcast::Sender<AcpEvent>,
+    /// ACP client for communicating with the agent (created lazily).
+    acp_client: Arc<Mutex<Option<AcpClient>>>,
+    /// Cached Initialized event so late-connecting WebSocket clients
+    /// receive agent info (name, version, capabilities).
+    initialized_event: Arc<Mutex<Option<AcpEvent>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,7 +1027,7 @@ async fn pty_list(State(state): State<AppState>) -> Json<Vec<PtyInfo>> {
 ///
 /// The `container` field in the request body selects the target: `"workspace"` for
 /// the workspace container, anything else (including absent) defaults to the agent
-/// container. This means the opencode SDK (which cannot add extra fields) naturally
+/// container. This means a minimal SDK (which cannot add extra fields) naturally
 /// targets the agent container, while the workspace terminal frontend explicitly
 /// passes `"workspace"`.
 async fn pty_create(
@@ -1450,7 +1444,7 @@ async fn handle_ws(
 
 /// Response for the `/summary` endpoint.
 ///
-/// The control plane polls this instead of fetching raw opencode sessions
+/// The control plane polls this instead of fetching raw agent sessions
 /// and deriving status itself. This makes pod-api the source of truth for
 /// pod/agent status (see `docs/todo/pod-api-driver.md`, Phase 2).
 #[derive(Debug, Serialize)]
@@ -1465,7 +1459,7 @@ struct PodSummaryResponse {
     recent_output: Vec<String>,
     /// Epoch millis of the most recent message.
     last_message_ts: Option<i64>,
-    /// Total number of opencode sessions in this pod.
+    /// Total number of agent sessions in this pod.
     session_count: usize,
     /// Pod completion status: "active" or "done".
     completion_status: CompletionStatus,
@@ -1473,15 +1467,11 @@ struct PodSummaryResponse {
     title: Option<String>,
 }
 
-/// Maximum number of output lines to return in the summary.
-const SUMMARY_MAX_LINES: usize = 3;
-
 /// `GET /summary` — return pre-computed agent status.
 ///
-/// Queries the opencode server at `127.0.0.1:4096` (same pod network namespace),
-/// finds the root session, fetches recent messages, and derives a structured
-/// status summary. The control plane can proxy this directly instead of
-/// reimplementing the derivation logic.
+/// Queries the ACP client for current session state and derives a structured
+/// status summary. Handles auto-completion detection. The control plane proxies
+/// this directly instead of reimplementing the derivation logic.
 async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> {
     let title = {
         let path = title_path();
@@ -1492,93 +1482,40 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
             .filter(|s| !s.is_empty())
     };
 
-    let unknown = PodSummaryResponse {
-        activity: "Unknown".to_string(),
-        status_line: None,
-        current_tool: None,
-        recent_output: vec![],
-        last_message_ts: None,
-        session_count: 0,
-        completion_status: CompletionStatus::default(),
-        title: title.clone(),
+    // Query ACP client status. If the client is not connected, report idle.
+    let status = {
+        let guard = state.acp_client.lock().await;
+        match guard.as_ref() {
+            Some(client) => {
+                let session_id = client.current_session_id().await;
+                let is_working = client.is_working();
+                crate::agent::AgentStatusSummary {
+                    activity: if session_id.is_none() {
+                        crate::agent::AgentActivity::Unknown
+                    } else if is_working {
+                        crate::agent::AgentActivity::Working
+                    } else {
+                        crate::agent::AgentActivity::Idle
+                    },
+                    status_line: session_id.as_ref().map(|sid| format!("Session: {}", sid)),
+                    current_tool: None,
+                    recent_output: vec![],
+                    last_message_ts: None,
+                    session_count: if session_id.is_some() { 1 } else { 0 },
+                }
+            }
+            None => crate::agent::AgentStatusSummary {
+                activity: crate::agent::AgentActivity::Unknown,
+                status_line: Some("ACP client not connected".to_string()),
+                current_tool: None,
+                recent_output: vec![],
+                last_message_ts: None,
+                session_count: 0,
+            },
+        }
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return Json(unknown),
-    };
-
-    let credentials = BASE64_STANDARD.encode(format!("opencode:{}", state.opencode_password));
-    let auth_value = format!("Basic {}", credentials);
-    let opencode_port = state.opencode_port;
-
-    // Fetch sessions from the local opencode server.
-    let sessions_resp = match client
-        .get(format!("http://127.0.0.1:{}/session", opencode_port))
-        .header(header::AUTHORIZATION, &auth_value)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Json(unknown),
-    };
-
-    let sessions: Vec<serde_json::Value> = match sessions_resp.json().await {
-        Ok(s) => s,
-        Err(_) => return Json(unknown),
-    };
-
-    let session_count = sessions.len();
-
-    if sessions.is_empty() {
-        let (completion_status, _changed_at) = read_completion_status(&state.workspace).await;
-        return Json(PodSummaryResponse {
-            activity: "Idle".to_string(),
-            status_line: Some("Waiting for input...".to_string()),
-            current_tool: None,
-            recent_output: vec![],
-            last_message_ts: None,
-            session_count: 0,
-            completion_status,
-            title: title.clone(),
-        });
-    }
-
-    // Find the root session (no parentID or null parentID).
-    let root_session = sessions.iter().find(|s| crate::session_is_root(s));
-
-    let session_id = match root_session
-        .and_then(|s| s.get("id"))
-        .and_then(|id| id.as_str())
-    {
-        Some(id) => id.to_string(),
-        None => return Json(unknown),
-    };
-
-    // Fetch recent messages for the root session.
-    let messages_resp = match client
-        .get(format!(
-            "http://127.0.0.1:{}/session/{}/message?limit=5",
-            opencode_port, session_id
-        ))
-        .header(header::AUTHORIZATION, &auth_value)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Json(unknown),
-    };
-
-    let messages: Vec<serde_json::Value> = match messages_resp.json().await {
-        Ok(m) => m,
-        Err(_) => return Json(unknown),
-    };
-
-    let (activity, status_line, current_tool, recent_output, last_message_ts) =
-        derive_agent_status_from_messages(&messages);
+    let activity = status.activity.as_str().to_string();
 
     let (mut completion_status, changed_at) = read_completion_status(&state.workspace).await;
 
@@ -1602,7 +1539,7 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
 
     if activity == "Idle"
         && completion_status == CompletionStatus::Active
-        && !messages.is_empty()
+        && status.session_count > 0
         && !in_grace_period
     {
         if let Err(e) = write_completion_status(&state.workspace, CompletionStatus::Done).await {
@@ -1615,514 +1552,342 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
 
     Json(PodSummaryResponse {
         activity,
-        status_line,
-        current_tool,
-        recent_output,
-        last_message_ts,
-        session_count,
+        status_line: status.status_line,
+        current_tool: status.current_tool,
+        recent_output: status.recent_output,
+        last_message_ts: status.last_message_ts,
+        session_count: status.session_count,
         completion_status,
         title,
     })
 }
 
-/// Derive agent status fields from opencode session messages.
+// ---------------------------------------------------------------------------
+// ACP client spawning
+// ---------------------------------------------------------------------------
+
+/// Ensure the ACP client is spawned and initialized. Returns a reference to the client.
 ///
-/// This is the canonical implementation; the control plane proxies to `/summary`
-/// rather than reimplementing this logic. See `docs/todo/pod-api-driver.md`.
-fn derive_agent_status_from_messages(
-    messages: &[serde_json::Value],
-) -> (
-    String,         // activity
-    Option<String>, // status_line
-    Option<String>, // current_tool
-    Vec<String>,    // recent_output
-    Option<i64>,    // last_message_ts
-) {
-    if messages.is_empty() {
-        return ("Unknown".to_string(), None, None, vec![], None);
+/// If the client doesn't exist yet, this function:
+/// 1. Loads the agent profile configuration
+/// 2. Builds a podman exec command to run the agent in the agent container
+/// 3. Spawns the ACP client with the wrapped command
+/// 4. Initializes the ACP connection
+async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
+    // Check if a live client exists (quick lock).
+    // If the agent process has exited, clear the stale client so we
+    // respawn it below.
+    {
+        let mut guard = state.acp_client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            if client.is_alive().await {
+                return Ok(());
+            }
+            tracing::info!("ACP agent process exited, clearing stale client");
+            *guard = None;
+        }
     }
 
-    // Find the last assistant message.
-    let last_assistant = messages.iter().rev().find(|msg| {
-        msg.get("info")
-            .and_then(|i| i.get("role"))
-            .and_then(|r| r.as_str())
-            == Some("assistant")
+    tracing::info!(
+        "Spawning ACP client for agent container: {}",
+        state.agent_container
+    );
+
+    // Load agent profile from config
+    let config = crate::config::load_config(None).unwrap_or_else(|e| {
+        tracing::warn!("Failed to load config, using defaults: {}", e);
+        crate::config::Config::default()
     });
 
-    let Some(last_assistant) = last_assistant else {
-        return ("Unknown".to_string(), None, None, vec![], None);
-    };
+    // Get podman path first (needed for probing)
+    let podman_path = std::env::var("PODMAN_PATH").unwrap_or_else(|_| "podman".to_string());
 
-    let info = match last_assistant.get("info") {
-        Some(i) => i,
-        None => return ("Unknown".to_string(), None, None, vec![], None),
-    };
+    // Try each candidate profile in priority order, probing the container
+    // for the binary. Use the first one that's available.
+    let candidates = config.agent.candidates();
+    let mut selected: Option<(String, crate::config::AgentProfile)> = None;
 
-    let parts = last_assistant
-        .get("parts")
-        .and_then(|p| p.as_array())
-        .map(|arr| arr.as_slice())
-        .unwrap_or(&[]);
-
-    // Extract recent output from parts.
-    let recent_output = {
-        let mut lines = Vec::new();
-        for part in parts {
-            let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match part_type {
-                "text" => {
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        for line in text.lines().rev().take(SUMMARY_MAX_LINES) {
-                            let truncated = if line.chars().count() > 80 {
-                                let s: String = line.chars().take(77).collect();
-                                format!("{s}...")
-                            } else {
-                                line.to_string()
-                            };
-                            if !truncated.trim().is_empty() {
-                                lines.push(truncated);
-                            }
-                            if lines.len() >= SUMMARY_MAX_LINES {
-                                break;
-                            }
-                        }
-                    }
-                }
-                "tool" => {
-                    if let Some(tool_name) = part.get("name").and_then(|n| n.as_str()) {
-                        let status = part
-                            .get("state")
-                            .and_then(|s| s.get("status"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("running");
-                        lines.push(format!("\u{2192} {tool_name}: {status}"));
-                    }
-                }
-                _ => {}
-            }
-            if lines.len() >= SUMMARY_MAX_LINES {
-                break;
-            }
+    for (name, profile) in &candidates {
+        if profile.command.is_empty() {
+            continue;
         }
-        lines.reverse();
-        lines
-    };
-
-    // Extract current tool (first incomplete tool).
-    let current_tool = parts.iter().find_map(|part| {
-        if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
-            let status = part
-                .get("state")
-                .and_then(|s| s.get("status"))
-                .and_then(|s| s.as_str());
-            if status != Some("completed") && status != Some("error") {
-                return part.get("name").and_then(|n| n.as_str()).map(String::from);
-            }
-        }
-        None
-    });
-
-    // Build status line from first text part.
-    let status_line = parts.iter().find_map(|part| {
-        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-            part.get("text").and_then(|t| t.as_str()).map(|text| {
-                let first_line = text.lines().next().unwrap_or("");
-                if first_line.chars().count() > 60 {
-                    let s: String = first_line.chars().take(57).collect();
-                    format!("{s}...")
-                } else {
-                    first_line.to_string()
-                }
-            })
+        let binary = &profile.command[0];
+        // Check if binary exists in the agent container
+        let probe = tokio::process::Command::new(&podman_path)
+            .args([
+                "exec",
+                &state.agent_container,
+                "sh",
+                "-c",
+                &format!("command -v {}", binary),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if probe.map(|s| s.success()).unwrap_or(false) {
+            tracing::info!(
+                "Selected agent profile '{}' (binary '{}' found)",
+                name,
+                binary
+            );
+            selected = Some((name.to_string(), (*profile).clone()));
+            break;
         } else {
-            None
+            tracing::debug!("Agent binary '{}' not found for profile '{}'", binary, name);
         }
-    });
+    }
 
-    // Determine activity.
-    let activity = if info.get("time").and_then(|t| t.get("completed")).is_none() {
-        "Working"
+    let (profile_name, profile) = match selected {
+        Some((name, p)) => (name, p),
+        None => {
+            // No binary found — fall back to hardcoded opencode and let it fail
+            // with a clear error when the exec happens.
+            tracing::warn!("No agent binary found in container, falling back to opencode");
+            (
+                "opencode".to_string(),
+                crate::config::AgentProfile {
+                    command: vec!["opencode".to_string(), "acp".to_string()],
+                    env: HashMap::new(),
+                },
+            )
+        }
+    };
+
+    tracing::info!("Using agent profile: {}", profile_name);
+
+    // Build podman exec command:
+    // podman exec -i <agent_container> <agent_command...>
+    let mut podman_command = vec![podman_path, "exec".to_string(), "-i".to_string()];
+
+    // Add environment variables as -e flags
+    for (key, value) in &profile.env {
+        podman_command.push("-e".to_string());
+        podman_command.push(format!("{}={}", key, value));
+    }
+
+    // Add container name
+    podman_command.push(state.agent_container.clone());
+
+    // Add agent command. In mock mode, use the mock ACP agent script
+    // installed by the agent container startup script.
+    if std::env::var("DEVAIPOD_MOCK_AGENT").is_ok() {
+        podman_command.push("/home/devenv/.local/bin/mock-acp-agent".to_string());
     } else {
-        let has_incomplete_tool = parts.iter().any(|part| {
-            if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
-                let status = part
-                    .get("state")
-                    .and_then(|s| s.get("status"))
-                    .and_then(|s| s.as_str());
-                status != Some("completed") && status != Some("error")
-            } else {
-                false
-            }
-        });
+        podman_command.extend(profile.command.clone());
+    }
 
-        if has_incomplete_tool {
-            "Working"
-        } else {
-            let finish = info.get("finish").and_then(|f| f.as_str()).unwrap_or("");
-            if finish == "tool-calls" {
-                "Working"
-            } else {
-                "Idle"
-            }
+    tracing::debug!("Spawning ACP client with command: {:?}", podman_command);
+
+    // Spawn the ACP client (outside the lock)
+    let cwd = state.workspace.to_string_lossy().to_string();
+    let client = AcpClient::spawn(
+        podman_command,
+        std::collections::HashMap::new(), // env vars are passed via -e flags to podman exec
+        &cwd,
+        state.acp_event_tx.clone(),
+    )?;
+
+    // Initialize the ACP connection (outside the lock)
+    match client.initialize().await {
+        Ok(resp) => {
+            tracing::info!("ACP client initialized successfully");
+            // Cache the Initialized event so late-connecting WebSocket clients
+            // receive agent info (name, version, capabilities).
+            // Always use the config profile name for consistency across agents.
+            let acp_info = resp.get("agentInfo");
+            let event = AcpEvent::Initialized {
+                agent_info: Some(serde_json::json!({
+                    "name": profile_name,
+                    "version": acp_info
+                        .and_then(|i| i.get("version"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                })),
+                capabilities: resp.get("agentCapabilities").cloned(),
+            };
+            *state.initialized_event.lock().await = Some(event);
         }
-    };
+        Err(e) => {
+            tracing::error!("Failed to initialize ACP client: {}", e);
+            return Err(color_eyre::eyre::eyre!("ACP initialization failed: {}", e));
+        }
+    }
 
-    // Extract the most recent message timestamp.
-    let last_message_ts = messages
-        .iter()
-        .filter_map(|msg| {
-            msg.get("info").and_then(|info| {
-                info.get("time").and_then(|time| {
-                    time.get("completed")
-                        .or_else(|| time.get("created"))
-                        .and_then(|t| t.as_i64())
-                })
-            })
-        })
-        .max();
-
-    (
-        activity.to_string(),
-        status_line,
-        current_tool,
-        recent_output,
-        last_message_ts,
-    )
+    // Insert under lock
+    {
+        let mut guard = state.acp_client.lock().await;
+        // TOCTOU: Two concurrent calls could both spawn. That's acceptable
+        // (one wins, the other's client gets dropped).
+        *guard = Some(client);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Opencode proxy and static file serving
+// WebSocket command types for ACP interaction
 // ---------------------------------------------------------------------------
 
-/// Whether a path is an SSE event-stream endpoint.
-fn is_event_stream_path(path: &str) -> bool {
-    path == "event" || path.starts_with("event/") || path == "global" || path.starts_with("global/")
+/// Commands sent from the frontend to pod-api via WebSocket.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum WsCommand {
+    /// Send a prompt to the agent.
+    #[serde(rename = "send_prompt")]
+    Prompt {
+        /// Session to send the prompt to.
+        #[serde(alias = "session_id", rename = "sessionId")]
+        session_id: String,
+        /// The prompt content blocks (ACP format).
+        prompt: Vec<serde_json::Value>,
+    },
+    /// Cancel an in-progress prompt.
+    #[serde(rename = "cancel")]
+    Cancel {
+        /// Session to cancel.
+        #[serde(alias = "session_id", rename = "sessionId")]
+        session_id: String,
+    },
+    /// Approve a permission request.
+    #[serde(rename = "permission_response")]
+    Approve {
+        /// The JSON-RPC request id from the permission request.
+        #[serde(alias = "request_id", rename = "requestId")]
+        request_id: i64,
+        /// The selected permission option (e.g. "allow_once").
+        #[serde(alias = "option_id", rename = "optionId")]
+        option_id: String,
+    },
+    /// Create a new session.
+    #[serde(rename = "new_session")]
+    NewSession,
+    /// List all sessions.
+    #[serde(rename = "list_sessions")]
+    ListSessions,
+    /// Load a specific session by ID.
+    #[serde(rename = "load_session")]
+    LoadSession {
+        /// The session ID to load.
+        #[serde(alias = "session_id", rename = "sessionId")]
+        session_id: String,
+    },
 }
 
-/// Return a long-lived SSE stream that sends periodic keepalive comments.
-/// Prevents the opencode SDK from error-looping when the upstream isn't ready.
-fn sse_keepalive_stream(comment: &str) -> Body {
-    let initial = format!(": {comment}\n\n");
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(2);
-    tokio::spawn(async move {
-        if tx.send(Ok(initial)).await.is_err() {
+/// Handle a WebSocket command from the frontend.
+async fn handle_ws_command(text: &str, state: &AppState) {
+    let cmd: WsCommand = match serde_json::from_str(text) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                "Failed to parse WebSocket command: {}: {}",
+                e,
+                &text[..text.len().min(200)]
+            );
             return;
         }
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if tx.send(Ok(": keepalive\n\n".to_string())).await.is_err() {
+    };
+
+    // Ensure the ACP client is spawned before handling commands
+    if let Err(e) = ensure_acp_client(state).await {
+        tracing::error!("Failed to spawn ACP client: {}", e);
+        let _ = state.acp_event_tx.send(AcpEvent::Error {
+            message: format!("Failed to start agent: {}", e),
+        });
+        return;
+    }
+
+    // Clone the client and drop the lock before async I/O operations.
+    // Holding the lock across async calls can cause deadlocks if other tasks
+    // need to acquire it.
+    let client = {
+        let guard = state.acp_client.lock().await;
+        match guard.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                tracing::warn!("Received WebSocket command but no ACP client is connected");
                 return;
             }
         }
-    });
-    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
-}
+    };
+    // Lock is dropped here.
 
-/// Build a 200 OK SSE keepalive response.
-fn sse_keepalive_response(comment: &str) -> std::result::Result<Response, StatusCode> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(sse_keepalive_stream(comment))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-/// Whether a path's last segment contains a dot (i.e. looks like a static file).
-fn has_file_extension(path: &str) -> bool {
-    path.rsplit_once('/')
-        .map_or(path, |(_dir, file)| file)
-        .contains('.')
-}
-
-/// Whether a path (with leading `/` stripped) is an opencode REST/SSE API endpoint
-/// that should be proxied to the upstream opencode server rather than served as
-/// an SPA navigation route.
-///
-/// The list is derived from the opencode SDK's generated route table
-/// (`sdk.gen.ts`). Everything that is *not* in this list and does not have a
-/// file extension is treated as an SPA navigation path and served our vendored
-/// `index.html`.
-fn is_opencode_api_path(path: &str) -> bool {
-    // All known opencode API top-level path segments. A request matches if the
-    // trimmed path equals one of these exactly (e.g. `session`) *or* starts
-    // with one followed by `/` (e.g. `session/abc123/message`).
-    const API_SEGMENTS: &[&str] = &[
-        "session",
-        "global",
-        "event",
-        "auth",
-        "project",
-        "config",
-        "experimental",
-        "permission",
-        "question",
-        "provider",
-        "find",
-        "file",
-        "mcp",
-        "tui",
-        "instance",
-        "path",
-        "vcs",
-        "command",
-        "log",
-        "agent",
-        "skill",
-        "lsp",
-        "formatter",
-    ];
-
-    // Extract the first path segment for matching.
-    let first_segment = path.split('/').next().unwrap_or("");
-    API_SEGMENTS.contains(&first_segment)
-}
-
-/// Proxy an HTTP request to the opencode server.
-///
-/// Supports regular requests, SSE streaming, and HTTP Upgrade (WebSocket).
-/// If the upstream is unreachable and the path is an event-stream endpoint,
-/// returns an SSE keepalive stream instead of an error.
-async fn proxy_to_opencode(
-    path: &str,
-    password: &str,
-    opencode_port: u16,
-    request: Request,
-) -> std::result::Result<Response, StatusCode> {
-    let host = "127.0.0.1";
-    let port = opencode_port;
-
-    // Connect to the opencode server.
-    // For SSE/event paths, return a keepalive stream immediately if unreachable.
-    // For regular API paths, retry a few times so the SPA doesn't see errors
-    // while opencode is still starting up after a rebuild.
-    let stream = if is_event_stream_path(path) {
-        match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!("Cannot connect to opencode at {}:{}: {}", host, port, e);
-                return sse_keepalive_response("opencode not ready");
+    match cmd {
+        WsCommand::Prompt { session_id, prompt } => {
+            let session_id = session_id.clone();
+            // Extract text from ACP content blocks
+            let text: String = prompt
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type")?.as_str()? == "text" {
+                        block.get("text")?.as_str().map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Err(e) = client.prompt(&session_id, &text).await {
+                tracing::error!("Failed to send prompt: {}", e);
+                let _ = state.acp_event_tx.send(AcpEvent::Error {
+                    message: format!("Prompt failed: {}", e),
+                });
+            } else {
+                // New work started — reset completion status so the pod
+                // shows as active (not done) while the agent processes.
+                if let Err(e) =
+                    write_completion_status(&state.workspace, CompletionStatus::Active).await
+                {
+                    tracing::warn!("Failed to reset completion status: {e}");
+                }
             }
         }
-    } else {
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY: Duration = Duration::from_secs(1);
-        let mut last_err = None;
-        let mut connected = None;
-        for attempt in 0..MAX_RETRIES {
-            match tokio::net::TcpStream::connect(format!("{}:{}", host, port)).await {
-                Ok(s) => {
-                    connected = Some(s);
-                    break;
+        WsCommand::Cancel { session_id } => {
+            if let Err(e) = client.cancel(&session_id).await {
+                tracing::error!("Failed to cancel: {}", e);
+            }
+        }
+        WsCommand::Approve {
+            request_id,
+            option_id,
+        } => {
+            client.respond_permission(request_id, &option_id).await;
+        }
+        WsCommand::NewSession => {
+            let cwd = state.workspace.to_string_lossy().to_string();
+            match client.new_session(&cwd).await {
+                Ok(sid) => {
+                    // SessionCreated is already broadcast by AcpClient::new_session().
+                    tracing::info!("Created new ACP session: {}", sid);
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "Cannot connect to opencode at {}:{} (attempt {}/{}): {}",
-                        host,
-                        port,
-                        attempt + 1,
-                        MAX_RETRIES,
-                        e
-                    );
-                    last_err = Some(e);
-                    if attempt + 1 < MAX_RETRIES {
-                        tokio::time::sleep(RETRY_DELAY).await;
-                    }
+                    tracing::error!("Failed to create session: {}", e);
+                    let _ = state.acp_event_tx.send(AcpEvent::Error {
+                        message: format!("Failed to create session: {}", e),
+                    });
                 }
             }
         }
-        match connected {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    "opencode at {}:{} unreachable after {} attempts: {}",
-                    host,
-                    port,
-                    MAX_RETRIES,
-                    last_err.unwrap()
-                );
-                return Err(StatusCode::BAD_GATEWAY);
+        WsCommand::ListSessions => match client.list_sessions().await {
+            Ok(sessions) => {
+                let _ = state.acp_event_tx.send(AcpEvent::SessionList { sessions });
+            }
+            Err(e) => {
+                tracing::error!("Failed to list sessions: {}", e);
+                let _ = state.acp_event_tx.send(AcpEvent::Error {
+                    message: format!("Failed to list sessions: {}", e),
+                });
+            }
+        },
+        WsCommand::LoadSession { session_id } => {
+            let cwd = state.workspace.to_string_lossy().to_string();
+            if let Err(e) = client.load_session(&session_id, &cwd).await {
+                tracing::error!("Failed to load session: {}", e);
+                let _ = state.acp_event_tx.send(AcpEvent::Error {
+                    message: format!("Failed to load session: {}", e),
+                });
             }
         }
-    };
-
-    let io = TokioIo::new(stream);
-    let is_upgrade = request.headers().get(header::UPGRADE).is_some();
-
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| {
-            tracing::error!("Handshake with opencode server failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
-
-    if is_upgrade {
-        tokio::spawn(async move {
-            if let Err(e) = conn.with_upgrades().await {
-                tracing::debug!("Upgrade connection closed: {}", e);
-            }
-        });
-    } else {
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::error!("Connection to opencode server failed: {}", e);
-            }
-        });
     }
-
-    // Build the upstream URI, preserving query string
-    let mut uri = if path.is_empty() || path == "/" {
-        "/".to_string()
-    } else if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{}", path)
-    };
-    if let Some(query) = request.uri().query() {
-        uri.push('?');
-        uri.push_str(query);
-    }
-
-    let (parts, body) = request.into_parts();
-
-    // Add Basic auth header
-    let credentials = BASE64_STANDARD.encode(format!("opencode:{}", password));
-    let mut builder = hyper::Request::builder()
-        .method(parts.method.clone())
-        .uri(&uri)
-        .header(header::HOST, format!("{}:{}", host, port))
-        .header(header::AUTHORIZATION, format!("Basic {}", credentials));
-
-    // Copy headers (except Host and Authorization which we set)
-    for (key, value) in parts.headers.iter() {
-        if key != header::HOST && key != header::AUTHORIZATION {
-            builder = builder.header(key, value);
-        }
-    }
-
-    let proxy_request = builder.body(body).map_err(|e| {
-        tracing::error!("Failed to build opencode proxy request: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let upstream_response = sender.send_request(proxy_request).await.map_err(|e| {
-        tracing::error!("Failed to send request to opencode: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
-
-    // Handle HTTP Upgrade (WebSocket) responses
-    if is_upgrade && upstream_response.status() == StatusCode::SWITCHING_PROTOCOLS {
-        let mut response_builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
-        for (key, value) in upstream_response.headers() {
-            response_builder = response_builder.header(key, value);
-        }
-
-        let inbound_request = Request::from_parts(parts, Body::empty());
-
-        tokio::spawn(async move {
-            let client_upgraded = hyper::upgrade::on(inbound_request).await;
-            let upstream_upgraded = hyper::upgrade::on(upstream_response).await;
-
-            match (client_upgraded, upstream_upgraded) {
-                (Ok(client), Ok(upstream)) => {
-                    let mut client_io = TokioIo::new(client);
-                    let mut upstream_io = TokioIo::new(upstream);
-                    if let Err(e) =
-                        tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
-                    {
-                        tracing::debug!("WebSocket proxy connection closed: {}", e);
-                    }
-                }
-                (Err(e), _) => {
-                    tracing::error!("Client upgrade failed: {}", e);
-                }
-                (_, Err(e)) => {
-                    tracing::error!("Upstream upgrade failed: {}", e);
-                }
-            }
-        });
-
-        return response_builder.body(Body::empty()).map_err(|e| {
-            tracing::error!("Failed to build upgrade response: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        });
-    }
-
-    // Normal response: normalize HTTP version for SSE/chunked support
-    let (mut resp_parts, body) = upstream_response.into_parts();
-    resp_parts.version = hyper::Version::HTTP_11;
-    let body = Body::new(body);
-
-    Ok(Response::from_parts(resp_parts, body))
-}
-
-/// Fallback handler: serves static files from the vendored UI or proxies to opencode.
-///
-/// Priority:
-/// 1. If the path has a file extension → try serving from the vendored UI directory,
-///    then fall through to the opencode proxy if the file isn't found locally.
-/// 2. If the path is a known opencode API route → proxy to localhost:4096.
-/// 3. Everything else (SPA navigation like `/`, `/:dir`, `/:dir/session/:id`) →
-///    serve our vendored `index.html` directly so that the opencode server's own
-///    index.html is never exposed to the browser.
-async fn fallback_handler(State(state): State<AppState>, request: Request) -> Response {
-    let path = request.uri().path().to_string();
-    let trimmed = path.trim_start_matches('/');
-
-    // 1. Static files: serve from the vendored UI directory first.
-    if has_file_extension(trimmed) {
-        let file_req = Request::builder()
-            .uri(request.uri().clone())
-            .body(Body::empty())
-            .unwrap();
-        let mut resp = ServeDir::new(OPENCODE_UI_PATH)
-            .oneshot(file_req)
-            .await
-            .unwrap()
-            .into_response();
-        if resp.status() != StatusCode::NOT_FOUND {
-            // Vite produces content-hashed filenames under /assets/ (e.g.
-            // index-abc123.js) — these are immutable so we can cache
-            // aggressively.  Other static files (favicon, etc.) get a
-            // shorter cache lifetime.
-            let cache_value = if trimmed.starts_with("assets/") {
-                "public, max-age=31536000, immutable"
-            } else {
-                "public, max-age=3600"
-            };
-            resp.headers_mut()
-                .insert(header::CACHE_CONTROL, cache_value.parse().unwrap());
-            return resp;
-        }
-        // File not found in UI dir — fall through to proxy (opencode may serve it)
-    }
-
-    // 2. Opencode API paths: proxy to the upstream opencode server.
-    if has_file_extension(trimmed) || is_opencode_api_path(trimmed) {
-        return match proxy_to_opencode(
-            trimmed,
-            &state.opencode_password,
-            state.opencode_port,
-            request,
-        )
-        .await
-        {
-            Ok(resp) => resp,
-            Err(status) => status.into_response(),
-        };
-    }
-
-    // 3. SPA fallback: serve our vendored index.html for all navigation routes.
-    let index_html = format!("{}/index.html", OPENCODE_UI_PATH);
-    let serve_dir = ServeDir::new(OPENCODE_UI_PATH).fallback(ServeFile::new(&index_html));
-    let fallback_req = Request::builder().uri("/").body(Body::empty()).unwrap();
-    serve_dir
-        .oneshot(fallback_req)
-        .await
-        .unwrap()
-        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2177,7 +1942,7 @@ struct CompletionStatusFile {
 /// resets status to Active but the agent hasn't started processing the
 /// review message yet, so the next /summary poll would see "Idle" and
 /// immediately re-set Done.
-const AUTO_COMPLETION_GRACE_SECS: i64 = 60;
+const AUTO_COMPLETION_GRACE_SECS: i64 = 5;
 
 /// Response for GET /completion-status.
 #[derive(Debug, Serialize)]
@@ -2484,16 +2249,157 @@ pub(crate) struct PodApiArgs {
     #[arg(long)]
     agent_container: Option<String>,
     /// Password for authenticating to the opencode server (Basic auth).
+    /// Legacy: unused with ACP transport, but accepted for CLI compatibility.
     #[arg(long, default_value = "")]
+    #[allow(dead_code)]
     opencode_password: String,
     /// Port of the opencode server to connect to.
-    #[arg(long, default_value_t = DEFAULT_OPENCODE_PORT)]
+    /// Legacy: unused with ACP transport, but accepted for CLI compatibility.
+    #[arg(long, default_value_t = 4096)]
+    #[allow(dead_code)]
     opencode_port: u16,
 }
 
 /// Liveness/readiness probe for container healthchecks.
 async fn healthz() -> &'static str {
     "ok"
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket endpoint for ACP event streaming
+// ---------------------------------------------------------------------------
+
+/// `GET /ws/events` — WebSocket endpoint for streaming ACP agent events.
+///
+/// Streams ACP events (session updates, permission requests, etc.) to
+/// the frontend. Also accepts commands from the frontend (prompts,
+/// approvals, etc.) as JSON text frames.
+async fn ws_agent_events(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_agent_events_ws(socket, state))
+}
+
+/// Handle an upgraded WebSocket connection for ACP agent events.
+///
+/// Bidirectional: forwards ACP events to the client, and processes
+/// commands (prompt, cancel, approve) from the client.
+async fn handle_agent_events_ws(mut socket: WebSocket, state: AppState) {
+    let mut rx = state.acp_event_tx.subscribe();
+
+    // Send an initial keepalive so the client knows the connection is live.
+    let _ = socket
+        .send(Message::Text(
+            serde_json::to_string(&AcpEvent::Keepalive).unwrap().into(),
+        ))
+        .await;
+
+    // Send cached Initialized event so the frontend has agent info
+    // (name, version, capabilities) even if it connected after init.
+    {
+        let init_event = state.initialized_event.lock().await;
+        if let Some(event) = init_event.as_ref() {
+            let json = serde_json::to_string(event).unwrap();
+            let _ = socket.send(Message::Text(json.into())).await;
+        }
+    }
+
+    // Send session list inline (not spawned) so the frontend reliably
+    // receives it before any other events. The frontend then calls
+    // session/load which replays the full conversation history.
+    {
+        if let Err(e) = ensure_acp_client(&state).await {
+            tracing::error!("Failed to spawn ACP client for session list: {}", e);
+        } else {
+            let client = {
+                let guard = state.acp_client.lock().await;
+                guard.as_ref().map(|c| c.clone())
+            };
+            if let Some(client) = client {
+                match client.list_sessions().await {
+                    Ok(sessions) => {
+                        let json =
+                            serde_json::to_string(&AcpEvent::SessionList { sessions }).unwrap();
+                        let _ = socket.send(Message::Text(json.into())).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to list sessions on connect: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(30));
+
+    loop {
+        tokio::select! {
+            // Forward ACP events to WebSocket.
+            event = rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        let json = serde_json::to_string(&event).unwrap();
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            // Handle incoming WebSocket messages (prompts, approvals).
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_ws_command(&text, &state).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            // Periodic keepalive.
+            _ = keepalive_interval.tick() => {
+                let ping = serde_json::to_string(&AcpEvent::Keepalive).unwrap();
+                if socket.send(Message::Text(ping.into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// `GET /api/devaipod/agent-profiles` — return available agent profiles.
+///
+/// Returns the agent profiles from the user's config file (if any),
+/// plus the default "opencode" profile as a fallback.
+async fn get_agent_profiles() -> Json<serde_json::Value> {
+    let config = crate::config::load_config(None).ok();
+    let mut profiles = serde_json::Map::new();
+
+    // Always include the default profile.
+    profiles.insert(
+        "opencode".to_string(),
+        serde_json::json!({
+            "command": ["opencode", "acp"],
+            "env": {},
+            "is_default": true
+        }),
+    );
+
+    // Merge user-configured profiles.
+    if let Some(ref config) = config {
+        let agent_config = &config.agent;
+        for (name, profile) in &agent_config.profiles {
+            profiles.insert(
+                name.clone(),
+                serde_json::json!({
+                    "command": profile.command,
+                    "env": profile.env,
+                    "is_default": agent_config.default.iter().any(|s| s == name)
+                }),
+            );
+        }
+    }
+
+    Json(serde_json::Value::Object(profiles))
 }
 
 /// Build the axum router (public for testing).
@@ -2524,6 +2430,10 @@ fn build_router(state: AppState) -> Router {
         )
         // Session title
         .route("/title", get(get_title).put(update_title))
+        // Agent event stream (ACP over WebSocket)
+        .route("/ws/events", get(ws_agent_events))
+        // Agent profile listing
+        .route("/api/devaipod/agent-profiles", get(get_agent_profiles))
         // PTY endpoints
         .route("/pty", get(pty_list).post(pty_create))
         .route(
@@ -2531,8 +2441,6 @@ fn build_router(state: AppState) -> Router {
             get(pty_get).put(pty_update).delete(pty_delete),
         )
         .route("/pty/{pty_id}/connect", get(pty_connect))
-        // Fallback: static UI files and opencode API proxy
-        .fallback(fallback_handler)
         .layer(CompressionLayer::new())
         .with_state(state)
 }
@@ -2598,7 +2506,7 @@ fn load_or_generate_admin_token() -> Result<String> {
 
 /// Path (relative to the workspace parent) where the initial task message is
 /// written by `write_task()` during pod creation. The pod-api reads this file,
-/// sends it to opencode, and marks it consumed so it doesn't repeat on restart.
+/// sends it to the agent, and marks it consumed so it doesn't repeat on restart.
 const INITIAL_TASK_RELATIVE: &str = ".devaipod/initial-task.md";
 
 /// Sentinel file written to the pod-api state dir after the initial task has
@@ -2614,26 +2522,33 @@ fn initial_task_path(workspace: &std::path::Path) -> PathBuf {
 }
 
 /// Check whether the initial task has already been consumed.
-fn initial_task_already_done() -> bool {
-    state_dir().join(INITIAL_TASK_DONE_FILE).exists()
+///
+/// The marker lives alongside the task file in the workspace directory
+/// (a persistent bind mount), not in the container overlay. This
+/// survives pod-api container restarts.
+fn initial_task_already_done(workspace: &std::path::Path) -> bool {
+    workspace
+        .join(".devaipod")
+        .join(INITIAL_TASK_DONE_FILE)
+        .exists()
 }
 
 /// Mark the initial task as consumed so it isn't re-sent on restart.
-async fn mark_initial_task_done() {
-    let path = state_dir().join(INITIAL_TASK_DONE_FILE);
+async fn mark_initial_task_done(workspace: &std::path::Path) {
+    let path = workspace.join(".devaipod").join(INITIAL_TASK_DONE_FILE);
     if let Err(e) = tokio::fs::write(&path, "done").await {
         tracing::warn!("Failed to write initial-task-done marker: {e}");
     }
 }
 
 /// Background task: if an initial task file exists and no session has been
-/// started yet, wait for opencode to become reachable, create a session,
-/// and send the task as the first message.
+/// started yet, wait for the ACP client to be available, create a session,
+/// and send the task as the first prompt.
 async fn maybe_auto_start_session(state: AppState) -> Result<()> {
     tracing::info!("Checking for initial task to auto-start...");
 
     // Already consumed (e.g. container restarted after initial send).
-    if initial_task_already_done() {
+    if initial_task_already_done(&state.workspace) {
         tracing::info!("Initial task already sent (done marker exists), skipping auto-start");
         return Ok(());
     }
@@ -2662,127 +2577,41 @@ async fn maybe_auto_start_session(state: AppState) -> Result<()> {
     }
     let task_content = task_content.unwrap();
 
-    tracing::info!("Found initial task file, waiting for opencode to become ready...");
+    tracing::info!("Found initial task file, spawning ACP client...");
 
-    // Use a short timeout for polling/session creation but we'll need a
-    // longer one for the actual message send (the /message endpoint blocks
-    // until the LLM finishes).
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("Failed to build HTTP client")?;
-    let message_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .context("Failed to build message HTTP client")?;
-
-    let credentials = BASE64_STANDARD.encode(format!("opencode:{}", state.opencode_password));
-    let auth_value = format!("Basic {credentials}");
-    let base_url = format!("http://127.0.0.1:{}", state.opencode_port);
-
-    // Wait for the opencode server to be reachable (up to 120s).
-    let max_attempts = 60;
-    for attempt in 1..=max_attempts {
-        match client
-            .get(format!("{base_url}/session"))
-            .header(header::AUTHORIZATION, &auth_value)
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => {
-                tracing::debug!("opencode reachable after {attempt} attempts");
-                // Check if there are already sessions — if so, someone else
-                // started one (e.g. a previous run that was interrupted).
-                if let Ok(sessions) = r.json::<Vec<serde_json::Value>>().await
-                    && !sessions.is_empty()
-                {
-                    tracing::info!(
-                        "opencode already has {} session(s), skipping auto-start",
-                        sessions.len()
-                    );
-                    mark_initial_task_done().await;
-                    return Ok(());
-                }
-                break;
-            }
-            Ok(r) => {
-                tracing::debug!(
-                    "opencode returned {} (attempt {}/{})",
-                    r.status(),
-                    attempt,
-                    max_attempts
-                );
-            }
-            Err(e) => {
-                tracing::debug!(
-                    "opencode not reachable (attempt {}/{}): {}",
-                    attempt,
-                    max_attempts,
-                    e
-                );
-            }
-        }
-
-        if attempt == max_attempts {
-            tracing::warn!(
-                "opencode did not become reachable after {} attempts, giving up on auto-start",
-                max_attempts
-            );
-            return Ok(());
-        }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    // Ensure the ACP client is spawned and ready
+    if let Err(e) = ensure_acp_client(&state).await {
+        tracing::warn!("Failed to spawn ACP client for auto-start: {:#}", e);
+        return Ok(());
     }
 
-    // Create a new session.
-    let session_resp = client
-        .post(format!("{base_url}/session"))
-        .header(header::AUTHORIZATION, &auth_value)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body("{}")
-        .send()
-        .await
-        .context("Failed to create session")?;
+    // Create a session and send the initial prompt via ACP.
+    let client_guard = state.acp_client.lock().await;
+    let Some(client) = client_guard.as_ref() else {
+        tracing::warn!("ACP client disappeared, giving up on auto-start");
+        return Ok(());
+    };
 
-    if !session_resp.status().is_success() {
-        let status = session_resp.status();
-        let body = session_resp.text().await.unwrap_or_default();
-        color_eyre::eyre::bail!("Failed to create session: HTTP {status}: {body}");
+    let cwd = state.workspace.to_string_lossy().to_string();
+    let session_id = client
+        .new_session(&cwd)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to create ACP session: {}", e))?;
+
+    tracing::info!("Created ACP session {session_id}, sending initial task...");
+
+    client
+        .prompt(&session_id, &task_content)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to send initial prompt: {}", e))?;
+
+    tracing::info!("Initial task sent to ACP session {session_id}");
+    // Set Active with a timestamp so the grace period protects against
+    // premature Done if the agent responds very quickly.
+    if let Err(e) = write_completion_status(&state.workspace, CompletionStatus::Active).await {
+        tracing::warn!("Failed to set completion status for auto-start: {e}");
     }
-
-    let session: serde_json::Value = session_resp
-        .json()
-        .await
-        .context("Failed to parse session response")?;
-    let session_id = session
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| color_eyre::eyre::eyre!("Session response missing 'id' field"))?;
-
-    tracing::info!("Created session {session_id}, sending initial task message...");
-
-    // Send the initial message.
-    let payload = serde_json::json!({
-        "parts": [{"type": "text", "text": task_content}]
-    });
-
-    let msg_resp = message_client
-        .post(format!("{base_url}/session/{session_id}/message"))
-        .header(header::AUTHORIZATION, &auth_value)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(payload.to_string())
-        .send()
-        .await
-        .context("Failed to send initial message")?;
-
-    if !msg_resp.status().is_success() {
-        let status = msg_resp.status();
-        let body = msg_resp.text().await.unwrap_or_default();
-        color_eyre::eyre::bail!("Failed to send initial message: HTTP {status}: {body}");
-    }
-
-    tracing::info!("Initial task message sent to session {session_id}");
-    mark_initial_task_done().await;
+    mark_initial_task_done(&state.workspace).await;
 
     Ok(())
 }
@@ -2793,19 +2622,25 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
     let git_events_tx = GitWatcher::spawn(Arc::clone(&workspace));
     let admin_token = load_or_generate_admin_token().context("Failed to initialize admin token")?;
 
+    // ACP event broadcast channel for WebSocket clients.
+    let (acp_event_tx, _) = broadcast::channel::<AcpEvent>(256);
+
+    // The ACP client is created lazily when the agent container starts
+    // (the pod-api sidecar starts before the agent).
     let state = AppState {
         workspace,
         git_events_tx,
         pty_sessions: PtySessionManager::new(),
         workspace_container: args.workspace_container.unwrap_or_default(),
         agent_container: args.agent_container.unwrap_or_default(),
-        opencode_password: args.opencode_password,
-        opencode_port: args.opencode_port,
         admin_token,
+        acp_event_tx,
+        acp_client: Arc::new(Mutex::new(None)),
+        initialized_event: Arc::new(Mutex::new(None)),
     };
 
     // Spawn background auto-start task: reads the initial task file (if present)
-    // and sends it to opencode once the server is reachable.
+    // and sends the initial prompt via ACP once the client is available.
     let auto_start_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = maybe_auto_start_session(auto_start_state).await {
@@ -2836,384 +2671,10 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Mock opencode server for integration testing
-// ---------------------------------------------------------------------------
-
-/// Run a minimal mock opencode server for integration testing.
-///
-/// Serves canned session and message data so that the pod-api sidecar can
-/// query "opencode" without a real AI provider. The responses make the agent
-/// appear idle (finished, stop).
-pub(crate) async fn run_mock_opencode(port: u16) -> Result<()> {
-    let app = Router::new()
-        .route("/session", get(mock_sessions))
-        .route("/session/{id}/message", get(mock_messages));
-
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("Mock opencode server listening on 0.0.0.0:{}", port);
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind mock-opencode to {addr}"))?;
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(crate::web::shutdown_signal())
-        .await
-        .context("mock-opencode server error")?;
-
-    tracing::info!("Mock opencode server shut down gracefully");
-    Ok(())
-}
-
-/// `GET /session` — return a canned session list (one root session).
-async fn mock_sessions() -> Json<serde_json::Value> {
-    Json(serde_json::json!([
-        {
-            "id": "mock-session-001",
-            "slug": "mock-session",
-            "projectID": "proj_001",
-            "directory": "/workspaces/test",
-            "title": "Mock session",
-            "version": "1.0.0",
-            "time": {"created": 1_700_000_000_000_i64, "updated": 1_700_000_100_000_i64}
-        }
-    ]))
-}
-
-/// `GET /session/:id/message` — return canned messages showing an idle agent.
-async fn mock_messages(Path(_id): Path<String>) -> Json<serde_json::Value> {
-    Json(serde_json::json!([
-        {
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1_700_000_001_000_i64, "completed": 1_700_000_002_000_i64},
-                "finish": "stop"
-            },
-            "parts": [
-                {"type": "text", "text": "Ready for testing."}
-            ]
-        }
-    ]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // derive_agent_status_from_messages — pure function tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_derive_status_empty_messages() {
-        let messages: Vec<serde_json::Value> = vec![];
-        let (activity, status_line, current_tool, recent_output, last_ts) =
-            derive_agent_status_from_messages(&messages);
-        assert_eq!(activity, "Unknown");
-        assert!(status_line.is_none());
-        assert!(current_tool.is_none());
-        assert!(recent_output.is_empty());
-        assert!(last_ts.is_none());
-    }
-
-    #[test]
-    fn test_derive_status_no_assistant_message() {
-        let messages = vec![serde_json::json!({
-            "info": {"role": "user"},
-            "parts": [{"type": "text", "text": "Hello"}]
-        })];
-        let (activity, ..) = derive_agent_status_from_messages(&messages);
-        assert_eq!(activity, "Unknown");
-    }
-
-    #[test]
-    fn test_derive_status_working_no_completed_time() {
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890}
-            },
-            "parts": [{"type": "text", "text": "Working on it..."}]
-        })];
-        let (activity, status_line, _, _, _) = derive_agent_status_from_messages(&messages);
-        assert_eq!(activity, "Working");
-        assert_eq!(status_line.as_deref(), Some("Working on it..."));
-    }
-
-    #[test]
-    fn test_derive_status_idle_with_stop_finish() {
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891},
-                "finish": "stop"
-            },
-            "parts": [{"type": "text", "text": "Done!"}]
-        })];
-        let (activity, ..) = derive_agent_status_from_messages(&messages);
-        assert_eq!(activity, "Idle");
-    }
-
-    #[test]
-    fn test_derive_status_working_with_tool_calls_finish() {
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891},
-                "finish": "tool-calls"
-            },
-            "parts": [{"type": "text", "text": "Making tool call..."}]
-        })];
-        let (activity, ..) = derive_agent_status_from_messages(&messages);
-        assert_eq!(activity, "Working");
-    }
-
-    #[test]
-    fn test_derive_status_working_with_incomplete_tool() {
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891}
-            },
-            "parts": [
-                {"type": "text", "text": "Running a tool..."},
-                {"type": "tool", "name": "bash", "state": {"status": "running"}}
-            ]
-        })];
-        let (activity, _, current_tool, _, _) = derive_agent_status_from_messages(&messages);
-        assert_eq!(activity, "Working");
-        assert_eq!(current_tool.as_deref(), Some("bash"));
-    }
-
-    #[test]
-    fn test_derive_status_idle_with_completed_tool() {
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891}
-            },
-            "parts": [
-                {"type": "text", "text": "Tool result..."},
-                {"type": "tool", "name": "bash", "state": {"status": "completed"}}
-            ]
-        })];
-        let (activity, _, current_tool, _, _) = derive_agent_status_from_messages(&messages);
-        assert_eq!(activity, "Idle");
-        assert!(
-            current_tool.is_none(),
-            "completed tool should not appear as current"
-        );
-    }
-
-    #[test]
-    fn test_derive_status_recent_output_truncates_long_lines() {
-        let long_line = "x".repeat(100);
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890}
-            },
-            "parts": [{"type": "text", "text": long_line}]
-        })];
-        let (_, _, _, recent_output, _) = derive_agent_status_from_messages(&messages);
-        assert!(!recent_output.is_empty());
-        assert!(
-            recent_output[0].len() <= 80,
-            "long line should be truncated to 80 chars, got {}",
-            recent_output[0].len()
-        );
-        assert!(
-            recent_output[0].ends_with("..."),
-            "truncated line should end with ellipsis"
-        );
-    }
-
-    #[test]
-    fn test_derive_status_recent_output_includes_tool_entries() {
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890}
-            },
-            "parts": [
-                {"type": "tool", "name": "read", "state": {"status": "completed"}}
-            ]
-        })];
-        let (_, _, _, recent_output, _) = derive_agent_status_from_messages(&messages);
-        assert!(!recent_output.is_empty());
-        assert!(
-            recent_output[0].contains("read"),
-            "tool entry should appear in recent_output"
-        );
-    }
-
-    #[test]
-    fn test_derive_status_last_message_timestamp() {
-        let messages = vec![
-            serde_json::json!({
-                "info": {
-                    "role": "user",
-                    "time": {"created": 1000}
-                },
-                "parts": []
-            }),
-            serde_json::json!({
-                "info": {
-                    "role": "assistant",
-                    "time": {"created": 2000, "completed": 3000}
-                },
-                "parts": [{"type": "text", "text": "Done"}]
-            }),
-        ];
-        let (_, _, _, _, last_ts) = derive_agent_status_from_messages(&messages);
-        assert_eq!(last_ts, Some(3000), "should pick the max timestamp");
-    }
-
-    #[test]
-    fn test_derive_status_status_line_truncates() {
-        let long_status = "a".repeat(80);
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890}
-            },
-            "parts": [{"type": "text", "text": long_status}]
-        })];
-        let (_, status_line, _, _, _) = derive_agent_status_from_messages(&messages);
-        let sl = status_line.unwrap();
-        assert!(
-            sl.len() <= 60,
-            "status_line should be truncated to 60 chars"
-        );
-        assert!(
-            sl.ends_with("..."),
-            "truncated status_line should end with ..."
-        );
-    }
-
-    #[test]
-    fn test_derive_status_multiple_messages_uses_last_assistant() {
-        let messages = vec![
-            serde_json::json!({
-                "info": {
-                    "role": "assistant",
-                    "time": {"created": 1000, "completed": 1001},
-                    "finish": "stop"
-                },
-                "parts": [{"type": "text", "text": "First response"}]
-            }),
-            serde_json::json!({
-                "info": {"role": "user"},
-                "parts": [{"type": "text", "text": "Do more"}]
-            }),
-            serde_json::json!({
-                "info": {
-                    "role": "assistant",
-                    "time": {"created": 2000}
-                },
-                "parts": [{"type": "text", "text": "Working on more..."}]
-            }),
-        ];
-        let (activity, status_line, _, _, _) = derive_agent_status_from_messages(&messages);
-        assert_eq!(
-            activity, "Working",
-            "should use last assistant message (no completed time)"
-        );
-        assert_eq!(status_line.as_deref(), Some("Working on more..."));
-    }
-
-    #[test]
-    fn test_has_file_extension() {
-        assert!(has_file_extension("index.html"));
-        assert!(has_file_extension("assets/main.js"));
-        assert!(has_file_extension("deep/path/style.css"));
-        assert!(!has_file_extension(""));
-        assert!(!has_file_extension("session"));
-        assert!(!has_file_extension("mydir/session/abc123"));
-        assert!(!has_file_extension("global/health"));
-    }
-
-    #[test]
-    fn test_is_opencode_api_path_bare_segments() {
-        // All known API segments should match when used alone
-        for path in [
-            "session",
-            "global",
-            "event",
-            "auth",
-            "project",
-            "config",
-            "experimental",
-            "permission",
-            "question",
-            "provider",
-            "find",
-            "file",
-            "mcp",
-            "tui",
-            "instance",
-            "path",
-            "vcs",
-            "command",
-            "log",
-            "agent",
-            "skill",
-            "lsp",
-            "formatter",
-        ] {
-            assert!(is_opencode_api_path(path), "expected API path: {path}");
-        }
-    }
-
-    #[test]
-    fn test_is_opencode_api_path_with_subpaths() {
-        assert!(is_opencode_api_path("session/abc123"));
-        assert!(is_opencode_api_path("session/abc123/message"));
-        assert!(is_opencode_api_path(
-            "session/abc123/message/msg456/part/p789"
-        ));
-        assert!(is_opencode_api_path("global/health"));
-        assert!(is_opencode_api_path("global/config"));
-        assert!(is_opencode_api_path("global/event"));
-        assert!(is_opencode_api_path("auth/github"));
-        assert!(is_opencode_api_path("project/current"));
-        assert!(is_opencode_api_path("config/providers"));
-        assert!(is_opencode_api_path("experimental/tool"));
-        assert!(is_opencode_api_path("permission/req123/reply"));
-        assert!(is_opencode_api_path("question/req456/reply"));
-        assert!(is_opencode_api_path("provider/openai/oauth/authorize"));
-        assert!(is_opencode_api_path("find/file"));
-        assert!(is_opencode_api_path("file/content"));
-        assert!(is_opencode_api_path("mcp/myserver/connect"));
-        assert!(is_opencode_api_path("tui/submit-prompt"));
-        assert!(is_opencode_api_path("instance/dispose"));
-        assert!(is_opencode_api_path("event/something"));
-    }
-
-    #[test]
-    fn test_is_opencode_api_path_rejects_spa_navigation() {
-        // Root path (trimmed to empty string)
-        assert!(!is_opencode_api_path(""));
-        // /:dir style SPA routes — arbitrary workspace directory names
-        assert!(!is_opencode_api_path("myproject"));
-        assert!(!is_opencode_api_path("some-workspace"));
-        assert!(!is_opencode_api_path("my-repo/session/abc123"));
-        // Random unknown paths should not be treated as API
-        assert!(!is_opencode_api_path("unknown"));
-        assert!(!is_opencode_api_path("foo/bar"));
-    }
-
-    #[test]
-    fn test_is_event_stream_path() {
-        assert!(is_event_stream_path("event"));
-        assert!(is_event_stream_path("event/something"));
-        assert!(is_event_stream_path("global"));
-        assert!(is_event_stream_path("global/event"));
-        assert!(!is_event_stream_path("session"));
-        assert!(!is_event_stream_path(""));
-        assert!(!is_event_stream_path("config"));
-    }
+    use axum::body::Body;
 
     // -----------------------------------------------------------------------
     // Gator scopes endpoint tests (in-process HTTP with temp workspace)
@@ -3227,19 +2688,202 @@ mod tests {
 
     /// Build a test router backed by a real temp directory.
     fn test_app(workspace: &std::path::Path) -> Router {
-        let (tx, _rx) = broadcast::channel(16);
+        let (git_tx, _rx) = broadcast::channel(16);
+        let (acp_tx, _) = broadcast::channel(16);
         let state = AppState {
             workspace: Arc::new(workspace.to_path_buf()),
-            git_events_tx: tx,
+            git_events_tx: git_tx,
             pty_sessions: PtySessionManager::new(),
             workspace_container: String::new(),
             agent_container: String::new(),
-            opencode_password: String::new(),
-            opencode_port: DEFAULT_OPENCODE_PORT,
             admin_token: TEST_ADMIN_TOKEN.to_string(),
+            acp_event_tx: acp_tx,
+            acp_client: Arc::new(Mutex::new(None)),
+            initialized_event: Arc::new(Mutex::new(None)),
         };
         build_router(state)
     }
+
+    // -----------------------------------------------------------------------
+    // /summary endpoint tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_summary_with_no_acp_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .uri("/summary")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Without an ACP client, the summary should report Unknown status.
+        assert_eq!(json["activity"], "Unknown");
+        assert_eq!(json["status_line"], "ACP client not connected");
+        assert!(json["current_tool"].is_null());
+        assert_eq!(json["session_count"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // /ws/events WebSocket endpoint test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ws_events_route_exists() {
+        // Verify /ws/events returns a WebSocket upgrade response (426)
+        // when called without the proper upgrade headers. This confirms
+        // the route is registered and the handler expects a WebSocket.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .uri("/ws/events")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Without Upgrade headers, axum's WebSocketUpgrade extractor rejects
+        // the request. The exact status depends on axum version but is not 404.
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/ws/events route must exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_events_rejects_non_upgrade() {
+        // A plain GET to /ws/events without WebSocket upgrade headers should
+        // be rejected (not 404) — axum returns 400 or similar when the
+        // WebSocketUpgrade extractor cannot extract from a non-upgrade request.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .uri("/ws/events")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            // Missing required Sec-WebSocket-Key/Version → extractor fails
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Without the full WS handshake headers the request is rejected,
+        // but the route itself exists (not 404). This confirms the route
+        // is registered and wired to the ws_agent_events handler.
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/ws/events route must exist even if upgrade fails"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_ws_command routing tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ws_command_deserialization_send_prompt() {
+        let json =
+            r#"{"type":"send_prompt","sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            WsCommand::Prompt { session_id, prompt } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(prompt.len(), 1);
+            }
+            _ => panic!("expected Prompt variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_command_deserialization_cancel() {
+        let json = r#"{"type":"cancel","sessionId":"s1"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            WsCommand::Cancel { session_id } => {
+                assert_eq!(session_id, "s1");
+            }
+            _ => panic!("expected Cancel variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_command_deserialization_permission_response() {
+        let json = r#"{"type":"permission_response","requestId":42,"optionId":"allow_once"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            WsCommand::Approve {
+                request_id,
+                option_id,
+            } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(option_id, "allow_once");
+            }
+            _ => panic!("expected Approve variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_command_deserialization_new_session() {
+        let json = r#"{"type":"new_session"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, WsCommand::NewSession));
+    }
+
+    #[tokio::test]
+    async fn test_ws_command_deserialization_list_sessions() {
+        let json = r#"{"type":"list_sessions"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, WsCommand::ListSessions));
+    }
+
+    #[tokio::test]
+    async fn test_ws_command_deserialization_load_session() {
+        let json = r#"{"type":"load_session","sessionId":"s2"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            WsCommand::LoadSession { session_id } => {
+                assert_eq!(session_id, "s2");
+            }
+            _ => panic!("expected LoadSession variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_ws_command_no_client() {
+        // Verify that handle_ws_command logs a warning and returns cleanly
+        // when no ACP client exists, without crashing.
+        let tmp = tempfile::tempdir().unwrap();
+        let (git_tx, _) = broadcast::channel(16);
+        let (acp_tx, _) = broadcast::channel(16);
+        let state = AppState {
+            workspace: Arc::new(tmp.path().to_path_buf()),
+            git_events_tx: git_tx,
+            pty_sessions: PtySessionManager::new(),
+            workspace_container: String::new(),
+            agent_container: String::new(),
+            admin_token: TEST_ADMIN_TOKEN.to_string(),
+            acp_event_tx: acp_tx,
+            acp_client: Arc::new(Mutex::new(None)),
+            initialized_event: Arc::new(Mutex::new(None)),
+        };
+
+        // This should not panic or crash — just log a warning.
+        let json = r#"{"type":"new_session"}"#;
+        handle_ws_command(json, &state).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Gator scopes endpoint tests
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_gator_scopes_get_not_configured() {
@@ -3513,5 +3157,71 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent profiles endpoint tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_agent_profiles_returns_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_app(tmp.path());
+
+        let req = HttpRequest::builder()
+            .uri("/api/devaipod/agent-profiles")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should always have the default "opencode" profile.
+        assert!(
+            json.get("opencode").is_some(),
+            "default opencode profile must exist"
+        );
+        let opencode = &json["opencode"];
+        assert_eq!(opencode["command"], serde_json::json!(["opencode", "acp"]));
+        assert_eq!(opencode["is_default"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // ACP WebSocket command parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ws_command_deserialization() {
+        // Frontend sends camelCase with content blocks
+        let json =
+            r#"{"type":"send_prompt","sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, WsCommand::Prompt { .. }));
+
+        let json = r#"{"type":"cancel","sessionId":"s1"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, WsCommand::Cancel { .. }));
+
+        let json = r#"{"type":"permission_response","requestId":42,"optionId":"allow_once"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, WsCommand::Approve { .. }));
+
+        let json = r#"{"type":"new_session"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, WsCommand::NewSession));
+
+        let json = r#"{"type":"list_sessions"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, WsCommand::ListSessions));
+
+        let json = r#"{"type":"load_session","sessionId":"s1"}"#;
+        let cmd: WsCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            WsCommand::LoadSession { session_id } => assert_eq!(session_id, "s1"),
+            _ => panic!("Expected LoadSession variant"),
+        }
     }
 }

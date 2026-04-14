@@ -14,14 +14,25 @@ use crate::{
     shell, short_name, unique_test_name,
 };
 
-/// Verify that `devaipod devcontainer list` works when no devcontainer pods exist.
+/// Verify that `devaipod devcontainer list` works.
+///
+/// This test verifies that the command succeeds and produces valid output.
+/// It may see devcontainer pods from parallel tests (all filtered to the
+/// integration test instance), so we don't assert emptiness - just that
+/// the command works correctly.
 fn test_devcontainer_list_empty() -> Result<()> {
     let output = run_devaipod(&["devcontainer", "list"])?;
     output.assert_success("devaipod devcontainer list");
 
+    // The output should either show "No devcontainer pods found" or a table
+    // with devcontainer pods (from parallel tests). Both are valid.
+    let stdout = output.stdout.as_str();
+    let has_empty_message = stdout.contains("No devcontainer pods found");
+    let has_table_header = stdout.contains("NAME") && (stdout.contains("REPO") || stdout.contains("REPOSITORY"));
+
     assert!(
-        output.stdout.contains("No devcontainer pods found"),
-        "Expected 'No devcontainer pods found' message, got:\n{}",
+        has_empty_message || has_table_header,
+        "Expected either 'No devcontainer pods found' or a table with headers, got:\n{}",
         output.combined()
     );
 
