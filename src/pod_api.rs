@@ -74,6 +74,9 @@ struct AppState {
     acp_event_tx: broadcast::Sender<AcpEvent>,
     /// ACP client for communicating with the agent (created lazily).
     acp_client: Arc<Mutex<Option<AcpClient>>>,
+    /// Cached Initialized event so late-connecting WebSocket clients
+    /// receive agent info (name, version, capabilities).
+    initialized_event: Arc<Mutex<Option<AcpEvent>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,23 +1588,69 @@ async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
         }
     }
 
-    tracing::info!("Spawning ACP client for agent container: {}", state.agent_container);
+    tracing::info!(
+        "Spawning ACP client for agent container: {}",
+        state.agent_container
+    );
 
     // Load agent profile from config
     let config = crate::config::load_config(None).unwrap_or_else(|e| {
         tracing::warn!("Failed to load config, using defaults: {}", e);
         crate::config::Config::default()
     });
-    let (profile_name, profile_opt) = config.agent.resolve_profile(None);
 
-    let profile: crate::config::AgentProfile = match profile_opt {
-        Some(p) => p.clone(),
+    // Get podman path first (needed for probing)
+    let podman_path = std::env::var("PODMAN_PATH").unwrap_or_else(|_| "podman".to_string());
+
+    // Try each candidate profile in priority order, probing the container
+    // for the binary. Use the first one that's available.
+    let candidates = config.agent.candidates();
+    let mut selected: Option<(String, crate::config::AgentProfile)> = None;
+
+    for (name, profile) in &candidates {
+        if profile.command.is_empty() {
+            continue;
+        }
+        let binary = &profile.command[0];
+        // Check if binary exists in the agent container
+        let probe = tokio::process::Command::new(&podman_path)
+            .args([
+                "exec",
+                &state.agent_container,
+                "sh",
+                "-c",
+                &format!("command -v {}", binary),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if probe.map(|s| s.success()).unwrap_or(false) {
+            tracing::info!(
+                "Selected agent profile '{}' (binary '{}' found)",
+                name,
+                binary
+            );
+            selected = Some((name.to_string(), (*profile).clone()));
+            break;
+        } else {
+            tracing::debug!("Agent binary '{}' not found for profile '{}'", binary, name);
+        }
+    }
+
+    let (profile_name, profile) = match selected {
+        Some((name, p)) => (name, p),
         None => {
-            // Default profile if not found in config
-            crate::config::AgentProfile {
-                command: vec!["opencode".to_string(), "acp".to_string()],
-                env: HashMap::new(),
-            }
+            // No binary found — fall back to hardcoded opencode and let it fail
+            // with a clear error when the exec happens.
+            tracing::warn!("No agent binary found in container, falling back to opencode");
+            (
+                "opencode".to_string(),
+                crate::config::AgentProfile {
+                    command: vec!["opencode".to_string(), "acp".to_string()],
+                    env: HashMap::new(),
+                },
+            )
         }
     };
 
@@ -1609,13 +1658,7 @@ async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
 
     // Build podman exec command:
     // podman exec -i <agent_container> <agent_command...>
-    let podman_path =
-        std::env::var("PODMAN_PATH").unwrap_or_else(|_| "podman".to_string());
-    let mut podman_command = vec![
-        podman_path,
-        "exec".to_string(),
-        "-i".to_string(),
-    ];
+    let mut podman_command = vec![podman_path, "exec".to_string(), "-i".to_string()];
 
     // Add environment variables as -e flags
     for (key, value) in &profile.env {
@@ -1647,8 +1690,23 @@ async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
 
     // Initialize the ACP connection (outside the lock)
     match client.initialize().await {
-        Ok(_) => {
+        Ok(resp) => {
             tracing::info!("ACP client initialized successfully");
+            // Cache the Initialized event so late-connecting WebSocket clients
+            // receive agent info (name, version, capabilities).
+            // Always use the config profile name for consistency across agents.
+            let acp_info = resp.get("agentInfo");
+            let event = AcpEvent::Initialized {
+                agent_info: Some(serde_json::json!({
+                    "name": profile_name,
+                    "version": acp_info
+                        .and_then(|i| i.get("version"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                })),
+                capabilities: resp.get("agentCapabilities").cloned(),
+            };
+            *state.initialized_event.lock().await = Some(event);
         }
         Err(e) => {
             tracing::error!("Failed to initialize ACP client: {}", e);
@@ -1809,19 +1867,17 @@ async fn handle_ws_command(text: &str, state: &AppState) {
                 }
             }
         }
-        WsCommand::ListSessions => {
-            match client.list_sessions().await {
-                Ok(sessions) => {
-                    let _ = state.acp_event_tx.send(AcpEvent::SessionList { sessions });
-                }
-                Err(e) => {
-                    tracing::error!("Failed to list sessions: {}", e);
-                    let _ = state.acp_event_tx.send(AcpEvent::Error {
-                        message: format!("Failed to list sessions: {}", e),
-                    });
-                }
+        WsCommand::ListSessions => match client.list_sessions().await {
+            Ok(sessions) => {
+                let _ = state.acp_event_tx.send(AcpEvent::SessionList { sessions });
             }
-        }
+            Err(e) => {
+                tracing::error!("Failed to list sessions: {}", e);
+                let _ = state.acp_event_tx.send(AcpEvent::Error {
+                    message: format!("Failed to list sessions: {}", e),
+                });
+            }
+        },
         WsCommand::LoadSession { session_id } => {
             let cwd = state.workspace.to_string_lossy().to_string();
             if let Err(e) = client.load_session(&session_id, &cwd).await {
@@ -2236,44 +2292,41 @@ async fn handle_agent_events_ws(mut socket: WebSocket, state: AppState) {
         ))
         .await;
 
-    // Immediately list sessions and send to the frontend.
-    // If there's exactly one session, auto-load it.
-    tokio::spawn({
-        let state = state.clone();
-        async move {
-            if let Err(e) = ensure_acp_client(&state).await {
-                tracing::error!("Failed to spawn ACP client for session list: {}", e);
-                return;
-            }
+    // Send cached Initialized event so the frontend has agent info
+    // (name, version, capabilities) even if it connected after init.
+    {
+        let init_event = state.initialized_event.lock().await;
+        if let Some(event) = init_event.as_ref() {
+            let json = serde_json::to_string(event).unwrap();
+            let _ = socket.send(Message::Text(json.into())).await;
+        }
+    }
 
-            // AcpClient methods acquire and release the lock internally,
-            // so we don't hold the lock across slow operations.
+    // Send session list inline (not spawned) so the frontend reliably
+    // receives it before any other events. The frontend then calls
+    // session/load which replays the full conversation history.
+    {
+        if let Err(e) = ensure_acp_client(&state).await {
+            tracing::error!("Failed to spawn ACP client for session list: {}", e);
+        } else {
             let client = {
                 let guard = state.acp_client.lock().await;
                 guard.as_ref().map(|c| c.clone())
             };
-
-            let Some(client) = client else {
-                tracing::warn!("No ACP client available for session list");
-                return;
-            };
-
-            match client.list_sessions().await {
-                Ok(sessions) => {
-                    // Send the session list to the frontend. The frontend
-                    // decides which session to load (if any) — we don't
-                    // auto-load here to avoid duplicating messages when the
-                    // frontend also requests a load on reconnect.
-                    let _ = state.acp_event_tx.send(AcpEvent::SessionList {
-                        sessions,
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("Failed to list sessions on connect: {}", e);
+            if let Some(client) = client {
+                match client.list_sessions().await {
+                    Ok(sessions) => {
+                        let json =
+                            serde_json::to_string(&AcpEvent::SessionList { sessions }).unwrap();
+                        let _ = socket.send(Message::Text(json.into())).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to list sessions on connect: {}", e);
+                    }
                 }
             }
         }
-    });
+    }
 
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(30));
 
@@ -2340,7 +2393,7 @@ async fn get_agent_profiles() -> Json<serde_json::Value> {
                 serde_json::json!({
                     "command": profile.command,
                     "env": profile.env,
-                    "is_default": agent_config.default.as_deref() == Some(name.as_str())
+                    "is_default": agent_config.default.iter().any(|s| s == name)
                 }),
             );
         }
@@ -2474,7 +2527,10 @@ fn initial_task_path(workspace: &std::path::Path) -> PathBuf {
 /// (a persistent bind mount), not in the container overlay. This
 /// survives pod-api container restarts.
 fn initial_task_already_done(workspace: &std::path::Path) -> bool {
-    workspace.join(".devaipod").join(INITIAL_TASK_DONE_FILE).exists()
+    workspace
+        .join(".devaipod")
+        .join(INITIAL_TASK_DONE_FILE)
+        .exists()
 }
 
 /// Mark the initial task as consumed so it isn't re-sent on restart.
@@ -2580,6 +2636,7 @@ pub(crate) async fn run(args: PodApiArgs) -> Result<()> {
         admin_token,
         acp_event_tx,
         acp_client: Arc::new(Mutex::new(None)),
+        initialized_event: Arc::new(Mutex::new(None)),
     };
 
     // Spawn background auto-start task: reads the initial task file (if present)
@@ -2642,10 +2699,10 @@ mod tests {
             admin_token: TEST_ADMIN_TOKEN.to_string(),
             acp_event_tx: acp_tx,
             acp_client: Arc::new(Mutex::new(None)),
+            initialized_event: Arc::new(Mutex::new(None)),
         };
         build_router(state)
     }
-
 
     // -----------------------------------------------------------------------
     // /summary endpoint tests
@@ -2734,7 +2791,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ws_command_deserialization_send_prompt() {
-        let json = r#"{"type":"send_prompt","sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#;
+        let json =
+            r#"{"type":"send_prompt","sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#;
         let cmd: WsCommand = serde_json::from_str(json).unwrap();
         match cmd {
             WsCommand::Prompt { session_id, prompt } => {
@@ -2762,7 +2820,10 @@ mod tests {
         let json = r#"{"type":"permission_response","requestId":42,"optionId":"allow_once"}"#;
         let cmd: WsCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            WsCommand::Approve { request_id, option_id } => {
+            WsCommand::Approve {
+                request_id,
+                option_id,
+            } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(option_id, "allow_once");
             }
@@ -2812,6 +2873,7 @@ mod tests {
             admin_token: TEST_ADMIN_TOKEN.to_string(),
             acp_event_tx: acp_tx,
             acp_client: Arc::new(Mutex::new(None)),
+            initialized_event: Arc::new(Mutex::new(None)),
         };
 
         // This should not panic or crash — just log a warning.
@@ -3134,7 +3196,8 @@ mod tests {
     #[test]
     fn test_ws_command_deserialization() {
         // Frontend sends camelCase with content blocks
-        let json = r#"{"type":"send_prompt","sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#;
+        let json =
+            r#"{"type":"send_prompt","sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#;
         let cmd: WsCommand = serde_json::from_str(json).unwrap();
         assert!(matches!(cmd, WsCommand::Prompt { .. }));
 

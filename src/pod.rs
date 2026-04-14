@@ -3525,6 +3525,7 @@ exec sleep infinity
         env.insert("GIT_CONFIG_KEY_0".to_string(), "safe.directory".to_string());
         env.insert("GIT_CONFIG_VALUE_0".to_string(), "*".to_string());
 
+
         let command = vec![
             "devaipod-server".to_string(),
             "pod-api".to_string(),
@@ -3549,6 +3550,26 @@ exec sleep infinity
             target: "/run/docker.sock".to_string(),
             readonly: false,
         }];
+
+        // Mount the devaipod config file into the pod-api container so it
+        // can read agent profiles for auto-detection. The mount source must
+        // be the host-side path (resolved via DEVAIPOD_HOST_HOME) since
+        // podman creates sibling containers from the host's perspective.
+        // Only mount when DEVAIPOD_HOST_HOME is set — in test environments
+        // where it's absent, the pod-api falls back to default profiles.
+        if let Ok(host_home) = std::env::var(crate::config::HOST_HOME_ENV) {
+            let host_config = format!("{}/.config/devaipod.toml", host_home);
+            // Verify the config exists inside the container before adding
+            // the mount (the host path may differ but we can't check it).
+            let config_path = crate::config::config_path();
+            if config_path.exists() {
+                mounts.push(MountConfig {
+                    source: host_config,
+                    target: "/tmp/.config/devaipod.toml".to_string(),
+                    readonly: true,
+                });
+            }
+        }
 
         // Agent workspace: bind mount if host dir, volume mount otherwise
         if is_bind_mount {
@@ -4373,13 +4394,20 @@ mod tests {
             "/mnt/main-workspace:ro"
         );
 
-        // Verify socket bind mount: source is the host path, target is canonical
-        assert_eq!(container_config.mounts.len(), 1);
+        // Verify socket bind mount: source is the host path, target is canonical.
+        // The config file mount is optional (only added if the file exists).
+        assert!(container_config.mounts.len() >= 1);
         assert_eq!(
             container_config.mounts[0].source,
             "/run/user/1000/podman/podman.sock"
         );
         assert_eq!(container_config.mounts[0].target, "/run/docker.sock");
+        // If the config file exists, verify it's mounted read-only
+        if let Some(config_mount) = container_config.mounts.iter().find(|m| {
+            m.target == "/tmp/.config/devaipod.toml"
+        }) {
+            assert!(config_mount.readonly, "config mount should be read-only");
+        }
 
         // Verify command runs pod-api with workspace container name and correct workspace path
         let cmd = container_config.command.as_ref().unwrap();

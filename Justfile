@@ -454,6 +454,19 @@ container-run: container-build
     # When no sources are configured, the launcher skips relaunching and serves
     # directly, but without port publishing. The wait loop detects this and
     # re-creates the container with port publishing.
+    # Forward env vars from the [env] allowlist in devaipod.toml so they
+    # reach the server container (which passes them to pod containers).
+    ALLOWLIST_ENV=""
+    if [ -f ~/.config/devaipod.toml ]; then
+        for key in $(grep -A100 '^\[env\]' ~/.config/devaipod.toml \
+            | grep '^allowlist' \
+            | sed 's/.*\[//;s/\].*//;s/"//g;s/,/ /g'); do
+            val="${!key:-}"
+            if [ -n "$val" ]; then
+                ALLOWLIST_ENV="$ALLOWLIST_ENV -e $key=$val"
+            fi
+        done
+    fi
     LAUNCHER="${NAME}-launcher"
     podman run -d --name "$LAUNCHER" --privileged --replace \
         $ADD_HOST \
@@ -468,10 +481,16 @@ container-run: container-build
         -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
         -v "$SSH_DIR":/run/devaipod-ssh:Z \
         $INSTANCE_ENV \
+        $ALLOWLIST_ENV \
         {{ CONTAINER_IMAGE }}:latest
     echo "Launcher started; waiting for server container '$NAME'..."
-    # The launcher always creates the server container (with or without
-    # source mounts) and then exits. Wait for it to appear.
+    # The launcher creates the server container and then exits.
+    # Wait for the launcher to finish first, then check the server.
+    if ! podman wait "$LAUNCHER" >/dev/null 2>&1; then
+        echo "WARNING: Could not wait for launcher (may have already exited)"
+    fi
+    # Poll for the server container (should exist now, but give it a moment
+    # on macOS where podman VM adds latency).
     for i in $(seq 1 30); do
         if podman inspect "$NAME" >/dev/null 2>&1; then
             break

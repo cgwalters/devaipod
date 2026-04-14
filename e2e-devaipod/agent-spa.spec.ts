@@ -216,6 +216,28 @@ test.describe("SPA agent page", () => {
     await page.waitForURL(/\/pods/)
   })
 
+  test("clicking pod from pods page navigates to /agent/ route", async ({
+    page,
+    gotoAgentSpa,
+    podShortNames,
+  }) => {
+    // Start on the agent page, then go to pods via back button
+    await gotoAgentSpa(podShortNames[0])
+    const backLink = page.locator('a[href="/pods"]')
+    await backLink.click()
+    await page.waitForURL(/\/pods/)
+
+    // Click a pod row to navigate back to the agent page
+    const podRow = page.locator(`text=${podShortNames[1]}`).first()
+    await expect(podRow).toBeVisible({ timeout: 10_000 })
+    await podRow.click()
+
+    // Should navigate to /agent/:name, NOT /_devaipod/agent/:name
+    await page.waitForURL(/\/agent\//, { timeout: 10_000 })
+    expect(page.url()).not.toContain("/_devaipod/")
+    expect(page.url()).toContain(`/agent/`)
+  })
+
   test("pod switcher shows running pods", async ({
     page,
     gotoAgentSpa,

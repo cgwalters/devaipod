@@ -612,21 +612,36 @@ impl CreateOptions {
 ///
 /// If a profile is provided, uses AcpBackend with the profile's command.
 /// Otherwise, uses ACP backend with default command `["opencode", "acp"]`.
+///
+/// The `agent_config` parameter is used to extract candidate binaries for
+/// auto-detection in the startup script.
 fn create_agent_backend(
     _name: &str,
     profile: Option<&crate::config::AgentProfile>,
+    agent_config: &crate::config::AgentConfig,
 ) -> color_eyre::Result<Box<dyn crate::agent::AgentBackend>> {
+    let candidate_binaries: Vec<String> = agent_config
+        .candidate_binaries()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
     if let Some(profile) = profile {
-        return Ok(Box::new(crate::agent_acp::AcpBackend::new(
+        return Ok(Box::new(crate::agent_acp::AcpBackend::new_with_candidates(
             profile.command.clone(),
+            candidate_binaries,
         )));
     }
 
     // No profile — use ACP backend with default opencode command
-    Ok(Box::new(crate::agent_acp::AcpBackend::new(vec![
-        "opencode".to_string(),
-        "acp".to_string(),
-    ])))
+    Ok(Box::new(crate::agent_acp::AcpBackend::new_with_candidates(
+        vec!["opencode".to_string(), "acp".to_string()],
+        if candidate_binaries.is_empty() {
+            vec!["opencode".to_string()]
+        } else {
+            candidate_binaries
+        },
+    )))
 }
 
 #[derive(Debug, Parser)]
@@ -3331,7 +3346,7 @@ async fn create_workspace_from_local(
 
     // Create agent backend
     let (agent_name, agent_profile) = config.agent.resolve_profile(None);
-    let backend = create_agent_backend(&agent_name, agent_profile)?;
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
 
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -3432,7 +3447,7 @@ async fn create_workspace_without_source(
 
     // Create agent backend
     let (agent_name, agent_profile) = config.agent.resolve_profile(None);
-    let backend = create_agent_backend(&agent_name, agent_profile)?;
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
 
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -3637,7 +3652,7 @@ async fn create_workspace_from_remote(
 
     // Create agent backend
     let (agent_name, agent_profile) = config.agent.resolve_profile(None);
-    let backend = create_agent_backend(&agent_name, agent_profile)?;
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
 
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
@@ -3823,7 +3838,7 @@ async fn create_workspace_from_pr(
 
     // Create agent backend
     let (agent_name, agent_profile) = config.agent.resolve_profile(None);
-    let backend = create_agent_backend(&agent_name, agent_profile)?;
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
 
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
@@ -8074,7 +8089,7 @@ async fn cmd_rebuild(
 
     // Create agent backend
     let (agent_name, agent_profile) = config.agent.resolve_profile(None);
-    let backend = create_agent_backend(&agent_name, agent_profile)?;
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
 
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
@@ -9754,7 +9769,8 @@ mod tests {
     #[test]
     fn test_create_agent_backend_any_name_returns_acp() {
         // All agents use ACP now — name is informational
-        let backend = create_agent_backend("anything", None).unwrap();
+        let agent_config = crate::config::AgentConfig::default();
+        let backend = create_agent_backend("anything", None, &agent_config).unwrap();
         assert_eq!(backend.name(), "acp");
     }
 
@@ -9766,7 +9782,8 @@ mod tests {
             command: vec!["goose".to_string(), "acp".to_string()],
             env,
         };
-        let backend = create_agent_backend("goose", Some(&profile)).unwrap();
+        let agent_config = crate::config::AgentConfig::default();
+        let backend = create_agent_backend("goose", Some(&profile), &agent_config).unwrap();
         assert_eq!(backend.name(), "acp");
     }
 }

@@ -450,7 +450,7 @@ function AcpContent() {
               data-testid="agent-info"
               title={`Agent: ${info().name} v${info().version}`}
             >
-              {info().name} <span class="opacity-50">v{info().version}</span>
+              {info().title || info().name} <span class="opacity-50">v{info().version}</span>
             </span>
           )}
         </Show>
@@ -969,7 +969,7 @@ function SessionPane(props: { sessionId: string; podName: string }) {
                 </Show>
               }>
                 <Show when={sessionData().messages.find((m) => m.id === entry.id)}>
-                  {(msg) => <MessageBubble message={msg()} />}
+                  {(msg) => <MessageBubble message={msg()} agentName={acp.agentInfo?.title || acp.agentInfo?.name} />}
                 </Show>
               </Show>
             )}
@@ -1116,13 +1116,13 @@ function ConnectionIndicator(props: { state: ConnectionState }) {
 // Message bubble
 // ---------------------------------------------------------------------------
 
-function MessageBubble(props: { message: AcpMessage }) {
+function MessageBubble(props: { message: AcpMessage; agentName?: string }) {
   const roleLabel = () => {
     switch (props.message.role) {
       case "user":
         return "You"
       case "assistant":
-        return "Assistant"
+        return props.agentName || "Assistant"
       case "thought":
         return "Thinking"
     }
@@ -1520,7 +1520,10 @@ function PromptBar(props: {
     <div class="relative border-t border-border-base shrink-0" data-testid="prompt-bar">
       {/* Slash command menu */}
       <Show when={showSlashMenu() && filteredCommands().length > 0}>
-        <div class="absolute bottom-full left-3 right-3 mb-1 bg-surface-base border border-border-base rounded-md shadow-lg max-h-48 overflow-y-auto z-10">
+        <div
+          class="absolute bottom-full left-3 right-3 mb-1 border border-border-base rounded-md max-h-48 overflow-y-auto z-10"
+          style={{ "background-color": "#2a2323", "box-shadow": "0 8px 24px rgba(0,0,0,0.5)" }}
+        >
           <For each={filteredCommands()}>
             {(cmd, idx) => (
               <button
