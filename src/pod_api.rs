@@ -3187,9 +3187,4 @@ mod tests {
         assert_eq!(opencode["command"], serde_json::json!(["opencode", "acp"]));
         assert_eq!(opencode["is_default"], true);
     }
-
-    // -----------------------------------------------------------------------
-    // ACP WebSocket command parsing tests
-    // -----------------------------------------------------------------------
-
 }
