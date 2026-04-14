@@ -6,9 +6,6 @@
 //! - ACP (Agent Client Protocol) over stdio (`agent_acp.rs`)
 //!
 //! The trait is object-safe so it can be used as `Box<dyn AgentBackend>`.
-//!
-//! These types are defined now (Phase 1) but will be wired into pod_api
-//! and pod.rs in Phase 2.
 
 use serde::Serialize;
 
@@ -16,12 +13,11 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum AgentActivity {
     /// Agent is actively processing a request or running tools.
-    #[allow(dead_code)] // Used by OpenCode backend, kept for future use
     Working,
     /// Agent is idle, waiting for input.
     Idle,
     /// Agent is stopped or not running.
-    #[allow(dead_code)] // Used by ACP backend in Phase 3
+    #[allow(dead_code)] // Returned in API JSON but not yet constructed in Rust code
     Stopped,
     /// Agent state cannot be determined.
     Unknown,

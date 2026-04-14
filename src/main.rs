@@ -630,10 +630,11 @@ impl CreateOptions {
 /// The `agent_config` parameter is used to extract candidate binaries for
 /// auto-detection in the startup script.
 fn create_agent_backend(
-    _name: &str,
+    name: &str,
     profile: Option<&crate::config::AgentProfile>,
     agent_config: &crate::config::AgentConfig,
 ) -> color_eyre::Result<Box<dyn crate::agent::AgentBackend>> {
+    tracing::debug!("Creating agent backend for profile '{name}'");
     let candidate_binaries: Vec<String> = agent_config
         .candidate_binaries()
         .into_iter()

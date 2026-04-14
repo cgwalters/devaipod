@@ -1,9 +1,10 @@
-//! ACP (Agent Client Protocol) backend stub.
+//! ACP (Agent Client Protocol) backend.
 //!
 //! This module implements [`AgentBackend`] for the ACP protocol over stdio.
-//! It is currently a stub that compiles but does not perform real ACP
-//! communication. Phase 2 will wire it up to spawn the agent process and
-//! manage JSON-RPC sessions.
+//! Pod-api spawns the agent process via `podman exec -i` and communicates
+//! using JSON-RPC 2.0 through [`crate::acp_client::AcpClient`]. This
+//! backend provides container startup configuration and environment
+//! variables; the actual ACP session management lives in `acp_client.rs`.
 //!
 //! ACP is an open standard (Apache-2.0, JSON-RPC 2.0 over stdio) that
 //! standardizes communication between frontends and coding agents. See
@@ -16,17 +17,14 @@ use crate::agent::{
 
 /// ACP backend over stdio.
 ///
-/// When fully implemented (Phase 2), this backend will:
-/// - Spawn the agent process with ACP over stdio
-/// - Manage JSON-RPC sessions
-/// - Track agent status from ACP event notifications
-/// - Expose events over WebSocket for the frontend
-///
-/// Currently this is a compilable stub returning placeholder values.
+/// Provides container startup configuration (keep-alive loop, binary
+/// pre-flight check, mock agent injection) and agent-specific environment
+/// variables. The actual ACP session management is handled by
+/// [`crate::acp_client::AcpClient`] in pod-api.
 #[derive(Debug, Clone)]
 pub(crate) struct AcpBackend {
     /// The command to start the agent (e.g., `["opencode", "acp"]`).
-    #[allow(dead_code)] // Will be used in Phase 2
+    #[allow(dead_code)] // Used by ensure_acp_client via config, not directly here
     command: Vec<String>,
     /// Candidate binary names for availability checking in the startup script.
     /// These are the first element of each candidate profile's command.
