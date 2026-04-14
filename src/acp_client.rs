@@ -540,11 +540,29 @@ impl AcpClient {
         let _ = stdin_lock.flush().await;
     }
 
+    /// Default timeout for JSON-RPC requests.
+    const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Longer timeout for initialization (agent may need to download models,
+    /// install packages, etc. on first run).
+    const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// Send a JSON-RPC request and wait for the response.
     async fn request<T: Serialize>(
         &self,
         method: &str,
         params: Option<T>,
+    ) -> Result<Box<serde_json::value::RawValue>, JsonRpcError> {
+        self.request_with_timeout(method, params, Self::DEFAULT_TIMEOUT)
+            .await
+    }
+
+    /// Send a JSON-RPC request with a custom timeout.
+    async fn request_with_timeout<T: Serialize>(
+        &self,
+        method: &str,
+        params: Option<T>,
+        timeout: std::time::Duration,
     ) -> Result<Box<serde_json::value::RawValue>, JsonRpcError> {
         let id = self
             .next_id
@@ -586,7 +604,7 @@ impl AcpClient {
         }
 
         // Wait for the response with a timeout.
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(JsonRpcError {
                 code: -32603,
@@ -599,7 +617,7 @@ impl AcpClient {
                 pending.remove(&id);
                 Err(JsonRpcError {
                     code: -32603,
-                    message: "Request timed out after 30s".to_string(),
+                    message: format!("Request timed out after {}s", timeout.as_secs()),
                     data: None,
                 })
             }
@@ -615,7 +633,9 @@ impl AcpClient {
             .client_info(Implementation::new("devaipod", env!("CARGO_PKG_VERSION")))
             .client_capabilities(ClientCapabilities::default());
 
-        let raw = self.request("initialize", Some(req)).await?;
+        let raw = self
+            .request_with_timeout("initialize", Some(req), Self::INIT_TIMEOUT)
+            .await?;
         let resp: serde_json::Value =
             serde_json::from_str(raw.get()).map_err(|e| JsonRpcError {
                 code: -32603,
@@ -737,21 +757,21 @@ impl AcpClient {
                         .and_then(|s| s.as_str())
                         .unwrap_or("end_turn")
                         .to_string();
-                    prompt_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    prompt_flag.store(false, std::sync::atomic::Ordering::Release);
                     let _ = event_tx.send(AcpEvent::PromptCompleted {
                         session_id: sid,
                         stop_reason,
                     });
                 }
                 Ok(Err(e)) => {
-                    prompt_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    prompt_flag.store(false, std::sync::atomic::Ordering::Release);
                     tracing::error!("Prompt response error: {}", e);
                     let _ = event_tx.send(AcpEvent::Error {
                         message: format!("Prompt failed: {}", e),
                     });
                 }
                 Err(_) => {
-                    prompt_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    prompt_flag.store(false, std::sync::atomic::Ordering::Release);
                     tracing::error!("Prompt response channel closed");
                 }
             }
@@ -761,14 +781,14 @@ impl AcpClient {
         // is processing but agent_active is false (the response handler on
         // another task could clear it before we set it if we wrote first).
         self.agent_active
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // Send the request (don't wait for response).
         {
             let mut stdin = self.stdin.lock().await;
             if let Err(e) = stdin.write_all(line.as_bytes()).await {
                 self.agent_active
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                    .store(false, std::sync::atomic::Ordering::Release);
                 return Err(JsonRpcError {
                     code: -32603,
                     message: format!("Failed to write to agent stdin: {}", e),
@@ -777,7 +797,7 @@ impl AcpClient {
             }
             if let Err(e) = stdin.flush().await {
                 self.agent_active
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                    .store(false, std::sync::atomic::Ordering::Release);
                 return Err(JsonRpcError {
                     code: -32603,
                     message: format!("Failed to flush agent stdin: {}", e),
@@ -822,7 +842,7 @@ impl AcpClient {
 
     /// Whether the agent is currently processing a prompt.
     pub(crate) fn is_working(&self) -> bool {
-        self.agent_active.load(std::sync::atomic::Ordering::Relaxed)
+        self.agent_active.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Get the current session ID (if any).
@@ -914,7 +934,7 @@ impl AcpClient {
                 Ok(Ok(raw)) => {
                     tracing::debug!("Session load completed");
                     // Ensure agent_active is cleared after load completes.
-                    load_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    load_flag.store(false, std::sync::atomic::Ordering::Release);
                     // Extract modes and configOptions from the response.
                     if let Ok(resp) = serde_json::from_str::<serde_json::Value>(raw.get()) {
                         if let Some(modes) = resp.get("modes") {
@@ -939,11 +959,11 @@ impl AcpClient {
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Session load error: {}", e);
-                    load_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    load_flag.store(false, std::sync::atomic::Ordering::Release);
                 }
                 Err(_) => {
                     tracing::error!("Session load response channel closed");
-                    load_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    load_flag.store(false, std::sync::atomic::Ordering::Release);
                 }
             }
         });
@@ -970,12 +990,27 @@ impl AcpClient {
     }
 
     /// Kill the child process (no-op for test clients without a child).
-    #[allow(dead_code)] // Used in integration tests
     pub(crate) async fn kill(&self) {
         if let Some(child) = &self.child {
             let mut child = child.lock().await;
             let _ = child.kill().await;
         }
+    }
+
+    /// Shut down this client: kill the child process and close stdin.
+    ///
+    /// Call this explicitly before dropping a client that owns a child
+    /// process (e.g. when replacing a stale client in `ensure_acp_client`).
+    /// We can't rely on `Drop` because `AcpClient` is `Clone` (all fields
+    /// are `Arc`), so dropping one clone won't necessarily kill the process.
+    pub(crate) async fn shutdown(&self) {
+        // Close stdin first so the agent sees EOF and can exit gracefully.
+        {
+            let mut stdin = self.stdin.lock().await;
+            let _ = stdin.shutdown().await;
+        }
+        // Then kill the child if it's still running.
+        self.kill().await;
     }
 }
 

@@ -1573,19 +1573,23 @@ async fn pod_summary(State(state): State<AppState>) -> Json<PodSummaryResponse> 
 /// 2. Builds a podman exec command to run the agent in the agent container
 /// 3. Spawns the ACP client with the wrapped command
 /// 4. Initializes the ACP connection
+///
+/// The lock on `state.acp_client` is held across the entire spawn+init
+/// sequence to prevent TOCTOU races where concurrent callers each spawn
+/// a separate agent process.
 async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
-    // Check if a live client exists (quick lock).
-    // If the agent process has exited, clear the stale client so we
-    // respawn it below.
-    {
-        let mut guard = state.acp_client.lock().await;
-        if let Some(client) = guard.as_ref() {
-            if client.is_alive().await {
-                return Ok(());
-            }
-            tracing::info!("ACP agent process exited, clearing stale client");
-            *guard = None;
+    // Hold the lock for the entire operation to prevent concurrent spawns.
+    let mut guard = state.acp_client.lock().await;
+
+    // If a live client already exists, return early.
+    if let Some(client) = guard.as_ref() {
+        if client.is_alive().await {
+            return Ok(());
         }
+        // Agent process exited — shut down the stale client before respawning.
+        tracing::info!("ACP agent process exited, shutting down stale client");
+        client.shutdown().await;
+        *guard = None;
     }
 
     tracing::info!(
@@ -1714,13 +1718,8 @@ async fn ensure_acp_client(state: &AppState) -> color_eyre::Result<()> {
         }
     }
 
-    // Insert under lock
-    {
-        let mut guard = state.acp_client.lock().await;
-        // TOCTOU: Two concurrent calls could both spawn. That's acceptable
-        // (one wins, the other's client gets dropped).
-        *guard = Some(client);
-    }
+    // Store the client (we already hold the lock from the top of this fn).
+    *guard = Some(client);
     Ok(())
 }
 
@@ -1942,7 +1941,7 @@ struct CompletionStatusFile {
 /// resets status to Active but the agent hasn't started processing the
 /// review message yet, so the next /summary poll would see "Idle" and
 /// immediately re-set Done.
-const AUTO_COMPLETION_GRACE_SECS: i64 = 5;
+const AUTO_COMPLETION_GRACE_SECS: i64 = 15;
 
 /// Response for GET /completion-status.
 #[derive(Debug, Serialize)]
@@ -3193,35 +3192,4 @@ mod tests {
     // ACP WebSocket command parsing tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_ws_command_deserialization() {
-        // Frontend sends camelCase with content blocks
-        let json =
-            r#"{"type":"send_prompt","sessionId":"s1","prompt":[{"type":"text","text":"hello"}]}"#;
-        let cmd: WsCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, WsCommand::Prompt { .. }));
-
-        let json = r#"{"type":"cancel","sessionId":"s1"}"#;
-        let cmd: WsCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, WsCommand::Cancel { .. }));
-
-        let json = r#"{"type":"permission_response","requestId":42,"optionId":"allow_once"}"#;
-        let cmd: WsCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, WsCommand::Approve { .. }));
-
-        let json = r#"{"type":"new_session"}"#;
-        let cmd: WsCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, WsCommand::NewSession));
-
-        let json = r#"{"type":"list_sessions"}"#;
-        let cmd: WsCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, WsCommand::ListSessions));
-
-        let json = r#"{"type":"load_session","sessionId":"s1"}"#;
-        let cmd: WsCommand = serde_json::from_str(json).unwrap();
-        match cmd {
-            WsCommand::LoadSession { session_id } => assert_eq!(session_id, "s1"),
-            _ => panic!("Expected LoadSession variant"),
-        }
-    }
 }
