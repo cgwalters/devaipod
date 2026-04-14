@@ -2,32 +2,26 @@
 
 ## Before you start
 
-devaipod is opinionated, but also is designed to be very configurable
-about the execution environment.
+devaipod is opinionated but highly configurable about the execution environment.
 
 ### devcontainer required
 
-A core assumption of this project is that your software needs *your tools*;
-your version of npm/Rust/Go etc. using your preferred base OS.
+Your software needs *your tools* -- your version of npm/Rust/Go etc. on your preferred base OS.
 
-The default solution from this project is [devcontainers](https://containers.dev/).
-In particular, you must have a container image with opencode and git installed
-alongside your tools.
+Devaipod uses [devcontainers](https://containers.dev/) to provide this.
+Your container image must include git and an ACP-compatible agent (OpenCode, Goose, Claude Code) alongside your tools.
 
-### OpenCode configuration strongly encouraged
+### Agent selection
 
-While OpenCode does run out of the box with a $0 "Zen" model,
-a foundational assumption of this project is that in general, you
-will want to configure at least the provider to use your organization's
-model(s).
+Devaipod supports multiple agents via the Agent Client Protocol (ACP). Configure your preferred agent in `~/.config/devaipod.toml` or use auto-detection with a multi-agent devcontainer image. See [Configuration -- Agent Configuration](configuration.md#agent-configuration) for setup.
 
-Further, the author of this project is very strongly of the opinion
-that *everyone* should write an [AGENTS.md](https://agents.md/) that
-defines your style and rules - don't just accept stock model output!
+### Agent configuration strongly encouraged
 
-The encouraged solution to both of these is to create a "dotfiles"
-git repository. This is not a new concept, it's already supported
-by popular devcontainer tools, and this project is one of them.
+Most agents work with default models, but you will want to configure your organization's model provider and preferences.
+
+Write an [AGENTS.md](https://agents.md/) that defines your style and rules. Do not accept stock model output.
+
+Create a "dotfiles" git repository for your configuration. Dotfiles repos are standard in devcontainer tools, and devaipod supports them.
 
 ### Example dotfiles with opencode config
 
@@ -45,9 +39,8 @@ by popular devcontainer tools, and this project is one of them.
 ### Install the host CLI
 
 The `devaipod` CLI is a thin host-side binary that manages the server
-container and proxies commands into it. It translates your working
-directory paths so commands like `devaipod diff` work from any source
-repository on the host.
+container and proxies commands into it. It translates working directory
+paths so `devaipod diff` works from any source repository on the host.
 
 **From a release tarball** (Linux and macOS, x86_64 and aarch64):
 
@@ -78,7 +71,7 @@ just install-host-shim
 ### Create podman secrets
 
 devaipod passes credentials to agent containers via podman secrets.
-Create at least your LLM API key:
+Create your LLM API key at minimum:
 
 ```bash
 echo "$ANTHROPIC_API_KEY" | podman secret create anthropic_api_key -
@@ -88,7 +81,7 @@ echo "$GH_TOKEN" | podman secret create gh_token -
 
 > **macOS note:** On macOS with podman machine, verify secrets are visible
 > inside the VM with `podman secret list`. If you switched machines or
-> secrets aren't showing up, you may need to recreate them.
+> secrets are missing, recreate them.
 
 > **GHCR note:** If you get a 403 pulling `ghcr.io/cgwalters/service-gator`,
 > you may need to authenticate: `podman login ghcr.io`
@@ -113,8 +106,8 @@ src = "~/src"
 ```
 
 The `[sources]` section tells devaipod which host directories contain
-your git repositories. See [Configuration — Sources](configuration.md#sources)
-for access levels and advanced options.
+your git repositories. See [Configuration -- Sources](configuration.md#sources)
+for access levels and options.
 
 ## Starting the server
 
@@ -123,8 +116,8 @@ devaipod server start
 ```
 
 This creates a launcher container that reads your config, resolves
-`[sources]` mounts, and starts the devaipod server container with the
-right bind mounts. The web UI is available at <http://127.0.0.1:8080/>.
+`[sources]` mounts, and starts the devaipod server with the correct
+bind mounts. The web UI is at <http://127.0.0.1:8080/>.
 
 Options:
 
@@ -135,18 +128,18 @@ devaipod server status                                # check if running
 devaipod server stop                                  # stop and remove containers
 ```
 
-The default image is `ghcr.io/cgwalters/devaipod:latest` (the published
-production image). To use a locally-built image instead, either pass
-`--image`, set `DEVAIPOD_IMAGE`, or add `image = "localhost/devaipod:latest"`
-to your `devaipod.toml`. Resolution order: `--image` flag >
-`DEVAIPOD_IMAGE` env var > config file `image` > compiled default.
+The default image is `ghcr.io/cgwalters/devaipod:latest`. To use a
+local build, pass `--image`, set `DEVAIPOD_IMAGE`, or add
+`image = "localhost/devaipod:latest"` to your `devaipod.toml`.
+Resolution order: `--image` flag > `DEVAIPOD_IMAGE` env var >
+config file `image` > compiled default.
 
 ## Running tasks
 
 The web UI at <http://127.0.0.1:8080/> is the primary interface for
-creating workspaces, launching tasks, and monitoring agent progress.
+creating workspaces, launching tasks, and monitoring agents.
 
-The CLI works from anywhere on the host — the shim translates your cwd
+The CLI works from anywhere on the host. The shim translates your cwd
 and proxies commands into the server container:
 
 ```bash
@@ -179,8 +172,8 @@ devaipod fetch         # fetch agent commits into local branches
 ```
 
 These commands use git's `ext::` transport to tunnel through `podman exec`
-into the agent container, so they work even when the workspace volume
-uses container-internal paths.
+into the agent container, working even when the workspace volume uses
+container-internal paths.
 
 ### TUI and shell access
 
@@ -197,9 +190,9 @@ devaipod exec <workspace> -W
 
 ## Service-gator: GitHub Access for the Agent
 
-[service-gator](service-gator.md) provides scope-controlled GitHub access (read PRs/issues, create drafts, etc.) to the AI agent without exposing your `GH_TOKEN` directly.
+[service-gator](service-gator.md) gives the AI agent scope-controlled GitHub access (read PRs/issues, create drafts, etc.) without exposing your `GH_TOKEN`.
 
-**Automatic for GitHub URLs:** When you run `devaipod run https://github.com/...` or `devaipod run https://github.com/.../pull/123`, service-gator is auto-enabled with **read + draft PR** permissions for that repository.
+**Automatic for GitHub URLs:** `devaipod run https://github.com/...` or `devaipod run https://github.com/.../pull/123` auto-enables service-gator with **read + draft PR** permissions for that repository.
 
 **Recommended: Global read-only config.** Create a podman secret for your GitHub token (`echo 'ghp_...' | podman secret create gh_token -`), then add to `~/.config/devaipod.toml`:
 
@@ -215,13 +208,13 @@ This gives all pods read-only access to all GitHub data (repos, search, gists, G
 
 ## Editor integration via SSH
 
-Each devaipod workspace runs an embedded SSH server, allowing you to connect
-with editors that support SSH remoting (Zed, VSCode, Cursor, etc.). This lets
-you interrupt an autonomous task and take manual control of the codebase.
+Each devaipod workspace runs an embedded SSH server. Connect with any editor
+that supports SSH remoting (Zed, VSCode, Cursor, etc.) to interrupt an
+autonomous task and take manual control of the codebase.
 
-To export SSH configs from the container to the host, bind-mount a directory
-to `/run/devaipod-ssh` when starting the daemon. The `devaipod server start`
-command does this automatically at `~/.ssh/config.d/devaipod/`.
+To export SSH configs to the host, bind-mount a directory to
+`/run/devaipod-ssh` when starting the daemon. `devaipod server start`
+does this automatically at `~/.ssh/config.d/devaipod/`.
 
 Add to the top of `~/.ssh/config`:
 
@@ -238,8 +231,8 @@ zed ssh://devaipod-<workspace>
 code --remote ssh-remote+devaipod-<workspace> /workspaces/<project>
 ```
 
-The SSH connection goes to the workspace container, which has full access to
-credentials for manual development work.
+The SSH connection reaches the workspace container, which has full access to
+credentials for manual development.
 
 ## Stopping and cleanup
 
@@ -248,8 +241,8 @@ devaipod server stop
 ```
 
 This stops and removes both the server and launcher containers.
-Workspace pods persist independently and continue running even if the
-server is stopped.
+Workspace pods persist independently and keep running even after the
+server stops.
 
 ## Architecture
 
@@ -276,20 +269,19 @@ server is stopped.
 
 The host CLI shim proxies commands into the server container via
 `podman exec`, translating host source paths to container mount paths.
-The server container uses podman-remote to create "sibling" workspace
-pods on the host.
+The server uses podman-remote to create "sibling" workspace pods on
+the host.
 
-Users interact through the **control plane web UI at :8080**, which is
-authenticated by default (a login token is generated on first start and
+Users interact through the **control plane web UI at :8080**, which
+requires authentication (a login token is generated on first start and
 printed to the container logs). The control plane manages pod lifecycle
 and embeds each pod's agent UI in an iframe.
 
 ## Manual setup (without the CLI shim)
 
-If you prefer not to install the host shim, you can start the server
-container directly with `podman run` and use `podman exec` for CLI
-commands. See the Justfile's `container-run` target for the full
-invocation, or expand below:
+Without the host shim, start the server container directly with
+`podman run` and use `podman exec` for CLI commands. See the Justfile's
+`container-run` target for the full invocation, or expand below:
 
 <details>
 <summary>Manual podman run commands</summary>
@@ -333,7 +325,7 @@ podman exec -ti devaipod devaipod attach <workspace>
 
 ## Limitations
 
-- **No `bind_home`** - the `[bind_home]` config option is not supported; use `[trusted.secrets]` instead
+- **No `bind_home`** -- use `[trusted.secrets]` instead
 
 ## Building from source
 
@@ -345,9 +337,9 @@ just container-build
 podman build -t localhost/devaipod -f Containerfile .
 ```
 
-The multi-stage Containerfile builds devaipod from source using CentOS
-Stream 10 and creates a minimal runtime image with `podman-remote`, `git`,
-`tmux`, and `openssh-clients`.
+The multi-stage Containerfile builds devaipod from source on CentOS
+Stream 10 and produces a minimal runtime image with `podman-remote`,
+`git`, `tmux`, and `openssh-clients`.
 
 To build the host CLI shim:
 
