@@ -5,8 +5,9 @@ Each devaipod workspace is a **podman pod** with several containers:
 | Container | Role |
 |-----------|------|
 | `agent` | Runs the AI agent (OpenCode, Goose, or Claude Code); has its own workspace copy |
-| `gator` | [service-gator](https://github.com/cgwalters/service-gator) — fine-grained MCP server for GitHub/GitLab/Forgejo |
+| `gator` | *(optional)* [service-gator](https://github.com/cgwalters/service-gator) — fine-grained MCP server for GitHub/GitLab/Forgejo |
 | `api` | **pod-api** sidecar — ACP client, WebSocket event bridge, HTTP API for git/status |
+| `worker` | *(optional, orchestration mode)* Second agent for multi-agent task delegation |
 
 All containers in a pod share the network namespace (localhost communication).
 The `api` container exposes a `/healthz` endpoint with a podman healthcheck.
@@ -65,22 +66,49 @@ Both the TUI and the web frontend use the same REST API
 (`/api/devaipod/pods`, `/api/devaipod/workspaces`, etc.) as their
 data source, ensuring consistent behavior across interfaces.
 
+The control plane proxies per-pod requests to each pod-api sidecar.
+When the frontend calls `/api/devaipod/pods/{name}/pod-api/...`, the
+control plane discovers the pod-api's published host port via container
+inspection and forwards the request (including WebSocket upgrades) to
+the sidecar. This means the frontend never connects directly to
+pod-api; all traffic flows through the control plane.
+
 ## Agent Client Protocol (ACP)
 
-Pod-api acts as an ACP client, communicating with agents via JSON-RPC over stdio. The transport spawns the agent process with `podman exec -i <agent-container> <command>` and pipes JSON-RPC messages over stdin/stdout.
+Pod-api acts as an ACP client, communicating with agents via JSON-RPC
+over stdio. The end-to-end data flow for a user prompt looks like:
 
-`AcpClient` in `src/acp_client.rs` manages the protocol:
+```
+browser (SolidJS)
+  │  WebSocket
+  ▼
+control plane (devaipod web :8080)
+  │  HTTP proxy (discovers pod-api port via container inspect)
+  ▼
+pod-api sidecar (/ws/events)
+  │  JSON-RPC over stdin/stdout
+  │  via: podman exec -i <agent-container> <command>
+  ▼
+agent process (opencode acp / goose acp / claude-agent-acp)
+```
 
-- Spawns the agent process (`opencode acp`, `goose acp`, `claude-agent-acp`)
-- Sends JSON-RPC requests and notifications
-- Reads JSON-RPC responses and `session/update` notifications line-by-line
-- Broadcasts ACP events to WebSocket subscribers at `/ws/events`
+The transport spawns the agent process with `podman exec -i` and pipes
+JSON-RPC messages over stdin/stdout. `AcpClient` in `src/acp_client.rs`
+manages the protocol: it sends requests and notifications to the agent's
+stdin and reads JSON-RPC responses and `session/update` notifications
+line-by-line from stdout. These events are broadcast to WebSocket
+subscribers at `/ws/events`, so the frontend sees progress in real time.
 
-Agent profile resolution: config `[agent].default` → probe agent container for each candidate → fall back to `["opencode", "acp"]`. Auto-detection runs `command -v <binary>` in the agent container to check availability.
+Agent profile resolution: config `[agent].default` → probe agent
+container for each candidate → fall back to `["opencode", "acp"]`.
+Auto-detection runs `command -v <binary>` in the agent container to
+check availability.
 
-`is_alive()` detects dead agents by calling `try_wait()` on the child process handle. When `ensure_acp_client()` finds a dead process, it clears the stale client and spawns a new one on the next request.
+`is_alive()` detects dead agents by calling `try_wait()` on the child
+process handle. When `ensure_acp_client()` finds a dead process, it
+clears the stale client and spawns a new one on the next request.
 
-WebSocket clients subscribe to `/ws/events` and receive updates as the agent works. The frontend renders messages, tool calls, and permission requests in a multi-pane interface. See [ACP Support](acp.md) for protocol details.
+See [ACP Support](acp.md) for protocol details and agent configuration.
 
 ## Tracing
 
