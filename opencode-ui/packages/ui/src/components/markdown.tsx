@@ -229,7 +229,6 @@ export function Markdown(
       onBeforeNodeDiscarded: (node) => {
         if (node instanceof Element) {
           if (node.getAttribute("data-slot") === "markdown-copy-button") return false
-          if (node.getAttribute("data-component") === "markdown-code") return false
         }
         return true
       },

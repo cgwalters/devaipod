@@ -1,6 +1,6 @@
 # Configuration
 
-devaipod is configured via `~/.config/devaipod.toml` and per-project `devcontainer.json` files.
+Configure devaipod through `~/.config/devaipod.toml` and per-project `devcontainer.json` files.
 
 ## Global Configuration
 
@@ -57,10 +57,9 @@ port = 8765
 ## Sources
 
 The `[sources]` section declares host directories that devaipod mounts
-into the server container. This enables the CLI shim to translate your
-working directory (`~/src/github/org/repo` → `/mnt/src/github/org/repo`)
-and is required for `devaipod diff`, `devaipod fetch`, and the
-`src:<name>/<subpath>` shorthand.
+into the server container. The CLI shim uses these to translate your
+working directory (`~/src/github/org/repo` → `/mnt/src/github/org/repo`).
+Required for `devaipod diff`, `devaipod fetch`, and the `src:<name>/<subpath>` shorthand.
 
 ### Basic usage
 
@@ -70,15 +69,15 @@ src = "~/src"
 ```
 
 This mounts `~/src` at `/mnt/src` inside the server container (read-write,
-but only visible to the server — not to agents). With this config,
-running `devaipod fetch` from `~/src/github/org/repo` on the host
-fetches agent branches directly into your local repo, and `devaipod diff`
-Just Works.
+visible only to the server -- not agents). With this config,
+`devaipod fetch` from `~/src/github/org/repo` on the host
+fetches agent branches into your local repo, and `devaipod diff`
+works immediately.
 
 ### Access levels
 
-Each source can specify an access level that controls where it's mounted
-and whether it's writable:
+Each source can specify an access level controlling mount location
+and write permissions:
 
 ```toml
 [sources]
@@ -97,14 +96,13 @@ shared = { path = "~/shared", access = "agent" }        # r/w in agents too
 | `readonly` | mounted `:ro` | not mounted |
 | `agent` | mounted r/w | mounted r/w |
 
-The `controlplane` default means `devaipod fetch` can write remotes and
-fetch branches directly into your local git repos. Agents never see these
-mounts, so there is no risk of the AI modifying your source trees.
+The `controlplane` default lets `devaipod fetch` write remotes and
+fetch branches into your local git repos. Agents never see these
+mounts, so the AI cannot modify your source trees.
 
 ### Source shorthand in CLI
 
-With sources configured, you can reference repos by source name instead
-of full URLs:
+With sources configured, reference repos by source name instead of full URLs:
 
 ```bash
 # Instead of: devaipod run https://github.com/org/repo -c 'fix bug'
@@ -119,8 +117,8 @@ on the host.
 
 The `bind` array provides generic bind mounts using the same
 `source:target[:options]` syntax as `podman -v` / `docker -v`.
-Unlike `[sources]`, these have no git awareness or CWD translation —
-they are passed directly to all containers (server, workspace, and agent).
+Unlike `[sources]`, these lack git awareness and CWD translation --
+they pass directly to all containers (server, workspace, and agent).
 
 ```toml
 bind = [
@@ -129,31 +127,73 @@ bind = [
 ]
 ```
 
-Tilde in the source path is expanded to the host home directory.
-Options like `ro`, `Z`, `U` are passed through to podman as-is.
+Tilde in the source path expands to the host home directory.
+Options like `ro`, `Z`, `U` pass through to podman as-is.
 
 **Important:** `bind` must appear before any `[section]` header in
-your config file, or in its own section-less area. TOML scoping means
-that `bind = [...]` placed after `[sources]` would be interpreted as
-`sources.bind` (a source named "bind"), not the top-level bind array.
-devaipod detects and warns about this, but the bind mounts won't take
-effect.
+your config file. TOML scoping means `bind = [...]` after `[sources]`
+becomes `sources.bind` (a source named "bind"), not the top-level
+bind array. Devaipod warns about this, but the bind mounts will not
+take effect.
 
 Use `[sources]` for git source trees (enables `fetch`, `diff`, CWD
 translation). Use `bind` for everything else (data directories,
 caches, toolchains).
 
+## Agent Configuration
+
+Devaipod supports any ACP-compatible coding agent. Configure agent
+profiles in `~/.config/devaipod.toml`:
+
+```toml
+[agent]
+default = ["my-preferred-agent", "fallback-agent"]
+
+[agent.profiles.my-preferred-agent]
+command = ["my-agent", "acp"]
+
+[agent.profiles.my-preferred-agent.env]
+MY_AGENT_MODE = "auto"
+```
+
+### Agent Selection
+
+The `default` field specifies which agent to use. It accepts:
+
+- A single string: `default = "my-agent"`
+- An ordered array: `default = ["first-choice", "second-choice"]`
+
+When multiple profiles are listed, devaipod probes the agent container
+for each binary in order and selects the first one found.
+
+### Profile Definition
+
+Each profile under `[agent.profiles.<name>]` defines:
+
+- `command`: Array of strings, the command to start the agent's ACP mode
+- `env`: Optional environment variables (model selection, permissions, etc.)
+
+See [Supported Agents](agents.md) for tested configurations.
+
+Agent-specific config files (model, MCP servers, etc.) belong in the agent's config directory, referenced by env vars if needed. Devaipod never writes agent config files -- the user maintains agent configurations.
+
+### Container Image Requirements
+
+The devcontainer image must include the agent binary and your
+development tools (compilers, linters, etc.). Set the `image` field
+in your project's `devcontainer.json` accordingly.
+
 ## Using Without devcontainer.json
 
-Not all repositories include a `devcontainer.json`. The recommended approach is to
-put a default `devcontainer.json` in your dotfiles repository. When a project has no
-devcontainer.json, devaipod automatically checks your dotfiles repo for one.
+Not all repositories include a `devcontainer.json`. Put a default
+`devcontainer.json` in your dotfiles repository. When a project lacks one,
+devaipod checks your dotfiles repo automatically.
 
 **Dotfiles devcontainer.json** (recommended)
 
 Add a `.devcontainer/devcontainer.json` to your dotfiles repo (configured via
-`[dotfiles]` in devaipod.toml). This is the natural place for user-level defaults
-like your preferred image, nested container support, and lifecycle commands:
+`[dotfiles]` in devaipod.toml) for user-level defaults like your preferred image,
+nested container support, and lifecycle commands:
 
 ```json
 {
@@ -168,9 +208,8 @@ like your preferred image, nested container support, and lifecycle commands:
 }
 ```
 
-The `runArgs` with `--privileged` keeps compatibility with the stock devcontainer CLI,
-while `nestedContainers: true` tells devaipod to use a tighter set of capabilities
-instead.
+`--privileged` in `runArgs` keeps compatibility with the stock devcontainer CLI.
+`nestedContainers: true` tells devaipod to use a tighter set of capabilities instead.
 
 To force the dotfiles devcontainer.json even when a project has its own, use
 `--use-default-devcontainer` (or the checkbox in the web UI).
@@ -191,8 +230,8 @@ but these only set the image without any lifecycle commands or customizations.
 ## Git Hosting Providers
 
 devaipod recognizes bare hostnames like `github.com/owner/repo` and
-automatically prepends `https://`. The built-in list covers GitHub, GitLab,
-Codeberg, Bitbucket, sr.ht, and Gitea. For private instances, add them via
+prepends `https://`. The built-in list covers GitHub, GitLab,
+Codeberg, Bitbucket, sr.ht, and Gitea. Add private instances via
 the `[git]` section:
 
 ```toml
@@ -201,12 +240,12 @@ extra_hosts = ["forgejo.example.com", "gitea.corp.internal"]
 ```
 
 This lets you run `devaipod up forgejo.example.com/team/project` without
-typing the full URL. SSH URLs (`git@host:owner/repo.git`) are also
-automatically converted to HTTPS regardless of this setting.
+the full URL. SSH URLs (`git@host:owner/repo.git`) convert to HTTPS
+regardless of this setting.
 
 ## Per-Project Configuration
 
-Projects use standard `devcontainer.json` with optional devaipod customizations:
+Projects use standard `devcontainer.json` with optional devaipod extensions:
 
 ```json
 {
@@ -245,7 +284,7 @@ echo "your-api-key" | podman secret create GEMINI_API_KEY -
 
 ## Environment Variable Priority
 
-Environment variables are merged in this order (later wins):
+Environment variables merge in this order (later wins):
 
 1. Global `[env]` section in devaipod.toml
 2. Per-project `containerEnv` in devcontainer.json
@@ -271,9 +310,9 @@ See [Service-gator Integration](service-gator.md) for full details.
 
 ## Multi-Agent Orchestration
 
-By default each workspace runs a single agent container. Multi-agent
-orchestration — where a worker container runs alongside the agent and
-receives delegated subtasks — is opt-in:
+Each workspace runs a single agent container by default. Multi-agent
+orchestration -- a worker container alongside the agent that receives
+delegated subtasks -- is opt-in:
 
 ```toml
 [orchestration]
@@ -291,8 +330,8 @@ commits before merging.
 
 **Worker gator options:**
 
-- `"readonly"`: Worker can only read from forge (no PRs, no pushes) — **default**
-- `"inherit"`: Worker gets same gator scopes as the agent
+- `"readonly"`: Worker can only read from forge (no PRs, no pushes) -- **default**
+- `"inherit"`: Worker gets the same gator scopes as the agent
 - `"none"`: Worker has no gator access
 
-The worker is one step further from human review, so it has restricted access by default.
+The worker operates further from human review, so its access is restricted by default.

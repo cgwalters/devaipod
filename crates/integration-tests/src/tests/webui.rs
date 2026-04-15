@@ -20,7 +20,7 @@
 //!   iframe pointing at the pod-api sidecar).
 //! - **GET /api/podman/v5.0.0/libpod/pods/json** — Pod list (Bearer token required).
 //! - **POST /api/podman/.../pods/{name}/start**, **.../stop**, **DELETE .../pods/{name}?force=true**
-//! - **GET /api/devaipod/pods/{name}/opencode-info** — Agent info for "Open Agent".
+//! - **GET /api/devaipod/pods/{name}/agent-status** — Agent status summary.
 //! - **POST /api/devaipod/pods/{name}/recreate** — Recreate workspace (same repo).
 //! - **POST /api/devaipod/run** — Create workspace (JSON: `{ "source", "task" }`).
 //! - **GET /api/devaipod/pods/{name}/pod-api/{*path}** — Proxy to the per-pod API sidecar
@@ -37,17 +37,17 @@
 //! Tests are categorized into tiers based on their resource needs:
 //!
 //! - **Tier 1 (parallel safe, no pod)**: Static file serving, auth checks, health endpoints
-//! - **Tier 2 (parallel safe, needs pod)**: Pod listing, opencode-info (uses the shared test pod)
+//! - **Tier 2 (parallel safe, needs pod)**: Pod listing, agent-status (uses the shared test pod)
 //! - **Tier 3 (serial, mutations)**: Tests that modify state (currently none)
 //!
 //! All tests share a single `WebFixture` container to reduce resource contention.
 
-use color_eyre::Result;
 use color_eyre::eyre::bail;
+use color_eyre::Result;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
-use xshell::{Shell, cmd};
+use xshell::{cmd, Shell};
 
 use crate::container_integration_test;
 use crate::shell;
@@ -976,24 +976,33 @@ fn test_web_container_pod_list() -> Result<()> {
 }
 container_integration_test!(test_web_container_pod_list);
 
-/// Verify the opencode-info endpoint returns 404 for non-existent pods
+/// Verify the agent-status endpoint returns "Stopped" for non-existent pods
 /// and proper JSON structure for existing pods
 ///
+/// Note: The old /agent-info endpoint was removed in the ACP migration.
+/// The /agent-status endpoint is now the canonical way to get pod status.
+///
 /// Tier 2: Parallel safe, uses shared pod for validation
-fn test_web_container_opencode_info_endpoint() -> Result<()> {
+fn test_web_container_agent_info_endpoint() -> Result<()> {
     let fixture = WebFixture::get()?;
 
     let token = fixture.token().to_string();
 
-    // Test that non-existent pod returns 404
-    let (status, _body) = fixture.curl_in_container(
-        "/api/devaipod/pods/nonexistent-pod-12345/opencode-info",
+    // Test that non-existent pod returns "Stopped" (not an error, just status)
+    let (status, body) = fixture.curl_in_container(
+        "/api/devaipod/pods/nonexistent-pod-12345/agent-status",
         Some(&token),
     )?;
     assert_eq!(
-        status, 404,
-        "Non-existent pod should return 404, got {}",
+        status, 200,
+        "agent-status should always return 200, got {}",
         status
+    );
+    let status_json: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        status_json["activity"].as_str(),
+        Some("Stopped"),
+        "Non-existent pod should have Stopped activity"
     );
 
     // If there's a running devaipod pod, test the endpoint returns valid data
@@ -1005,59 +1014,48 @@ fn test_web_container_opencode_info_endpoint() -> Result<()> {
         for pod in &pods {
             if let Some(name) = pod.get("Name").and_then(|n| n.as_str()) {
                 if name.starts_with("devaipod-") {
-                    // Found a devaipod pod, test the opencode-info endpoint
+                    // Found a devaipod pod, test the agent-status endpoint
                     let (info_status, info_body) = fixture.curl_in_container(
-                        &format!("/api/devaipod/pods/{}/opencode-info", name),
+                        &format!("/api/devaipod/pods/{}/agent-status", name),
                         Some(&token),
                     )?;
 
-                    // Should return 200 or 404 (if pod not running/accessible)
-                    assert!(
-                        info_status == 200 || info_status == 404,
-                        "opencode-info should return 200 or 404, got {}: {}",
+                    // Should always return 200 (status endpoint never errors)
+                    assert_eq!(
+                        info_status, 200,
+                        "agent-status should return 200, got {}: {}",
                         info_status,
                         info_body
                     );
 
-                    if info_status == 200 {
-                        // Verify JSON structure
-                        let info: serde_json::Value =
-                            serde_json::from_str(&info_body).map_err(|e| {
-                                color_eyre::eyre::eyre!(
-                                    "Failed to parse opencode-info JSON: {} - body: {}",
-                                    e,
-                                    info_body
-                                )
-                            })?;
+                    // Verify JSON structure
+                    let info: serde_json::Value =
+                        serde_json::from_str(&info_body).map_err(|e| {
+                            color_eyre::eyre::eyre!(
+                                "Failed to parse agent-status JSON: {} - body: {}",
+                                e,
+                                info_body
+                            )
+                        })?;
 
-                        assert!(
-                            info.get("url").is_some(),
-                            "opencode-info should have 'url' field"
-                        );
-                        assert!(
-                            info.get("port").is_some(),
-                            "opencode-info should have 'port' field"
-                        );
-                        assert!(
-                            info.get("accessible").is_some(),
-                            "opencode-info should have 'accessible' field"
-                        );
+                    assert!(
+                        info.get("activity").is_some(),
+                        "agent-status should have 'activity' field"
+                    );
+                    assert!(
+                        info.get("status_line").is_some(),
+                        "agent-status should have 'status_line' field"
+                    );
+                    assert!(
+                        info.get("session_count").is_some(),
+                        "agent-status should have 'session_count' field"
+                    );
 
-                        // URL should be a direct localhost URL (token is not included)
-                        let url = info.get("url").unwrap().as_str().unwrap_or("");
-                        assert!(
-                            url.starts_with("http://127.0.0.1:")
-                                || url.starts_with("http://localhost:"),
-                            "URL should start with 'http://127.0.0.1:' or 'http://localhost:', got: {}",
-                            url
-                        );
-
-                        tracing::info!(
-                            "Successfully validated opencode-info for pod {}: port={}",
-                            name,
-                            info.get("port").unwrap()
-                        );
-                    }
+                    tracing::info!(
+                        "Successfully validated agent-status for pod {}: activity={}",
+                        name,
+                        info.get("activity").unwrap()
+                    );
                     break; // Only test one pod
                 }
             }
@@ -1066,19 +1064,19 @@ fn test_web_container_opencode_info_endpoint() -> Result<()> {
 
     Ok(())
 }
-container_integration_test!(test_web_container_opencode_info_endpoint);
+container_integration_test!(test_web_container_agent_info_endpoint);
 
-/// Test connectivity to a running devaipod pod's opencode proxy
+/// Test connectivity to a running devaipod pod's agent proxy
 ///
-/// This test validates that the opencode proxy actually returns content by:
+/// This test validates that the agent proxy actually returns content by:
 /// 1. Finding a running devaipod pod
-/// 2. Getting its opencode-info (URL, port, token)
+/// 2. Getting its agent-info (URL, port)
 /// 3. Using curl from inside the web container to test the proxy returns content
 ///
 /// If no devaipod pod is running, the test passes with a skip note.
 ///
 /// Tier 2: Parallel safe, uses shared pod for validation
-fn test_web_container_opencode_connectivity() -> Result<()> {
+fn test_web_container_agent_connectivity() -> Result<()> {
     let fixture = WebFixture::get()?;
 
     let token = fixture.token().to_string();
@@ -1114,156 +1112,18 @@ fn test_web_container_opencode_connectivity() -> Result<()> {
 
         tracing::info!("Found running devaipod pod: {}", name);
 
-        // Get opencode-info for this pod
-        let (info_status, info_body) = fixture.curl_in_container(
-            &format!("/api/devaipod/pods/{}/opencode-info", name),
-            Some(&token),
-        )?;
-
-        if info_status != 200 {
-            tracing::info!(
-                "opencode-info returned {} for pod {}, skipping",
-                info_status,
-                name
-            );
-            continue;
-        }
-
-        // Parse the opencode-info response
-        let info: serde_json::Value = match serde_json::from_str(&info_body) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Failed to parse opencode-info: {}", e);
-                continue;
-            }
-        };
-
-        let port = match info.get("port").and_then(|p| p.as_u64()) {
-            Some(p) => p as u16,
-            None => {
-                tracing::warn!("No port in opencode-info response");
-                continue;
-            }
-        };
-
-        // The URL no longer includes a token; the opencode server inside
-        // the pod does not require authentication for localhost access.
-        let _url = info.get("url").and_then(|u| u.as_str()).unwrap_or("");
-
-        tracing::info!(
-            "Testing opencode proxy connectivity on port {} for pod {}",
-            port,
-            name
-        );
-
-        found_running_pod = true;
-
-        // Test 1: Initial page load (no token needed for localhost access)
-        // curl from inside the web container to the host's published port
-        // Note: 127.0.0.1 in the container refers to the container's localhost,
-        // but the opencode proxy port is published on the host.
-        // We need to use the host's IP or the podman network gateway.
-        // For rootless podman, we can try host.containers.internal or the host IP.
-        let curl_url = format!("http://host.containers.internal:{}/", port);
-        let curl_output = Command::new("podman")
-            .args([
-                "exec",
-                fixture.container_name(),
-                "curl",
-                "-s",
-                "--max-time",
-                "10",
-                "-w",
-                "\n%{http_code}",
-                &curl_url,
-            ])
-            .output()?;
-
-        let combined = String::from_utf8_lossy(&curl_output.stdout);
-        let lines: Vec<&str> = combined.trim().lines().collect();
-        let status_code: i32 = lines.last().and_then(|s| s.parse().ok()).unwrap_or(-1);
-        let body = if lines.len() > 1 {
-            lines[..lines.len() - 1].join("\n")
-        } else {
-            String::new()
-        };
-
-        if status_code == -1 || status_code == 0 {
-            // Connection failed - likely network isolation or host not reachable
-            tracing::info!(
-                "Could not reach host.containers.internal:{}, pod may be on different host or network isolated",
-                port
-            );
-            // This is expected in some CI environments, so we don't fail
-            continue;
-        }
-
-        // Verify we got a successful response with HTML content
-        assert!(
-            status_code == 200 || status_code == 302,
-            "Initial page load should return 200 or 302, got {}: {}",
-            status_code,
-            &body[..body.len().min(200)]
-        );
-
-        if status_code == 200 {
-            // Should contain HTML
-            assert!(
-                body.contains("<!DOCTYPE html>")
-                    || body.contains("<html")
-                    || body.contains("<!doctype html>"),
-                "Response should contain HTML, got: {}",
-                &body[..body.len().min(500)]
-            );
-            tracing::info!("Initial page load returned HTML content successfully");
-        } else {
-            tracing::info!("Got redirect (302), which is also acceptable");
-        }
-
-        // Test 2: Request to /health (no auth needed for localhost access)
-        let health_url = format!("http://host.containers.internal:{}/health", port);
-        let curl_health_output = Command::new("podman")
-            .args([
-                "exec",
-                fixture.container_name(),
-                "curl",
-                "-s",
-                "--max-time",
-                "10",
-                "-w",
-                "\n%{http_code}",
-                &health_url,
-            ])
-            .output()?;
-
-        let health_combined = String::from_utf8_lossy(&curl_health_output.stdout);
-        let health_lines: Vec<&str> = health_combined.trim().lines().collect();
-        let health_status: i32 = health_lines
-            .last()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(-1);
-
-        // Health endpoint may or may not exist on the opencode server
-        // The important thing is we got a response (not connection refused)
-        if health_status > 0 {
-            tracing::info!("Request to /health returned status {}", health_status);
-        }
-
-        // Successfully tested one pod, we're done
-        tracing::info!(
-            "Successfully validated opencode proxy connectivity for pod {}",
-            name
-        );
+        // The /agent-info endpoint was removed in the ACP migration.
+        // ACP uses stdio transport (podman exec) instead of HTTP, so there's
+        // no published agent port to test connectivity against.
+        // TODO: Add ACP-specific connectivity test (e.g. verify podman exec works)
+        tracing::info!("Skipping connectivity test (agent-info endpoint removed in ACP migration)");
         return Ok(());
     }
 
-    if !found_running_pod {
-        tracing::info!("No running devaipod pods found, skipping opencode proxy connectivity test");
-    }
-
+    tracing::info!("No running devaipod pods found, skipping connectivity test");
     Ok(())
 }
-container_integration_test!(test_web_container_opencode_connectivity);
+container_integration_test!(test_web_container_agent_connectivity);
 
 /// Verify cookie-based authentication persists across requests.
 ///

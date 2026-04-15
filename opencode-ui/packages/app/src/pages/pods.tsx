@@ -936,7 +936,7 @@ function AgentRow(props: { agent: ControlPlaneAgent }) {
   const isDone = () => a().completion_status === "done"
 
   function navigate() {
-    window.location.href = `/_devaipod/agent/${encodeURIComponent(a().name)}`
+    window.location.href = `/agent/${encodeURIComponent(a().name)}/`
   }
 
   return (
@@ -1333,7 +1333,6 @@ function LaunchForm(props: { onClose: () => void; prefillSource?: string }) {
   const [readOnly, setReadOnly] = createSignal(true)
   const [devcontainerJson, setDevcontainerJson] = createSignal("")
   const [useDefaultDevcontainer, setUseDefaultDevcontainer] = createSignal(false)
-  const [autoApprove, setAutoApprove] = createSignal(true)
   const [autoTitle, setAutoTitle] = createSignal(true)
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
@@ -1407,7 +1406,6 @@ function LaunchForm(props: { onClose: () => void; prefillSource?: string }) {
       const dcj = devcontainerJson().trim()
       if (dcj) params.devcontainer_json = dcj
       if (useDefaultDevcontainer()) params.use_default_devcontainer = true
-      if (!autoApprove()) params.no_auto_approve = true
 
       // Auto-generate title from task text if enabled
       if (autoTitle() && t) {
@@ -1506,13 +1504,6 @@ function LaunchForm(props: { onClose: () => void; prefillSource?: string }) {
                 onChange={setUseDefaultDevcontainer}
               >
                 Use default devcontainer (from dotfiles repo instead of project's)
-              </Checkbox>
-
-              <Checkbox
-                checked={autoApprove()}
-                onChange={setAutoApprove}
-              >
-                Auto-approve tool permissions (agent runs autonomously without prompts)
               </Checkbox>
 
               <div>

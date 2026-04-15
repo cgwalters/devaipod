@@ -72,7 +72,7 @@ impl Drop for PodmanServiceGuard {
 // Re-export from lib for test registration
 pub(crate) use integration_tests::{
     INTEGRATION_TESTS, READONLY_INTEGRATION_TESTS, SharedFixture, container_integration_test,
-    integration_test, podman_integration_test, poll_until, readonly_test,
+    integration_test, podman_integration_test, readonly_test,
     wait_for_container_running, wait_for_file,
 };
 

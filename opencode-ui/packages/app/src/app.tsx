@@ -1,5 +1,5 @@
 import "@/index.css"
-import { ErrorBoundary, Suspense, lazy, type JSX, type ParentProps } from "solid-js"
+import { ErrorBoundary, Show, Suspense, lazy, type JSX, type ParentProps } from "solid-js"
 import { Router, Route, Navigate } from "@solidjs/router"
 import { MetaProvider } from "@solidjs/meta"
 import { Font } from "@opencode-ai/ui/font"
@@ -170,9 +170,32 @@ const PodsRoute = () => (
 )
 
 const AgentRoute = () => (
-  <Suspense fallback={<Loading />}>
-    <Agent />
-  </Suspense>
+  <ErrorBoundary fallback={(err) => (
+    <div class="flex items-center justify-center h-screen bg-surface-base text-text-strong">
+      <div class="max-w-lg p-6 rounded-lg border border-border-base bg-fill-element-base">
+        <h1 class="text-lg font-semibold mb-2">Something went wrong</h1>
+        <p class="text-sm opacity-70 mb-3">An error occurred while loading the agent session.</p>
+        <details class="text-xs font-mono bg-surface-inset rounded p-3 mb-4 max-h-48 overflow-y-auto">
+          <summary class="cursor-pointer mb-1 font-medium">Error Details</summary>
+          <pre class="whitespace-pre-wrap break-all">{err?.message ?? String(err)}</pre>
+          <Show when={err?.stack}>
+            <pre class="whitespace-pre-wrap break-all mt-2 opacity-50">{err.stack}</pre>
+          </Show>
+        </details>
+        <button
+          type="button"
+          class="px-4 py-2 rounded text-sm font-medium bg-blue-900 border border-blue-700 text-blue-300 hover:bg-blue-800 cursor-pointer"
+          onClick={() => window.location.reload()}
+        >
+          Reload Page
+        </button>
+      </div>
+    </div>
+  )}>
+    <Suspense fallback={<Loading />}>
+      <Agent />
+    </Suspense>
+  </ErrorBoundary>
 )
 
 export function AppInterface(props: { defaultUrl?: string; children?: JSX.Element; isSidecar?: boolean }) {

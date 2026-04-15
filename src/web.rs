@@ -1466,9 +1466,6 @@ struct RunRequest {
     /// Use the devcontainer.json from dotfiles instead of the project's
     #[serde(default)]
     use_default_devcontainer: bool,
-    /// Disable auto-approve of tool permissions
-    #[serde(default)]
-    no_auto_approve: bool,
     /// Human-readable title for the workspace session
     title: Option<String>,
 }
@@ -1565,10 +1562,6 @@ async fn run_workspace(
 
     if req.use_default_devcontainer {
         cmd.arg("--use-default-devcontainer");
-    }
-
-    if req.no_auto_approve {
-        cmd.arg("--no-auto-approve");
     }
 
     if let Some(ref title) = req.title {

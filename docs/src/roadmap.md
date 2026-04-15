@@ -1,15 +1,18 @@
 # devaipod Roadmap
 
-Priorities may shift based on user feedback and practical experience.
+Priorities may shift based on feedback and experience.
 Design documents live in `docs/todo/`; this roadmap organizes them
-into a dependency-ordered plan.
+by dependency order.
 
 ## Recently Completed
 
+- **ACP multi-agent support**: ACP client with auto-detection,
+  profile-based configuration, and WebSocket event streaming. Any
+  ACP-compatible agent works. See [acp.md](acp.md).
 - **SSH server for editor connections**: Embedded Rust SSH server
   (russh). Supports exec, shell, PTY, and port forwarding.
-- **Pod-api sidecar**: HTTP API sidecar per pod, serving the vendored
-  opencode web UI and proxying agent API calls.
+- **Pod-api sidecar**: HTTP API sidecar per pod, serving the web UI
+  and proxying agent communication via ACP.
   See [per-pod-gateway-sidecar.md](../todo/per-pod-gateway-sidecar.md)
   (historical).
 - **Script injection reduction**: Auth proxy and workspace monitor
@@ -28,89 +31,89 @@ into a dependency-ordered plan.
 
 ## In Progress / Near-term
 
-- **Agent completion detection**: Partially implemented via `/summary`
-  endpoint. Needs full idle-state detection for `run` mode.
-- **Agent readiness probes**: Partially implemented via pod-api health
-  checks. Needs refinement.
-- **Pod-api as lifecycle driver**: Make pod-api the single entry point
-  for agent session creation and task injection, eliminating fragile
+- **Agent completion detection**: Partial -- `/summary` endpoint exists.
+  Still needs idle-state detection for `run` mode.
+- **Agent readiness probes**: Partial via pod-api health checks. Needs
+  refinement.
+- **Pod-api as lifecycle driver**: Make pod-api the sole entry point
+  for agent session creation and task injection, replacing fragile
   `podman exec` patterns.
   See [pod-api-driver.md](../todo/pod-api-driver.md).
 - **UI improvements**: Session titles, card layout, attach experience.
   See [ui.md](../todo/ui.md).
-- **Web UI review component**: Pod-api git endpoints are functional,
-  but the web frontend still needs push approval gate, viewed-files
-  tracking, and Signed-off-by checkbox.
-- **Git hook hardening on read path**: Pod-api `run_git()` only sets
+- **Web UI review component**: Pod-api git endpoints work, but the
+  web frontend still needs a push approval gate, viewed-files tracking,
+  and Signed-off-by checkbox.
+- **Git hook hardening on read path**: Pod-api `run_git()` sets only
   `safe.directory=*`; the full hardening (fsmonitor, hooksPath,
-  credential.helper) described in
-  [lightweight-review.md](../todo/lightweight-review.md) is not yet
-  implemented.
+  credential.helper) from
+  [lightweight-review.md](../todo/lightweight-review.md) remains
+  unimplemented.
 
 ## Planned Work
 
-The following features have design docs and are ordered by dependency.
-Later items build on earlier ones.
+These features have design docs, ordered by dependency. Later items
+build on earlier ones.
 
 ### 1. Workspace v2: remaining phases
 
 Core workspace-v2 (host directories, multi-repo, harvest) is done.
-Remaining work: workspace-anchored UI/model rework (Phase 2),
-decoupling workspace containers from agent pods (Phase 3), and
-repo-centric control plane (Phase 4).
+Remaining: workspace-anchored UI/model rework (Phase 2), decoupling
+workspace containers from agent pods (Phase 3), and repo-centric
+control plane (Phase 4).
 
 See [workspace-v2.md](../todo/workspace-v2.md).
 
 ### 2. Review and push (web UI)
 
-CLI review and push commands are done (`devaipod review/push/pr`).
+CLI review and push commands work (`devaipod review/push/pr`).
 Pod-api git endpoints work. Remaining: web UI approval gate,
-viewed-files tracking, Signed-off-by checkbox, and git hook
-hardening on the pod-api read path.
+viewed-files tracking, Signed-off-by checkbox, and git hook hardening
+on the pod-api read path.
 
 See [lightweight-review.md](../todo/lightweight-review.md).
 
 ### 3. Bot/assistant accounts and credential management
 
 Replace static PATs with OAuth2 "on behalf of user" authentication
-via GitHub Apps, GitLab Applications, etc. Proper credential
-storage, token refresh, and user attribution. This improves the
-credential story for both review/push and service-gator.
+via GitHub Apps, GitLab Applications, etc. Adds proper credential
+storage, token refresh, and user attribution for both review/push
+and service-gator.
 
 See [bot-assistant-accounts.md](../todo/bot-assistant-accounts.md).
 
 ### 4. Subagent containers
 
-Let the agent dynamically spawn subagent containers on demand via
-MCP tools. Each subagent gets its own git clone or worktree on a
-dedicated branch; commits merge back via `subagent_merge`. Replaces
-the current static worker container approach.
+Let agents spawn subagent containers on demand via MCP tools. Each
+subagent gets its own git clone or worktree on a dedicated branch;
+commits merge back via `subagent_merge`. Replaces the static worker
+container approach.
 
 See [subagent-container.md](../todo/subagent-container.md).
 
 ### 5. LLM credential isolation
 
-Proxy container between agent pods and LLM providers to centralize
-API key management and prevent key exfiltration from compromised
-agents. Agents receive only `OPENAI_BASE_URL` pointing at the proxy.
+Proxy container between agent pods and LLM providers centralizes API
+key management and prevents key exfiltration from compromised agents.
+Agents receive only `OPENAI_BASE_URL` pointing at the proxy.
 
 See [openai-compat-proxy.md](../todo/openai-compat-proxy.md).
 
 ## Future / Ideas
 
-These are larger features under consideration without a fixed
-ordering. Some have design docs, others are rough ideas.
+Larger features under consideration, unordered. Some have design docs;
+others are rough ideas.
 
 - **Kubernetes support**: Use kube-rs to create pods on k8s clusters.
   Three deployment models (devaipod-in-k8s, spawn-to-cluster,
   hybrid). See [kubernetes.md](../todo/kubernetes.md).
 - **Local Forgejo instance**: Git caching, local CI/CD, and code
-  review UI. Deferred in favor of the lightweight review approach
-  for now. See [forgejo-integration.md](../todo/forgejo-integration.md).
-- **Advisor agent** (partially implemented): Read-only observer that proposes
-  agent pods based on GitHub activity and pod health. Core infrastructure
-  is complete (MCP tools, CLI, workspace introspection); approval UI and
-  auto-launch from proposals are not yet implemented.
+  review UI. Deferred for the lightweight review approach.
+  See [forgejo-integration.md](../todo/forgejo-integration.md).
+- **Advisor agent** (partial): Read-only observer that proposes agent
+  pods based on GitHub activity and pod health. Core infrastructure
+  works (MCP tools, CLI, workspace introspection); approval UI and
+  auto-launch from proposals remain unimplemented.
   See [advisor.md](../todo/advisor.md).
 - **Dynamic port forwarding**: Forward ports from running pods
   without restart, via `podman exec` TCP relay.
@@ -134,11 +137,8 @@ ordering. Some have design docs, others are rough ideas.
 
 ## Known Limitations
 
-- **Agent requires opencode in the image**: The agent container runs
-  `opencode serve`, so opencode must be in the devcontainer image.
 - **Lifecycle commands only run in workspace**: `onCreateCommand`
   etc. run in the workspace container, not the agent container.
-- **Single agent type**: Only opencode is currently tested.
 
 ## Design Document Index
 

@@ -74,7 +74,6 @@ export interface LaunchWorkspaceParams {
   service_gator_ro?: boolean
   devcontainer_json?: string
   use_default_devcontainer?: boolean
-  no_auto_approve?: boolean
   title?: string
 }
 

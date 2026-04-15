@@ -19,6 +19,9 @@ use color_eyre::eyre::{Context, Result, bail};
 use crate::forge::PullRequestInfo;
 use crate::git::{GitRepoInfo, REMOTE_WORKER, REMOTE_WORKSPACE, RemoteRepoInfo};
 
+/// Port for the worker agent's server (internal, used by orchestration).
+pub(crate) const WORKER_PORT: u16 = 4098;
+
 /// Describes the source for the agent workspace: either a named podman volume
 /// or a host-side bind mount directory.
 #[derive(Debug, Clone)]
@@ -518,8 +521,8 @@ impl DevaipodPod {
         task: Option<&str>,
         enable_orchestration: bool,
         worker_gator_mode: WorkerGatorMode,
-        auto_approve: bool,
         source_dirs: &[PathBuf],
+        backend: &dyn crate::agent::AgentBackend,
     ) -> Result<Self> {
         // Note: container_home is resolved after we determine the image, since
         // we need to query the image for the user if devcontainer doesn't specify one
@@ -1210,6 +1213,7 @@ impl DevaipodPod {
         };
 
         let agent_config = Self::agent_container_config(
+            backend,
             project_path,
             &workspace_folder,
             &agent_bind_home,
@@ -1223,7 +1227,6 @@ impl DevaipodPod {
             &agent_home_volume,
             worker_workspace_volume_name.as_deref(),
             global_config,
-            auto_approve,
             &source_mounts,
         );
         podman
@@ -3068,6 +3071,7 @@ exec sleep infinity
     /// the worker's workspace is mounted read-only at `/mnt/worker-workspace`.
     #[allow(clippy::too_many_arguments)]
     fn agent_container_config(
+        backend: &dyn crate::agent::AgentBackend,
         _project_path: &Path,
         workspace_folder: &str,
         bind_home: &BindHomeConfig,
@@ -3081,7 +3085,6 @@ exec sleep infinity
         agent_home_volume: &str,
         worker_workspace_volume: Option<&str>,
         global_config: &crate::config::Config,
-        auto_approve: bool,
         source_mounts: &[(PathBuf, String, bool)],
     ) -> ContainerConfig {
         // Agent home is mounted from a persistent volume so state survives restarts
@@ -3134,17 +3137,6 @@ exec sleep infinity
 
         // Add env vars from global config (allowlist + explicit vars)
         env.extend(global_config.env.collect());
-
-        // Auto-approve all tool permissions by default so the agent runs
-        // autonomously without interactive prompts. This matches the behavior
-        // users expect in a headless pod environment. Pass --no-auto-approve
-        // to disable this.
-        if auto_approve {
-            env.insert(
-                "OPENCODE_PERMISSION".to_string(),
-                r#"{"*":"allow"}"#.to_string(),
-            );
-        }
 
         // Start with bind mounts for agent workspace and source repo (when using host dirs)
         let mut mounts = vec![];
@@ -3256,17 +3248,17 @@ exec sleep infinity
         }
 
         // Build MCP config combining service-gator and any additional MCP servers
-        let mut mcp_servers = serde_json::Map::new();
+        let mut mcp_servers_for_backend = Vec::new();
 
         if enable_gator {
-            mcp_servers.insert(
+            mcp_servers_for_backend.push((
                 "service-gator".to_string(),
                 serde_json::json!({
                     "type": "remote",
                     "url": format!("http://localhost:{}/mcp", GATOR_PORT),
                     "enabled": true
                 }),
-            );
+            ));
         }
 
         // Add any additional MCP servers from config
@@ -3279,27 +3271,20 @@ exec sleep infinity
             if !entry.headers.is_empty() {
                 server_json["headers"] = serde_json::json!(entry.headers);
             }
-            mcp_servers.insert(name.to_string(), server_json);
+            mcp_servers_for_backend.push((name.to_string(), server_json));
         }
 
-        if !mcp_servers.is_empty() {
-            let mcp_config = serde_json::json!({
-                "mcp": mcp_servers
-            });
-            env.insert(
-                "OPENCODE_CONFIG_CONTENT".to_string(),
-                mcp_config.to_string(),
-            );
-        }
-
-        // When orchestration is enabled, set OPENCODE_WORKER_URL so the task owner
-        // can use `opencode run --attach $OPENCODE_WORKER_URL` to delegate to the worker.
-        // This is much cleaner than raw curl commands.
-        if enable_orchestration {
-            env.insert(
-                "OPENCODE_WORKER_URL".to_string(),
-                format!("http://localhost:{}", WORKER_OPENCODE_PORT),
-            );
+        // Delegate agent-specific env vars to the backend
+        let env_config = crate::agent::AgentEnvConfig {
+            agent_home: AGENT_HOME_PATH.to_string(),
+            enable_gator,
+            gator_port: GATOR_PORT,
+            enable_orchestration,
+            worker_port: WORKER_PORT,
+            mcp_servers: mcp_servers_for_backend,
+        };
+        for (key, value) in backend.container_env(&env_config) {
+            env.insert(key, value);
         }
 
         // Get devcontainer-declared secrets (like ANTHROPIC_API_KEY, OPENAI_API_KEY).
@@ -3315,63 +3300,9 @@ exec sleep infinity
         // Used for credentials like GOOGLE_APPLICATION_CREDENTIALS that expect a file path.
         let file_secrets = global_config.trusted_env.file_secret_mounts();
 
-        let startup_script = format!(
-            r#"mkdir -p {home}/.config/opencode {home}/.local/share {home}/.local/bin {home}/.cache
-
-# Mock mode: run inline mock server instead of the real opencode server.
-# Used by integration tests to avoid needing a real AI provider.
-# Uses Python3 (available in all devcontainer images) so no extra binary
-# is required in the agent container.
-if [ -n "${{DEVAIPOD_MOCK_AGENT}}" ]; then
-    # Wait for devaipod to finish setup before starting mock server.
-    while [ ! -f {state} ]; do sleep 0.1; done
-    exec python3 -u -c "
-import json, http.server, socketserver
-
-SESSION = json.dumps([dict(id='mock-001',slug='mock',projectID='p',directory='/workspaces/test',title='Mock',version='1.0.0',time=dict(created=1700000000000,updated=1700000100000))])
-MESSAGE = json.dumps([dict(info=dict(role='assistant',time=dict(created=1700000001000,completed=1700000002000),finish='stop'),parts=[dict(type='text',text='Ready.')])])
-
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.startswith('/session') and '/message' in self.path:
-            body = MESSAGE
-        elif self.path.startswith('/session'):
-            body = SESSION
-        else:
-            self.send_error(404); return
-        self.send_response(200)
-        self.send_header('Content-Type','application/json')
-        self.end_headers()
-        self.wfile.write(body.encode())
-    def log_message(self, *a): pass
-
-print('Mock opencode on port {opencode_port}', flush=True)
-socketserver.TCPServer(('0.0.0.0',{opencode_port}),H).serve_forever()
-"
-fi
-
-# Pre-flight: verify the agent binary is available in the container image.
-# Check before waiting for the state file so the pod enters Degraded state
-# immediately rather than blocking on setup that cannot succeed.
-if ! command -v {agent_binary} >/dev/null 2>&1; then
-    echo "devaipod-error: agent-binary-not-found: {agent_binary}" >&2
-    exit 42
-fi
-
-# Wait for devaipod to finish setup (dotfiles, task config) before starting
-# opencode.  The state file lives on the container overlay so it persists
-# across stop/start but is absent after a container rebuild.
-while [ ! -f {state} ]; do
-    sleep 0.1
-done
-
-# Run opencode serve, bound to 0.0.0.0 so it's accessible from the published port
-exec {agent_binary} serve --port {opencode_port} --hostname 0.0.0.0"#,
-            home = AGENT_HOME_PATH,
-            state = AGENT_STATE_PATH,
-            opencode_port = OPENCODE_PORT,
-            agent_binary = "opencode"
-        );
+        // Delegate startup script to the backend
+        let startup_cfg = backend.startup_command(AGENT_HOME_PATH, AGENT_STATE_PATH);
+        let startup_script = startup_cfg.startup_script;
 
         // When using bind mounts, disable SELinux labeling so podman
         // can access the host directories.
@@ -3590,6 +3521,7 @@ exec {agent_binary} serve --port {opencode_port} --hostname 0.0.0.0"#,
         env.insert("GIT_CONFIG_KEY_0".to_string(), "safe.directory".to_string());
         env.insert("GIT_CONFIG_VALUE_0".to_string(), "*".to_string());
 
+
         let command = vec![
             "devaipod-server".to_string(),
             "pod-api".to_string(),
@@ -3614,6 +3546,26 @@ exec {agent_binary} serve --port {opencode_port} --hostname 0.0.0.0"#,
             target: "/run/docker.sock".to_string(),
             readonly: false,
         }];
+
+        // Mount the devaipod config file into the pod-api container so it
+        // can read agent profiles for auto-detection. The mount source must
+        // be the host-side path (resolved via DEVAIPOD_HOST_HOME) since
+        // podman creates sibling containers from the host's perspective.
+        // Only mount when DEVAIPOD_HOST_HOME is set — in test environments
+        // where it's absent, the pod-api falls back to default profiles.
+        if let Ok(host_home) = std::env::var(crate::config::HOST_HOME_ENV) {
+            let host_config = format!("{}/.config/devaipod.toml", host_home);
+            // Verify the config exists inside the container before adding
+            // the mount (the host path may differ but we can't check it).
+            let config_path = crate::config::config_path();
+            if config_path.exists() {
+                mounts.push(MountConfig {
+                    source: host_config,
+                    target: "/tmp/.config/devaipod.toml".to_string(),
+                    readonly: true,
+                });
+            }
+        }
 
         // Agent workspace: bind mount if host dir, volume mount otherwise
         if is_bind_mount {
@@ -4099,8 +4051,10 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -4114,7 +4068,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4133,16 +4086,14 @@ mod tests {
         assert_eq!(container_config.volume_mounts[2].0, "test-agent-home");
         assert_eq!(container_config.volume_mounts[2].1, AGENT_HOME_PATH);
 
-        // Verify command wraps opencode in a shell to create home dir
+        // Verify command wraps agent startup in a shell to create home dir.
+        // The ACP backend keeps the container alive with an infinite loop
+        // (agent is started on-demand via podman exec).
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
         assert_eq!(cmd[1], "-c");
-        assert!(cmd[2].contains("opencode serve"));
-        assert!(cmd[2].contains(&format!("--port {}", OPENCODE_PORT)));
-        // Pre-flight check for agent binary (uses command -v, exits 42 if missing)
-        assert!(cmd[2].contains("command -v"));
-        assert!(cmd[2].contains("agent-binary-not-found"));
-        assert!(cmd[2].contains("exit 42"));
+        assert!(cmd[2].contains("while true"), "ACP backend should keep container alive");
+        assert!(cmd[2].contains("sleep"), "ACP backend should use sleep in loop");
 
         // Agent has the same security settings as workspace (not restricted)
         // to support nested containers. Security comes from credential isolation.
@@ -4154,23 +4105,23 @@ mod tests {
         // Verify HOME is NOT overridden (it comes from passwd entry for devenv user)
         assert_eq!(container_config.env.get("HOME"), None);
 
-        // With auto_approve=true, OPENCODE_PERMISSION should be set
-        assert_eq!(
-            container_config.env.get("OPENCODE_PERMISSION").unwrap(),
-            r#"{"*":"allow"}"#,
-        );
+        // ACP backend doesn't set OpenCode-specific env vars
+        // (permissions are managed by the agent's own config)
+        assert!(container_config.env.get("OPENCODE_PERMISSION").is_none());
     }
 
     #[test]
-    fn test_agent_container_config_auto_approve_disabled() {
-        // When auto_approve is false, OPENCODE_PERMISSION should not be set
+    fn test_agent_container_config_acp_no_legacy_env() {
+        // ACP backend doesn't set OPENCODE_PERMISSION (permissions are per-agent)
         let project_path = Path::new("/home/user/myproject");
         let workspace_folder = "/workspaces/myproject";
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -4184,13 +4135,12 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            false, // auto_approve disabled
             &[],   // source_mounts
         );
 
         assert!(
             container_config.env.get("OPENCODE_PERMISSION").is_none(),
-            "OPENCODE_PERMISSION should not be set when auto_approve is false"
+            "ACP backend should not set OpenCode-specific env vars"
         );
     }
 
@@ -4202,8 +4152,10 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -4217,7 +4169,6 @@ mod tests {
             "test-agent-home",
             Some("test-worker-workspace"), // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4242,14 +4193,11 @@ mod tests {
             "/mnt/worker-workspace:ro"
         );
 
-        // With orchestration enabled, agent should have OPENCODE_WORKER_URL set
+        // ACP backend doesn't set OPENCODE_WORKER_URL (OpenCode-specific).
+        // Worker port is used for container config but not as an env var.
         assert!(
-            container_config.env.contains_key("OPENCODE_WORKER_URL"),
-            "Agent container should have OPENCODE_WORKER_URL when orchestration is enabled"
-        );
-        assert_eq!(
-            container_config.env.get("OPENCODE_WORKER_URL").unwrap(),
-            &format!("http://localhost:{}", WORKER_OPENCODE_PORT)
+            !container_config.env.contains_key("OPENCODE_WORKER_URL"),
+            "ACP backend should not set OpenCode-specific env vars"
         );
     }
 
@@ -4265,8 +4213,10 @@ mod tests {
         };
         let container_home = "/home/vscode";
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -4280,7 +4230,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4300,11 +4249,13 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let mut global_config = crate::config::Config::default();
         global_config.trusted_env.file_secrets =
             vec!["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()];
 
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -4318,7 +4269,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -4435,13 +4385,20 @@ mod tests {
             "/mnt/main-workspace:ro"
         );
 
-        // Verify socket bind mount: source is the host path, target is canonical
-        assert_eq!(container_config.mounts.len(), 1);
+        // Verify socket bind mount: source is the host path, target is canonical.
+        // The config file mount is optional (only added if the file exists).
+        assert!(container_config.mounts.len() >= 1);
         assert_eq!(
             container_config.mounts[0].source,
             "/run/user/1000/podman/podman.sock"
         );
         assert_eq!(container_config.mounts[0].target, "/run/docker.sock");
+        // If the config file exists, verify it's mounted read-only
+        if let Some(config_mount) = container_config.mounts.iter().find(|m| {
+            m.target == "/tmp/.config/devaipod.toml"
+        }) {
+            assert!(config_mount.readonly, "config mount should be read-only");
+        }
 
         // Verify command runs pod-api with workspace container name and correct workspace path
         let cmd = container_config.command.as_ref().unwrap();
@@ -4782,10 +4739,12 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let mut global_config = crate::config::Config::default();
         global_config.trusted_env.secrets = vec!["GH_TOKEN=gh_token".to_string()];
 
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -4799,7 +4758,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -5461,9 +5419,11 @@ mod tests {
             }
         }"#;
         let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
 
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -5477,7 +5437,6 @@ mod tests {
             "test-agent-home-vol",
             None, // worker_workspace_volume
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -5636,11 +5595,13 @@ mod tests {
         let container_home = "/home/vscode";
         let host_path = PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let agent_workspace_source = AgentWorkspaceSource::HostDir {
             host_path: host_path.clone(),
         };
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -5654,7 +5615,6 @@ mod tests {
             "test-agent-home",
             None, // worker_workspace_volume (no orchestration)
             &global_config,
-            true, // auto_approve
             &[],  // source_mounts
         );
 
@@ -5702,6 +5662,7 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
+        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let source_mounts: Vec<(PathBuf, String, bool)> = vec![
             (
@@ -5716,6 +5677,7 @@ mod tests {
             ),
         ];
         let container_config = DevaipodPod::agent_container_config(
+            &backend,
             project_path,
             workspace_folder,
             &bind_home,
@@ -5729,7 +5691,6 @@ mod tests {
             "test-agent-home",
             None,
             &global_config,
-            true,
             &source_mounts,
         );
 
