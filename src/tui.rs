@@ -623,6 +623,29 @@ impl App {
             })
             .cloned()
             .collect();
+
+        // Re-order instances to match the grouped-by-repo display order so that
+        // up/down navigation walks the visual order instead of the underlying
+        // activity-time order.  Within each repo group the original (activity)
+        // order is preserved.
+        {
+            let mut repo_order: Vec<String> = Vec::new();
+            let mut groups: std::collections::HashMap<String, Vec<InstanceInfo>> =
+                std::collections::HashMap::new();
+            for inst in self.instances.drain(..) {
+                let key = inst.repo.clone().unwrap_or_default();
+                if !groups.contains_key(&key) {
+                    repo_order.push(key.clone());
+                }
+                groups.entry(key).or_default().push(inst);
+            }
+            for key in repo_order {
+                if let Some(group) = groups.remove(&key) {
+                    self.instances.extend(group);
+                }
+            }
+        }
+
         // Keep selection in bounds
         if let Some(selected) = self.table_state.selected() {
             if selected >= self.instances.len() {
