@@ -9902,7 +9902,11 @@ mod tests {
         let mut config = devcontainer::DevcontainerConfig::default();
         merge_cli_ports_into_config(
             &mut config,
-            &["3000".to_string(), "8080:9090".to_string(), "443".to_string()],
+            &[
+                "3000".to_string(),
+                "8080:9090".to_string(),
+                "443".to_string(),
+            ],
         );
         assert_eq!(config.forward_ports.len(), 3);
         assert_eq!(config.forward_ports[0], serde_json::json!(3000u16));

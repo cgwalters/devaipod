@@ -28,7 +28,8 @@ fn test_devcontainer_list_empty() -> Result<()> {
     // with devcontainer pods (from parallel tests). Both are valid.
     let stdout = output.stdout.as_str();
     let has_empty_message = stdout.contains("No devcontainer pods found");
-    let has_table_header = stdout.contains("NAME") && (stdout.contains("REPO") || stdout.contains("REPOSITORY"));
+    let has_table_header =
+        stdout.contains("NAME") && (stdout.contains("REPO") || stdout.contains("REPOSITORY"));
 
     assert!(
         has_empty_message || has_table_header,

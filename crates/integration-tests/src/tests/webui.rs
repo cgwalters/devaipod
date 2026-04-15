@@ -42,12 +42,12 @@
 //!
 //! All tests share a single `WebFixture` container to reduce resource contention.
 
-use color_eyre::eyre::bail;
 use color_eyre::Result;
+use color_eyre::eyre::bail;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 use crate::container_integration_test;
 use crate::shell;
@@ -1024,8 +1024,7 @@ fn test_web_container_agent_info_endpoint() -> Result<()> {
                     assert_eq!(
                         info_status, 200,
                         "agent-status should return 200, got {}: {}",
-                        info_status,
-                        info_body
+                        info_status, info_body
                     );
 
                     // Verify JSON structure

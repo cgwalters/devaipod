@@ -3525,7 +3525,6 @@ exec sleep infinity
         env.insert("GIT_CONFIG_KEY_0".to_string(), "safe.directory".to_string());
         env.insert("GIT_CONFIG_VALUE_0".to_string(), "*".to_string());
 
-
         let command = vec![
             "devaipod-server".to_string(),
             "pod-api".to_string(),
@@ -4055,7 +4054,8 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             &backend,
@@ -4097,8 +4097,14 @@ mod tests {
         let cmd = container_config.command.as_ref().unwrap();
         assert_eq!(cmd[0], "/bin/sh");
         assert_eq!(cmd[1], "-c");
-        assert!(cmd[2].contains("while true"), "ACP backend should keep container alive");
-        assert!(cmd[2].contains("sleep"), "ACP backend should use sleep in loop");
+        assert!(
+            cmd[2].contains("while true"),
+            "ACP backend should keep container alive"
+        );
+        assert!(
+            cmd[2].contains("sleep"),
+            "ACP backend should use sleep in loop"
+        );
 
         // Agent has the same security settings as workspace (not restricted)
         // to support nested containers. Security comes from credential isolation.
@@ -4123,7 +4129,8 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             &backend,
@@ -4158,7 +4165,8 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             &backend,
@@ -4220,7 +4228,8 @@ mod tests {
         };
         let container_home = "/home/vscode";
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let container_config = DevaipodPod::agent_container_config(
             &backend,
@@ -4257,7 +4266,8 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let mut global_config = crate::config::Config::default();
         global_config.trusted_env.file_secrets =
             vec!["GOOGLE_APPLICATION_CREDENTIALS=gcloud_adc".to_string()];
@@ -4403,9 +4413,11 @@ mod tests {
         );
         assert_eq!(container_config.mounts[0].target, "/run/docker.sock");
         // If the config file exists, verify it's mounted read-only
-        if let Some(config_mount) = container_config.mounts.iter().find(|m| {
-            m.target == "/tmp/.config/devaipod.toml"
-        }) {
+        if let Some(config_mount) = container_config
+            .mounts
+            .iter()
+            .find(|m| m.target == "/tmp/.config/devaipod.toml")
+        {
             assert!(config_mount.readonly, "config mount should be read-only");
         }
 
@@ -4748,7 +4760,8 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let mut global_config = crate::config::Config::default();
         global_config.trusted_env.secrets = vec!["GH_TOKEN=gh_token".to_string()];
 
@@ -5429,7 +5442,8 @@ mod tests {
             }
         }"#;
         let config: DevcontainerConfig = serde_json::from_str(json).unwrap();
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
 
         let container_config = DevaipodPod::agent_container_config(
@@ -5606,7 +5620,8 @@ mod tests {
         let container_home = "/home/vscode";
         let host_path = PathBuf::from("/home/user/.local/share/devaipod/workspaces/test-pod");
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let agent_workspace_source = AgentWorkspaceSource::HostDir {
             host_path: host_path.clone(),
@@ -5674,7 +5689,8 @@ mod tests {
         let bind_home = BindHomeConfig::default();
         let container_home = "/home/vscode";
 
-        let backend = crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
+        let backend =
+            crate::agent_acp::AcpBackend::new(vec!["opencode".to_string(), "acp".to_string()]);
         let global_config = crate::config::Config::default();
         let source_mounts: Vec<(PathBuf, String, bool)> = vec![
             (
