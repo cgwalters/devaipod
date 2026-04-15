@@ -680,3 +680,93 @@ fn test_harness_missing_agent_binary_diagnostics() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_harness_missing_agent_binary_diagnostics);
+
+/// Verify the diagnostics API endpoint returns container logs and exit codes
+/// for a degraded pod.
+///
+/// Uses the same failure mode as `test_harness_missing_agent_binary_diagnostics`
+/// (missing agent binary → exit code 42) but exercises the
+/// `GET /api/devaipod/pods/{name}/diagnostics` endpoint and validates its
+/// response structure.
+fn test_harness_diagnostics_endpoint_captures_failure() -> Result<()> {
+    let mut harness = DevaipodHarness::start_without_mock()?;
+    let repo = TestRepo::new_with_devcontainer(
+        r#"{ "name": "diag-test", "image": "mcr.microsoft.com/devcontainers/base:ubuntu" }"#,
+    )?;
+
+    let pod_name = crate::unique_test_name("diag-e2e");
+    let short = crate::short_name(&pod_name);
+
+    // Create a pod that will degrade (agent binary missing → exit 42)
+    let _pod_json = harness.create_pod_expect_degraded(repo.repo_path.to_str().unwrap(), short)?;
+
+    // Now call the diagnostics endpoint
+    let diag_json = harness.pod_diagnostics(&pod_name)?;
+    let diag: serde_json::Value = serde_json::from_str(&diag_json).map_err(|e| {
+        color_eyre::eyre::eyre!("Failed to parse diagnostics JSON: {e}\nraw: {diag_json}")
+    })?;
+
+    // Validate pod-level info
+    let pod_info = diag
+        .get("pod")
+        .expect("diagnostics should have 'pod' field");
+    assert!(
+        pod_info.get("name").and_then(|v| v.as_str()).is_some(),
+        "pod.name should be present: {pod_info}"
+    );
+    assert!(
+        pod_info.get("state").and_then(|v| v.as_str()).is_some(),
+        "pod.state should be present: {pod_info}"
+    );
+
+    // Validate containers array
+    let containers = diag
+        .get("containers")
+        .and_then(|v| v.as_array())
+        .expect("diagnostics should have 'containers' array");
+    assert!(
+        !containers.is_empty(),
+        "containers array should not be empty"
+    );
+
+    // Find the agent container and verify it has exit code and logs
+    let agent = containers.iter().find(|c| {
+        c.get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n.ends_with("-agent"))
+    });
+    assert!(
+        agent.is_some(),
+        "Should find an agent container in diagnostics: {containers:?}"
+    );
+    let agent = agent.unwrap();
+
+    // Agent should have exited with code 42
+    assert_eq!(
+        agent.get("exit_code").and_then(|v| v.as_i64()),
+        Some(42),
+        "Agent container exit_code should be 42: {agent}"
+    );
+
+    // Agent should have non-empty state
+    assert!(
+        agent
+            .get("state")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "Agent container should have a state: {agent}"
+    );
+
+    // logs_tail should be present (may be empty if agent exited immediately)
+    assert!(
+        agent.get("logs_tail").and_then(|v| v.as_str()).is_some(),
+        "Agent container should have logs_tail field: {agent}"
+    );
+
+    tracing::info!(
+        "Diagnostics endpoint test passed: {} containers reported",
+        containers.len()
+    );
+    Ok(())
+}
+podman_integration_test!(test_harness_diagnostics_endpoint_captures_failure);

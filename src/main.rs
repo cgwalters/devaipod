@@ -5270,6 +5270,9 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
     // Check MCP connectivity
     let mcp_info = collect_mcp_debug(pod_name);
 
+    // Collect per-container diagnostics (logs, exit codes, state)
+    let container_diagnostics = collect_container_diagnostics(pod_name);
+
     if json_output {
         let debug_info = json!({
             "pod": {
@@ -5280,6 +5283,7 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
             "gator": gator_info,
             "agent": agent_info,
             "mcp": mcp_info,
+            "containers": container_diagnostics,
         });
         println!("{}", serde_json::to_string_pretty(&debug_info)?);
     } else {
@@ -5359,6 +5363,42 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
             }
         } else {
             println!("  (unable to check)");
+        }
+        println!();
+
+        // Container logs section
+        println!("--- Container Logs ---");
+        if let Some(containers) = container_diagnostics.as_array() {
+            if containers.is_empty() {
+                println!("  (no containers found)");
+            }
+            for c in containers {
+                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let state = c.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let exit_code = c.get("exit_code").and_then(|v| v.as_i64());
+                let health = c.get("health_status").and_then(|v| v.as_str());
+                let logs = c.get("logs_tail").and_then(|v| v.as_str()).unwrap_or("");
+
+                // Build the status line
+                let status = match (state, exit_code, health) {
+                    ("exited", Some(code), _) => format!("exited (exit code: {})", code),
+                    (s, _, Some(h)) => format!("{} ({})", s, h),
+                    (s, _, None) => s.to_string(),
+                };
+                println!("  {}: {}", name, status);
+
+                if logs.is_empty() {
+                    println!("    (no recent output)");
+                } else {
+                    let lines: Vec<&str> = logs.lines().collect();
+                    println!("    (last {} lines)", lines.len());
+                    for line in &lines {
+                        println!("    {}", line);
+                    }
+                }
+            }
+        } else {
+            println!("  (unable to collect container info)");
         }
     }
 
@@ -5474,6 +5514,129 @@ fn collect_mcp_debug(pod_name: &str) -> Option<serde_json::Value> {
     Some(json!({
         "gator_reachable": gator_reachable,
     }))
+}
+
+/// Collect per-container diagnostics: state, exit codes, health, and recent logs.
+fn collect_container_diagnostics(pod_name: &str) -> serde_json::Value {
+    use serde_json::json;
+
+    let containers_output = match podman_command()
+        .args([
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            &format!("pod={}", pod_name),
+            "--format",
+            "json",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return json!([]),
+    };
+
+    let container_list: Vec<serde_json::Value> =
+        match serde_json::from_slice(&containers_output.stdout) {
+            Ok(v) => v,
+            Err(_) => return json!([]),
+        };
+
+    let pod_prefix = format!("{}-", pod_name);
+
+    let mut results = Vec::new();
+    for entry in &container_list {
+        // podman container ls --format json uses "Names" (array) or "Name" (string)
+        let container_name = entry
+            .get("Names")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("Name").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+
+        if container_name.is_empty() {
+            continue;
+        }
+
+        // Strip pod prefix for readability (e.g. "devaipod-myproject-abc-agent" → "agent")
+        let display_name = container_name
+            .strip_prefix(&pod_prefix)
+            .unwrap_or(&container_name)
+            .to_string();
+
+        // Skip the infra container -- it's internal to podman
+        if display_name == "infra" {
+            continue;
+        }
+
+        // Get detailed state/exit_code/health via inspect
+        let (state, exit_code, health_status) = match podman_command()
+            .args(["inspect", "--format", "json", "--", &container_name])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let inspect: Vec<serde_json::Value> =
+                    serde_json::from_slice(&o.stdout).unwrap_or_default();
+                if let Some(info) = inspect.first() {
+                    let state_obj = info.get("State");
+                    let st = state_obj
+                        .and_then(|s| s.get("Status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let ec = state_obj
+                        .and_then(|s| s.get("ExitCode"))
+                        .and_then(|v| v.as_i64());
+                    let hs = state_obj
+                        .and_then(|s| s.get("Health"))
+                        .and_then(|h| h.get("Status"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    (st, ec, hs)
+                } else {
+                    ("unknown".to_string(), None, None)
+                }
+            }
+            _ => ("unknown".to_string(), None, None),
+        };
+
+        // Get last 30 lines of logs
+        let logs_tail = match podman_command()
+            .args(["logs", "--tail", "30", "--", &container_name])
+            .output()
+        {
+            Ok(o) => {
+                // Combine stdout and stderr (many containers log to stderr)
+                let mut combined = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr_str = String::from_utf8_lossy(&o.stderr);
+                if !stderr_str.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&stderr_str);
+                }
+                combined.trim().to_string()
+            }
+            Err(_) => String::new(),
+        };
+
+        let mut entry = json!({
+            "name": display_name,
+            "state": state,
+            "logs_tail": logs_tail,
+        });
+        if let Some(ec) = exit_code {
+            entry["exit_code"] = json!(ec);
+        }
+        if let Some(hs) = &health_status {
+            entry["health_status"] = json!(hs);
+        }
+        results.push(entry);
+    }
+
+    json!(results)
 }
 
 /// Interact with the opencode agent programmatically
