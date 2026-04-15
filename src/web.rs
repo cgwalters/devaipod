@@ -2786,6 +2786,184 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
     }
 }
 
+// =============================================================================
+// Pod diagnostics endpoint — returns structured debug info for a pod
+// =============================================================================
+
+/// Top-level response from `GET /api/devaipod/pods/{name}/diagnostics`.
+#[derive(Debug, Serialize)]
+struct PodDiagnosticsResponse {
+    pod: DiagnosticsPodInfo,
+    containers: Vec<DiagnosticsContainerInfo>,
+}
+
+/// Pod-level info in the diagnostics response.
+#[derive(Debug, Serialize)]
+struct DiagnosticsPodInfo {
+    name: String,
+    state: String,
+    id: String,
+}
+
+/// Per-container info in the diagnostics response.
+#[derive(Debug, Serialize)]
+struct DiagnosticsContainerInfo {
+    name: String,
+    state: String,
+    exit_code: Option<i64>,
+    health_status: Option<String>,
+    logs_tail: String,
+}
+
+/// Collect diagnostic information for a pod.
+///
+/// Shells out to `podman pod inspect` and `podman inspect`/`podman logs` for
+/// each container in the pod.  Used by the CLI and integration tests to debug
+/// pod startup failures.
+async fn pod_diagnostics(
+    Path(name): Path<String>,
+) -> Result<Json<PodDiagnosticsResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+
+    // All podman commands are blocking I/O; run on the blocking pool.
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<PodDiagnosticsResponse, (StatusCode, String)> {
+            // --- Pod-level info via `podman pod inspect` ---
+            let pod_inspect_output = std::process::Command::new("podman")
+                .args(["pod", "inspect", "--format", "json", "--"])
+                .arg(&pod_name)
+                .output()
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to run podman: {e}"),
+                    )
+                })?;
+
+            if !pod_inspect_output.status.success() {
+                let stderr = String::from_utf8_lossy(&pod_inspect_output.stderr);
+                if stderr.contains("no such pod") || stderr.contains("not found") {
+                    return Err((StatusCode::NOT_FOUND, format!("Pod '{pod_name}' not found")));
+                }
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("podman pod inspect failed: {stderr}"),
+                ));
+            }
+
+            let pod_json: serde_json::Value = serde_json::from_slice(&pod_inspect_output.stdout)
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to parse pod inspect output: {e}"),
+                    )
+                })?;
+
+            let pod_info = DiagnosticsPodInfo {
+                name: pod_json["Name"].as_str().unwrap_or(&pod_name).to_string(),
+                state: pod_json["State"].as_str().unwrap_or("Unknown").to_string(),
+                id: pod_json["Id"].as_str().unwrap_or("").to_string(),
+            };
+
+            // Collect container IDs/names from the pod inspect output.
+            let container_ids: Vec<String> = pod_json["Containers"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            // Use Name if available, otherwise Id
+                            c["Name"]
+                                .as_str()
+                                .or_else(|| c["Id"].as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // --- Per-container info ---
+            let mut containers = Vec::new();
+            for ctr_id in &container_ids {
+                // `podman inspect` for state/exit_code/health
+                let inspect_output = std::process::Command::new("podman")
+                    .args(["inspect", "--format", "json", "--"])
+                    .arg(ctr_id)
+                    .output();
+
+                let (state, exit_code, health_status, ctr_name) = match inspect_output {
+                    Ok(out) if out.status.success() => {
+                        // podman inspect returns a JSON array with one element
+                        let arr: Vec<serde_json::Value> =
+                            serde_json::from_slice(&out.stdout).unwrap_or_default();
+                        let ctr = arr.first().cloned().unwrap_or_default();
+
+                        let name = ctr["Name"].as_str().unwrap_or(ctr_id).to_string();
+                        let st = ctr["State"]["Status"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let ec = ctr["State"]["ExitCode"].as_i64();
+                        let hs = ctr["State"]["Health"]["Status"]
+                            .as_str()
+                            .map(|s| s.to_string());
+
+                        (st, ec, hs, name)
+                    }
+                    _ => ("unknown".to_string(), None, None, ctr_id.clone()),
+                };
+
+                // `podman logs --tail 50` for recent output (combined stdout+stderr)
+                let logs_tail = match std::process::Command::new("podman")
+                    .args(["logs", "--tail", "50", "--"])
+                    .arg(ctr_id)
+                    .output()
+                {
+                    Ok(out) => {
+                        // Combine stdout and stderr
+                        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+                        let stderr_str = String::from_utf8_lossy(&out.stderr);
+                        if !stderr_str.is_empty() {
+                            if !combined.is_empty() {
+                                combined.push('\n');
+                            }
+                            combined.push_str(&stderr_str);
+                        }
+                        combined
+                    }
+                    Err(e) => format!("(failed to collect logs: {e})"),
+                };
+
+                containers.push(DiagnosticsContainerInfo {
+                    name: ctr_name,
+                    state,
+                    exit_code,
+                    health_status,
+                    logs_tail,
+                });
+            }
+
+            Ok(PodDiagnosticsResponse {
+                pod: pod_info,
+                containers,
+            })
+        },
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("spawn_blocking panicked: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                error: "Internal error".to_string(),
+            }),
+        )
+    })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
+}
+
 // Git endpoints (git_status, git_diff, git_commits, git_log, git_diff_range,
 // git_fetch_agent, git_push) and exec_in_container have been removed.
 // The pod-api sidecar now handles all git operations directly, and the frontend
@@ -4303,6 +4481,7 @@ fn build_app_with_cache(
         .route("/devaipod/proposals", get(list_proposals_api))
         .route("/devaipod/proposals/{id}/dismiss", post(dismiss_proposal))
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
+        .route("/devaipod/pods/{name}/diagnostics", get(pod_diagnostics))
         .route(
             "/devaipod/pods/{name}/gator-scopes",
             get(get_gator_scopes).put(update_gator_scopes),
