@@ -1,5 +1,13 @@
 # devaipod
 
+This project was a useful experiment, however the author has found it easier in practice to
+just use separate isolated Unix users or other tools, and now investing in [OpenShell](https://github.com/NVIDIA/OpenShell)
+among other things.
+
+Historical README.md content:
+
+---
+
 A fine-grained sandboxing tool for agentic AI that can run 100% locally. No "open core" here, no cloud services except those you configure.
 
 Combines in an opinionated way:
