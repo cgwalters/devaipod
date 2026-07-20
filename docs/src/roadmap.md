@@ -26,6 +26,7 @@ Larger features under consideration:
 - **Nested devaipods**: MCP tool allowing agents to spawn additional sandboxed environments
 - **Worker orchestration API**: MCP tools or OpenCode skill for task owner to programmatically assign subtasks to worker (see [worker-orchestration-api.md](../todo/worker-orchestration-api.md))
 - **Devcontainer features support**: Install devcontainer features into the workspace image
+- **Agent Client Protocol (ACP)**: Decouple from OpenCode, enable pluggable agents via ACP (see [acp-integration.md](../todo/acp-integration.md))
 - **Multi-project workspaces**: Support for monorepos or multi-repo setups
 - **Persistent agent state**: Named volumes for agent home so context persists across pod restarts
 - **Bot/assistant accounts**: OAuth2 apps with "on behalf of" authentication instead of PATs
@@ -34,4 +35,4 @@ Larger features under consideration:
 
 - **Agent requires opencode in the image**: The agent container runs `opencode serve`, so opencode must be installed in the devcontainer image
 - **Lifecycle commands only run in workspace**: onCreateCommand etc. run in the workspace container, not the agent container
-- **Single agent type**: Only opencode is currently tested
+- **Single agent type**: Only opencode is currently tested (see [acp-integration.md](../todo/acp-integration.md) for the plan to support pluggable agents via ACP)
