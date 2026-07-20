@@ -25,10 +25,15 @@ import {
   DevaipodProvider,
   useDevaipod,
   type PodInfo,
+  type DevcontainerPod,
   type Proposal,
   type LaunchWorkspaceParams,
   type GatorScopeConfig,
   type GatorScopesResponse,
+  type ControlPlaneRepo,
+  type ControlPlaneAgent,
+  type ControlPlaneDevcontainer,
+  frecencySortPods,
   effectiveTimestamp,
   type SortBy,
   type GroupBy,
@@ -36,6 +41,26 @@ import {
   sortPods,
   groupPods,
 } from "@/context/devaipod"
+import { apiFetch } from "@/utils/devaipod-api"
+
+// ---------------------------------------------------------------------------
+// Diff types (from GET /api/devaipod/pods/{name}/diff)
+// ---------------------------------------------------------------------------
+
+interface DiffCommit {
+  sha: string
+  message: string
+  author: string
+  timestamp: string
+}
+
+interface DiffResponse {
+  branch: string
+  commit_count: number
+  commits: DiffCommit[]
+  diff: string
+  is_stat: boolean
+}
 
 // ---------------------------------------------------------------------------
 // Page wrapper — provides context
@@ -395,6 +420,10 @@ function PodsPageContent() {
   const [showForm, setShowForm] = createSignal(false)
   const [focusedIdx, setFocusedIdx] = createSignal(-1)
   const [searchText, setSearchText] = createSignal("")
+  const [prefillSource, setPrefillSource] = createSignal("")
+
+  // Ref for the launch form area so we can scroll to it
+  let launchRef: HTMLDivElement | undefined
 
   // View preference state (createStore per project convention)
   const [viewPrefs, setViewPrefs] = createStore<ViewPrefs>(loadViewPrefs())
@@ -549,6 +578,18 @@ function PodsPageContent() {
     return offset
   }
 
+  // Quick-launch from a repo section: scroll to and open the launch form
+  function quickLaunchForRepo(repoLabel: string) {
+    // Try to find a recent source matching this repo label
+    const match = ctx.recentSources.find((rs) =>
+      rs.source.toLowerCase().includes(repoLabel.toLowerCase()),
+    )
+    setPrefillSource(match?.source ?? repoLabel)
+    setShowForm(true)
+    // Scroll to the launch form
+    setTimeout(() => launchRef?.scrollIntoView({ behavior: "smooth", block: "start" }), 50)
+  }
+
   return (
     <div class="h-full overflow-y-auto">
     <div class="mx-auto mt-8 w-full max-w-3xl px-4 pb-16">
@@ -584,7 +625,7 @@ function PodsPageContent() {
       </Show>
 
       {/* Launch form section */}
-      <div class="mb-6">
+      <div class="mb-6" ref={launchRef}>
         <Show
           when={showForm()}
           fallback={
@@ -593,55 +634,9 @@ function PodsPageContent() {
             </Button>
           }
         >
-          <LaunchForm onClose={() => setShowForm(false)} />
+          <LaunchForm onClose={() => setShowForm(false)} prefillSource={prefillSource()} />
         </Show>
       </div>
-
-      {/* Search bar and filter chips */}
-      <Show when={ctx.pods.length > 0}>
-        <div class="mb-4 flex flex-col gap-2">
-          <input
-            type="text"
-            placeholder="Search pods... (repo:name, task:text, status:running)"
-            class="w-full text-12-regular bg-background-base border border-border-base rounded px-3 py-2 text-text-strong placeholder:text-text-weak focus:outline-none focus:border-border-active-base"
-            value={searchText()}
-            onInput={(e) => setSearchText(e.currentTarget.value)}
-          />
-          <div class="flex gap-1">
-            <For each={["all", "running", "stopped", "done"] as PodFilter[]}>
-              {(f) => {
-                const count = () => filterCounts()[f]
-                return (
-                  <button
-                    type="button"
-                    class="px-2.5 py-1 rounded text-12-regular transition-colors cursor-pointer"
-                    classList={{
-                      "bg-fill-element-active text-text-strong": activeStatusFilter() === f,
-                      "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base": activeStatusFilter() !== f,
-                    }}
-                    onClick={() => applyStatusFilter(f)}
-                  >
-                    {f.charAt(0).toUpperCase() + f.slice(1)}
-                    <span class="ml-1 opacity-60">{count()}</span>
-                  </button>
-                )
-              }}
-            </For>
-          </div>
-        </div>
-      </Show>
-
-      {/* View toolbar */}
-      <Show when={ctx.pods.length > 0}>
-        <ViewToolbar
-          sortBy={viewPrefs.sortBy}
-          groupBy={viewPrefs.groupBy}
-          density={viewPrefs.density}
-          onSortChange={(s) => setViewPrefs("sortBy", s)}
-          onGroupChange={(g) => setViewPrefs("groupBy", g)}
-          onDensityChange={(d) => setViewPrefs("density", d)}
-        />
-      </Show>
 
       {/* Advisor placeholder when no advisor pod exists */}
       <Show when={!ctx.hasAdvisor()}>
@@ -653,79 +648,659 @@ function PodsPageContent() {
         {([podName, info]) => <LaunchCard podName={podName} state={info} />}
       </For>
 
-      {/* Pod list */}
-      <Show
-        when={ctx.pods.length > 0 || pendingLaunches().length > 0}
-        fallback={
-          <Show when={ctx.connected !== undefined}>
-            <div class="flex flex-col items-center justify-center py-12 text-text-weak">
-              <div class="mb-3 opacity-30">
-                <Icon name="server" size="large" />
-              </div>
-              <p class="text-14-medium mb-1">No workspaces found</p>
-              <p class="text-12-regular">Launch one with the button above</p>
+      {/* Control plane repo-grouped view — primary content */}
+      <ControlPlaneView onQuickLaunch={quickLaunchForRepo} />
+
+      {/* Empty state when no data at all */}
+      <Show when={ctx.pods.length === 0 && ctx.controlPlane.length === 0 && pendingLaunches().length === 0}>
+        <Show when={ctx.connected !== undefined}>
+          <div class="flex flex-col items-center justify-center py-12 text-text-weak">
+            <div class="mb-3 opacity-30">
+              <Icon name="server" size="large" />
             </div>
-          </Show>
-        }
-      >
-        <Show
-          when={filteredPods().length > 0}
-          fallback={
-            <div class="flex flex-col items-center justify-center py-8 text-text-weak">
-              <p class="text-12-regular">
-                {searchText().trim() ? "No matching workspaces" : "No workspaces"}
-              </p>
-            </div>
-          }
-        >
-          <div class="flex flex-col gap-3">
-            <For each={groupedPods()}>
-              {(group, groupIdx) => {
-                const offset = () => flatIndexOffset(groupIdx())
-                return (
-                  <>
-                    <Show when={showDividers() && group.label}>
-                      <div class="flex items-center gap-3 my-2">
-                        <hr class="flex-1 border-t border-border-base" />
-                        <span class="text-11-regular text-text-weak shrink-0">
-                          {group.label}
-                          <Show when={group.pods.length > 1}>
-                            <span class="ml-1 opacity-60">({group.pods.length})</span>
-                          </Show>
-                        </span>
-                        <hr class="flex-1 border-t border-border-base" />
-                      </div>
-                    </Show>
-                    <For each={group.pods}>
-                      {(pod, podIdx) => (
-                        <Show
-                          when={viewPrefs.density === "compact"}
-                          fallback={
-                            <PodCard
-                              pod={pod}
-                              focused={focusedIdx() === offset() + podIdx()}
-                              onFocus={() => setFocusedIdx(offset() + podIdx())}
-                            />
-                          }
-                        >
-                          <CompactPodCard
-                            pod={pod}
-                            focused={focusedIdx() === offset() + podIdx()}
-                            onFocus={() => setFocusedIdx(offset() + podIdx())}
-                            hideRepo={viewPrefs.groupBy === "repo"}
-                          />
-                        </Show>
-                      )}
-                    </For>
-                  </>
-                )
-              }}
-            </For>
+            <p class="text-14-medium mb-1">No workspaces found</p>
+            <p class="text-12-regular">Launch one with the button above</p>
           </div>
         </Show>
       </Show>
+
+      {/* All Pods — collapsible flat list for power users */}
+      <Show when={ctx.pods.length > 0}>
+        <div class="mt-8">
+          <Collapsible variant="ghost">
+            <Collapsible.Trigger class="flex items-center gap-2 text-13-regular text-text-weak cursor-pointer hover:text-text-secondary-base transition-colors">
+              <Collapsible.Arrow />
+              All Pods ({ctx.pods.length})
+            </Collapsible.Trigger>
+            <Collapsible.Content class="mt-3">
+              {/* Search bar and filter chips */}
+              <div class="mb-4 flex flex-col gap-2">
+                <input
+                  type="text"
+                  placeholder="Search pods... (repo:name, task:text, status:running)"
+                  class="w-full text-12-regular bg-background-base border border-border-base rounded px-3 py-2 text-text-strong placeholder:text-text-weak focus:outline-none focus:border-border-active-base"
+                  value={searchText()}
+                  onInput={(e) => setSearchText(e.currentTarget.value)}
+                />
+                <div class="flex gap-1">
+                  <For each={["all", "running", "stopped", "done"] as PodFilter[]}>
+                    {(f) => {
+                      const count = () => filterCounts()[f]
+                      return (
+                        <button
+                          type="button"
+                          class="px-2.5 py-1 rounded text-12-regular transition-colors cursor-pointer"
+                          classList={{
+                            "bg-fill-element-active text-text-strong": activeStatusFilter() === f,
+                            "text-text-weak hover:text-text-secondary-base hover:bg-fill-element-base": activeStatusFilter() !== f,
+                          }}
+                          onClick={() => applyStatusFilter(f)}
+                        >
+                          {f.charAt(0).toUpperCase() + f.slice(1)}
+                          <span class="ml-1 opacity-60">{count()}</span>
+                        </button>
+                      )
+                    }}
+                  </For>
+                </div>
+              </div>
+
+              <ViewToolbar
+                sortBy={viewPrefs.sortBy}
+                groupBy={viewPrefs.groupBy}
+                density={viewPrefs.density}
+                onSortChange={(s) => setViewPrefs("sortBy", s)}
+                onGroupChange={(g) => setViewPrefs("groupBy", g)}
+                onDensityChange={(d) => setViewPrefs("density", d)}
+              />
+
+              <Show
+                when={filteredPods().length > 0}
+                fallback={
+                  <div class="flex flex-col items-center justify-center py-8 text-text-weak">
+                    <p class="text-12-regular">
+                      {searchText().trim() ? "No matching workspaces" : "No workspaces"}
+                    </p>
+                  </div>
+                }
+              >
+                <div class="flex flex-col gap-3">
+                  <For each={groupedPods()}>
+                    {(group, groupIdx) => {
+                      const offset = () => flatIndexOffset(groupIdx())
+                      return (
+                        <>
+                          <Show when={showDividers() && group.label}>
+                            <div class="flex items-center gap-3 my-2">
+                              <hr class="flex-1 border-t border-border-base" />
+                              <span class="text-11-regular text-text-weak shrink-0">
+                                {group.label}
+                                <Show when={group.pods.length > 1}>
+                                  <span class="ml-1 opacity-60">({group.pods.length})</span>
+                                </Show>
+                              </span>
+                              <hr class="flex-1 border-t border-border-base" />
+                            </div>
+                          </Show>
+                          <For each={group.pods}>
+                            {(pod, podIdx) => (
+                              <Show
+                                when={viewPrefs.density === "compact"}
+                                fallback={
+                                  <PodCard
+                                    pod={pod}
+                                    focused={focusedIdx() === offset() + podIdx()}
+                                    onFocus={() => setFocusedIdx(offset() + podIdx())}
+                                  />
+                                }
+                              >
+                                <CompactPodCard
+                                  pod={pod}
+                                  focused={focusedIdx() === offset() + podIdx()}
+                                  onFocus={() => setFocusedIdx(offset() + podIdx())}
+                                  hideRepo={viewPrefs.groupBy === "repo"}
+                                />
+                              </Show>
+                            )}
+                          </For>
+                        </>
+                      )
+                    }}
+                  </For>
+                </div>
+              </Show>
+            </Collapsible.Content>
+          </Collapsible>
+        </div>
+      </Show>
+
+      {/* Devcontainers section */}
+      <DevcontainerSection />
     </div>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Control Plane — repo-grouped view
+// ---------------------------------------------------------------------------
+
+/** Format an ISO timestamp as a relative "time ago" string. */
+function timeAgo(iso: string): string {
+  const ts = new Date(iso).getTime()
+  if (Number.isNaN(ts)) return ""
+  const age = Date.now() - ts
+  if (age < 60_000) return "just now"
+  const mins = Math.floor(age / 60_000)
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days === 1) return "1d ago"
+  return `${days}d ago`
+}
+
+function ControlPlaneView(props: { onQuickLaunch: (repoLabel: string) => void }) {
+  const ctx = useDevaipod()
+  const [showInactive, setShowInactive] = createSignal(true)
+
+  const activeRepos = createMemo(() =>
+    ctx.controlPlane.filter((r) => r.active_count > 0),
+  )
+  const inactiveRepos = createMemo(() =>
+    ctx.controlPlane.filter((r) => r.active_count === 0),
+  )
+
+  return (
+    <Show when={ctx.controlPlane.length > 0}>
+      <div class="mb-8">
+        <h2 class="text-16-medium text-text-strong mb-4">Repos</h2>
+        <div class="flex flex-col gap-3">
+          <For each={activeRepos()}>
+            {(repo) => <RepoSection repo={repo} defaultOpen={true} onQuickLaunch={props.onQuickLaunch} />}
+          </For>
+
+          <Show when={inactiveRepos().length > 0}>
+            <button
+              type="button"
+              class="flex items-center gap-2 text-12-regular text-text-weak hover:text-text-secondary-base transition-colors cursor-pointer py-1"
+              onClick={() => setShowInactive((v) => !v)}
+            >
+              <span class="text-text-weak">{showInactive() ? "\u25BC" : "\u25B8"}</span>
+              Inactive repos ({inactiveRepos().length})
+            </button>
+            <Show when={showInactive()}>
+              <For each={inactiveRepos()}>
+                {(repo) => <RepoSection repo={repo} defaultOpen={true} onQuickLaunch={props.onQuickLaunch} />}
+              </For>
+            </Show>
+          </Show>
+        </div>
+      </div>
+    </Show>
+  )
+}
+
+function RepoSection(props: { repo: ControlPlaneRepo; defaultOpen: boolean; onQuickLaunch: (repoLabel: string) => void }) {
+  const [open, setOpen] = createSignal(props.defaultOpen)
+
+  // Show last path component for short display, full for title
+  const shortRepoName = () => {
+    const parts = props.repo.repo.split("/")
+    return parts.length > 1 ? parts.slice(-2).join("/") : props.repo.repo
+  }
+
+  return (
+    <div class="border border-border-base rounded">
+      {/* Repo header */}
+      <div class="flex items-center">
+        <button
+          type="button"
+          class="flex-1 flex items-center justify-between px-4 py-2.5 hover:bg-surface-secondary transition-colors cursor-pointer min-w-0"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="text-text-weak text-11-regular">{open() ? "\u25BC" : "\u25B6"}</span>
+            <span class="text-13-regular text-text-strong truncate">{shortRepoName()}</span>
+          </div>
+          <Show when={props.repo.active_count > 0}>
+            <span class="text-11-regular text-text-weak bg-fill-element-base px-2 py-0.5 rounded-full">
+              {props.repo.active_count} active
+            </span>
+          </Show>
+        </button>
+        <button
+          type="button"
+          class="px-2.5 py-2.5 text-text-weak hover:text-text-strong hover:bg-surface-secondary transition-colors cursor-pointer text-12-regular"
+          title={`Launch new workspace for ${shortRepoName()}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            props.onQuickLaunch(props.repo.repo)
+          }}
+        >
+          +
+        </button>
+      </div>
+
+      {/* Repo body */}
+      <Show when={open()}>
+        <div class="border-t border-border-base">
+          <For each={props.repo.agents}>
+            {(agent) => <AgentRow agent={agent} />}
+          </For>
+          <For each={props.repo.devcontainers}>
+            {(dc) => <DevcontainerRow dc={dc} />}
+          </For>
+          <Show when={props.repo.agents.length === 0 && props.repo.devcontainers.length === 0}>
+            <div class="px-4 py-3 text-12-regular text-text-weak">No workspaces</div>
+          </Show>
+        </div>
+      </Show>
+    </div>
+  )
+}
+
+function AgentRow(props: { agent: ControlPlaneAgent }) {
+  const ctx = useDevaipod()
+  const a = () => props.agent
+  const [showDiff, setShowDiff] = createSignal(false)
+
+  const statusDot = createMemo(() => {
+    if (a().completion_status === "done") return { char: "\u25C9", cls: "text-violet-400" }
+    if (a().is_running) return { char: "\u25CF", cls: "text-icon-success-base" }
+    return { char: "\u25CF", cls: "text-text-weak" }
+  })
+
+  const displayName = () => a().title || a().short_name
+  const statusLabel = () => {
+    if (a().title) return a().short_name
+    if (a().completion_status === "done") return "Done"
+    return a().status
+  }
+
+  const lastActive = () => {
+    if (a().last_active) return timeAgo(a().last_active!)
+    return timeAgo(a().created)
+  }
+
+  // Cross-reference with pod-level agent status for activity info
+  const podAgentStatus = () => ctx.agentStatus[a().name]
+  const activityText = createMemo(() => {
+    const s = podAgentStatus()
+    if (!s) return null
+    if (s.current_tool) return `\u2192 ${s.current_tool}`
+    if (s.status_line) return s.status_line
+    return s.activity !== "Unknown" ? s.activity : null
+  })
+
+  const isDone = () => a().completion_status === "done"
+
+  function navigate() {
+    window.location.href = `/agent/${encodeURIComponent(a().name)}/`
+  }
+
+  return (
+    <div class="border-t border-border-base first:border-t-0">
+      <div class="flex items-center gap-3 px-4 py-2 hover:bg-surface-secondary transition-colors">
+        {/* Status dot */}
+        <span classList={{ [statusDot().cls]: true, "text-11-regular": true }}>{statusDot().char}</span>
+
+        {/* Name + task subtitle */}
+        <button
+          type="button"
+          class="flex-1 min-w-0 text-left cursor-pointer"
+          onClick={navigate}
+        >
+          <div class="flex items-center gap-2">
+            <span
+              class="text-12-regular truncate"
+              classList={{
+                "text-text-strong": a().is_running && !isDone(),
+                "text-text-weak": !a().is_running || isDone(),
+              }}
+            >
+              {displayName()}
+            </span>
+            <span class="text-11-regular text-text-weak truncate shrink-0 max-w-[120px]">{statusLabel()}</span>
+          </div>
+          <Show when={a().task}>
+            <div class="text-11-regular text-text-weak truncate mt-0.5">{a().task}</div>
+          </Show>
+        </button>
+
+        {/* Activity status from pod data */}
+        <Show when={activityText() && a().is_running && !isDone()}>
+          <span class="text-11-regular text-text-weak truncate shrink-0 max-w-[140px]">{activityText()}</span>
+        </Show>
+
+        {/* Time ago */}
+        <span class="text-11-regular text-text-weak shrink-0">{lastActive()}</span>
+
+        {/* Diff button for done agents */}
+        <Show when={isDone()}>
+          <button
+            type="button"
+            class="text-11-regular text-text-link hover:underline cursor-pointer shrink-0"
+            onClick={(e) => {
+              e.stopPropagation()
+              setShowDiff((v) => !v)
+            }}
+          >
+            {showDiff() ? "hide diff" : "diff"}
+          </button>
+        </Show>
+
+        {/* Navigate arrow for running agents */}
+        <Show when={a().is_running}>
+          <span class="text-text-weak text-11-regular shrink-0">{"\u2192"}</span>
+        </Show>
+      </div>
+
+      {/* Inline diff panel */}
+      <Show when={showDiff()}>
+        <DiffPanel podName={a().name} />
+      </Show>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Diff panel — inline expandable diff viewer
+// ---------------------------------------------------------------------------
+
+function DiffPanel(props: { podName: string }) {
+  const [diffData, setDiffData] = createSignal<DiffResponse | null>(null)
+  const [loading, setLoading] = createSignal(true)
+  const [error, setError] = createSignal("")
+  const [showFull, setShowFull] = createSignal(false)
+
+  // Fetch diff data. Re-fetch when showFull changes.
+  createEffect(() => {
+    const stat = !showFull()
+    setLoading(true)
+    setError("")
+    apiFetch<DiffResponse>(
+      `/api/devaipod/pods/${encodeURIComponent(props.podName)}/diff?stat=${stat}`,
+    )
+      .then((data) => setDiffData(data))
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        // Gracefully handle 404 (endpoint may not exist yet)
+        if (msg.includes("404")) {
+          setError("Diff not available for this agent")
+        } else {
+          setError(msg)
+        }
+        setDiffData(null)
+      })
+      .finally(() => setLoading(false))
+  })
+
+  return (
+    <div class="pl-10 pr-4 py-3 border-l-2 border-border-base ml-4 bg-surface-secondary/30">
+      <Show when={loading()}>
+        <div class="flex items-center gap-2 text-12-regular text-text-weak">
+          <Spinner class="size-3.5" />
+          Loading diff...
+        </div>
+      </Show>
+
+      <Show when={!loading() && error()}>
+        <span class="text-11-regular text-text-weak">{error()}</span>
+      </Show>
+
+      <Show when={!loading() && diffData()}>
+        {(data) => (
+          <>
+            <div class="text-11-regular text-text-secondary-base mb-1">
+              <span class="font-mono">{data().branch}</span>
+              <span class="text-text-weak"> — {data().commit_count} commit{data().commit_count !== 1 ? "s" : ""}</span>
+            </div>
+            <Show when={data().commits.length > 0}>
+              <div class="flex flex-col gap-0.5 mb-2">
+                <For each={data().commits}>
+                  {(commit) => (
+                    <div class="text-11-regular text-text-weak">
+                      <span class="font-mono text-text-secondary-base">{commit.sha.slice(0, 7)}</span>
+                      {" "}{commit.message}
+                      <span class="ml-2 opacity-60">{timeAgo(commit.timestamp)}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
+            <Show when={data().diff}>
+              <pre class="text-11-regular mt-1 overflow-x-auto max-h-96 overflow-y-auto bg-surface-secondary p-2 rounded border border-border-base font-mono whitespace-pre-wrap break-all">
+                {data().diff}
+              </pre>
+            </Show>
+            <Show when={data().is_stat}>
+              <button
+                type="button"
+                class="text-11-regular text-text-link mt-2 cursor-pointer hover:underline"
+                onClick={() => setShowFull(true)}
+              >
+                Show full diff
+              </button>
+            </Show>
+            <Show when={!data().is_stat && showFull()}>
+              <button
+                type="button"
+                class="text-11-regular text-text-link mt-2 cursor-pointer hover:underline"
+                onClick={() => setShowFull(false)}
+              >
+                Show summary
+              </button>
+            </Show>
+          </>
+        )}
+      </Show>
+    </div>
+  )
+}
+
+function DevcontainerRow(props: { dc: ControlPlaneDevcontainer }) {
+  const dc = () => props.dc
+
+  return (
+    <div class="flex items-center gap-3 px-4 py-2 border-t border-border-base first:border-t-0">
+      <span class="text-11-regular text-text-weak bg-fill-element-base px-1.5 py-0.5 rounded font-mono">DC</span>
+      <span
+        class="text-12-regular truncate min-w-0 flex-1"
+        classList={{
+          "text-text-strong": dc().is_running,
+          "text-text-weak": !dc().is_running,
+        }}
+      >
+        {dc().short_name}
+      </span>
+      <span class="text-11-regular text-text-weak shrink-0">
+        {dc().is_running ? "Running" : "Stopped"}
+      </span>
+      <Show when={dc().is_running}>
+        <span class="text-11-regular text-text-weak font-mono shrink-0">ssh {dc().short_name}</span>
+      </Show>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Devcontainer section
+// ---------------------------------------------------------------------------
+
+function DevcontainerSection() {
+  const ctx = useDevaipod()
+  const [source, setSource] = createSignal("")
+  const [launching, setLaunching] = createSignal(false)
+  const [error, setError] = createSignal("")
+
+  const isRunning = (dc: DevcontainerPod) =>
+    (dc.status ?? "").toLowerCase() === "running"
+
+  async function handleLaunch(e: Event) {
+    e.preventDefault()
+    const src = source().trim()
+    if (!src) return
+    setLaunching(true)
+    setError("")
+    try {
+      await ctx.launchDevcontainer(src)
+      setSource("")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLaunching(false)
+    }
+  }
+
+  return (
+    <div class="mt-10 pt-6 border-t border-border-base">
+      {/* Section header */}
+      <div class="flex items-center gap-3 mb-4">
+        <h2 class="text-16-medium text-text-strong">Devcontainers</h2>
+        <span class="text-11-regular text-text-weak bg-fill-element-base px-2 py-0.5 rounded-full">
+          {ctx.devcontainers.length}
+        </span>
+      </div>
+
+      {/* Launch form */}
+      <form onSubmit={handleLaunch} class="flex gap-2 mb-4">
+        <input
+          type="text"
+          placeholder="Path or URL"
+          class="flex-1 text-12-regular bg-background-base border border-border-base rounded px-3 py-2 text-text-strong placeholder:text-text-weak focus:outline-none focus:border-border-active-base"
+          value={source()}
+          onInput={(e) => setSource(e.currentTarget.value)}
+          disabled={launching()}
+        />
+        <Button variant="primary" size="small" type="submit" disabled={launching() || !source().trim()}>
+          {launching() ? "Launching..." : "Launch"}
+        </Button>
+      </form>
+
+      <Show when={error()}>
+        <Card variant="error" class="mb-4 p-3">
+          <span class="text-12-regular">{error()}</span>
+        </Card>
+      </Show>
+
+      {/* Devcontainer list */}
+      <Show
+        when={ctx.devcontainers.length > 0}
+        fallback={
+          <div class="flex flex-col items-center justify-center py-8 text-text-weak">
+            <p class="text-12-regular">No devcontainers</p>
+          </div>
+        }
+      >
+        <div class="flex flex-col gap-3">
+          <For each={ctx.devcontainers}>
+            {(dc) => <DevcontainerCard dc={dc} />}
+          </For>
+        </div>
+      </Show>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Devcontainer card
+// ---------------------------------------------------------------------------
+
+function DevcontainerCard(props: { dc: DevcontainerPod }) {
+  const ctx = useDevaipod()
+  const [actionError, setActionError] = createSignal("")
+
+  const shortName = () => props.dc.name.replace("devaipod-", "")
+  const isRunning = () => (props.dc.status ?? "").toLowerCase() === "running"
+  const repo = () => props.dc.labels?.["io.devaipod.repo"] ?? ""
+
+  async function withErrorHandling(fn: () => Promise<void>) {
+    setActionError("")
+    try {
+      await fn()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  return (
+    <Card class="p-4">
+      {/* Header row */}
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="text-14-medium text-text-strong truncate">{shortName()}</span>
+        </div>
+        <span
+          class="text-10-regular uppercase px-1.5 py-0.5 rounded"
+          classList={{
+            "bg-icon-success-base/20 text-icon-success-base": isRunning(),
+            "bg-icon-critical-base/20 text-icon-critical-base": !isRunning(),
+          }}
+        >
+          {isRunning() ? "Running" : "Stopped"}
+        </span>
+      </div>
+
+      {/* Metadata */}
+      <div class="text-12-regular text-text-weak flex flex-col gap-0.5 mb-3">
+        <Show when={repo()}>
+          <div>
+            <span class="text-text-weak">Repo: </span>
+            <span class="text-text-secondary-base">{repo()}</span>
+          </div>
+        </Show>
+        <div>
+          <span class="text-text-weak">Created: </span>
+          <span class="text-text-secondary-base">{formatDate(props.dc.created)}</span>
+        </div>
+      </div>
+
+      {/* Actions */}
+      <div class="flex gap-2 pt-2 border-t border-border-base">
+        <Show when={isRunning()}>
+          <Button
+            variant="secondary"
+            size="small"
+            onClick={() => withErrorHandling(() => ctx.stopDevcontainer(props.dc.name))}
+          >
+            Stop
+          </Button>
+        </Show>
+        <Show when={!isRunning()}>
+          <Button
+            variant="secondary"
+            size="small"
+            onClick={() => withErrorHandling(() => ctx.startDevcontainer(props.dc.name))}
+          >
+            Start
+          </Button>
+        </Show>
+        <Button
+          variant="ghost"
+          size="small"
+          class="text-text-critical-base"
+          onClick={() => {
+            if (confirm(`Delete devcontainer "${shortName()}"? This cannot be undone.`))
+              withErrorHandling(() => ctx.deleteDevcontainer(props.dc.name))
+          }}
+        >
+          Delete
+        </Button>
+        <Show when={isRunning()}>
+          <span class="ml-auto text-11-regular text-text-weak font-mono self-center" title="SSH into this devcontainer">
+            ssh {shortName()}
+          </span>
+        </Show>
+      </div>
+
+      {/* Action error */}
+      <Show when={actionError()}>
+        <Card variant="error" class="mt-3 p-2">
+          <span class="text-12-regular">{actionError()}</span>
+        </Card>
+      </Show>
+    </Card>
   )
 }
 
@@ -746,10 +1321,10 @@ function autoTitleFromTask(task: string): string {
   return lastSpace > 20 ? cut.slice(0, lastSpace) : cut
 }
 
-function LaunchForm(props: { onClose: () => void }) {
+function LaunchForm(props: { onClose: () => void; prefillSource?: string }) {
   const ctx = useDevaipod()
 
-  const [repoUrl, setRepoUrl] = createSignal("")
+  const [repoUrl, setRepoUrl] = createSignal(props.prefillSource ?? "")
   const [task, setTask] = createSignal("")
   const [podName, setPodName] = createSignal("")
   const [imageOverride, setImageOverride] = createSignal("")
@@ -762,6 +1337,36 @@ function LaunchForm(props: { onClose: () => void }) {
   const [autoTitle, setAutoTitle] = createSignal(true)
   const [submitting, setSubmitting] = createSignal(false)
   const [error, setError] = createSignal("")
+
+  /** Format a recent-source timestamp as a relative time label. */
+  function formatRecent(isoDate: string): string {
+    const ts = new Date(isoDate).getTime()
+    if (Number.isNaN(ts)) return ""
+    const age = Date.now() - ts
+    const hours = Math.floor(age / 3_600_000)
+    if (hours < 1) return "just now"
+    if (hours < 24) return `${hours}h ago`
+    const days = Math.floor(hours / 24)
+    if (days === 1) return "yesterday"
+    if (days < 7) return `${days}d ago`
+    if (days < 30) return `${Math.floor(days / 7)}w ago`
+    return `${Math.floor(days / 30)}mo ago`
+  }
+
+  /** Shorten a path for display: ~/src/foo instead of /home/user/src/foo. */
+  function shortenSource(s: string): string {
+    // Leave URLs alone
+    if (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("git@")) return s
+    // Collapse home dir
+    const home = "/home/"
+    const idx = s.indexOf(home)
+    if (idx === 0) {
+      const rest = s.slice(home.length)
+      const slash = rest.indexOf("/")
+      if (slash > 0) return "~" + rest.slice(slash)
+    }
+    return s
+  }
 
   function addScope() {
     setScopes((prev) => [...prev, ""])
@@ -825,12 +1430,37 @@ function LaunchForm(props: { onClose: () => void }) {
       <form onSubmit={handleSubmit}>
         <div class="flex flex-col gap-4">
           <TextField
-            label="Repository URL"
-            placeholder="https://github.com/org/repo or issue/PR URL"
+            label="Source"
+            placeholder="Local path, repo URL, issue/PR URL"
             value={repoUrl()}
             onChange={setRepoUrl}
             required
           />
+
+          <Show when={ctx.recentSources.length > 0 && !repoUrl().trim()}>
+            <div class="flex flex-col gap-1">
+              <span class="text-11-regular text-text-weak">Recent</span>
+              <div class="flex flex-col">
+                <For each={ctx.recentSources.slice(0, 8)}>
+                  {(recent) => (
+                    <button
+                      type="button"
+                      class="flex items-center justify-between px-2 py-1.5 rounded text-left hover:bg-surface-hover transition-colors group"
+                      onClick={() => setRepoUrl(recent.source)}
+                    >
+                      <span class="text-12-regular text-text-default truncate mr-3 font-mono">
+                        {shortenSource(recent.source)}
+                      </span>
+                      <span class="text-11-regular text-text-weak opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                        {formatRecent(recent.last_used)}
+                      </span>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </div>
+          </Show>
+
           <TextField
             label="Task (optional)"
             placeholder="Describe what the agent should work on..."

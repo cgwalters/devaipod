@@ -12,6 +12,140 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+// =============================================================================
+// Source configuration
+// =============================================================================
+
+/// Source access level for bind mounts.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceAccess {
+    /// Read-only everywhere (control plane + agent).
+    Readonly,
+    /// Read-write in control plane only, NOT mounted into agent containers.
+    /// This is the default because the control plane needs to write into source
+    /// repos for `devaipod fetch` (adding remotes and fetching branches).
+    /// Agents should never modify the user's original source trees.
+    #[default]
+    Controlplane,
+    /// Read-write everywhere (control plane + agent containers).
+    Agent,
+}
+
+/// A single source entry, supporting both shorthand and full forms.
+/// Shorthand: `src = "~/src"` (defaults to readonly)
+/// Full: `src = { path = "~/src", access = "controlplane" }`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SourceEntry {
+    /// Shorthand: just a path string (defaults to readonly access)
+    Short(String),
+    /// Full entry with explicit access level
+    Full(SourceEntryFull),
+}
+
+/// Full source entry with all options.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceEntryFull {
+    pub path: String,
+    #[serde(default)]
+    pub access: SourceAccess,
+}
+
+/// Resolved source information after path expansion.
+#[derive(Debug, Clone)]
+pub struct ResolvedSource {
+    pub name: String,
+    pub path: PathBuf,
+    pub access: SourceAccess,
+}
+
+/// Environment variable for the host's home directory.
+/// Set by the launcher so container-side tilde expansion resolves to host paths.
+pub const HOST_HOME_ENV: &str = "DEVAIPOD_HOST_HOME";
+
+/// Expand `~` in a path to the host home directory.
+/// Prefers DEVAIPOD_HOST_HOME (set by launcher) over HOME.
+fn expand_source_path(path: &str) -> PathBuf {
+    if let Some(suffix) = path.strip_prefix("~/") {
+        let home = std::env::var(HOST_HOME_ENV)
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| "/root".to_string());
+        PathBuf::from(home).join(suffix)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// Resolve a source shorthand like `src:github/org/repo` to a full path.
+/// Returns None if the source name is not found in the config or the path doesn't
+/// start with `<name>:`.
+pub fn resolve_source_shorthand(source: &str, config: &Config) -> Option<PathBuf> {
+    let (name, subpath) = source.split_once(':')?;
+    // Verify the source name exists in config
+    config.sources.get(name)?;
+    // Sources are mounted at /mnt/<name> inside the container
+    Some(PathBuf::from(format!("/mnt/{}", name)).join(subpath))
+}
+
+/// Translate a container-internal source path (e.g. `/mnt/src/github/org/repo`)
+/// back to the host-side path using the resolved sources config.
+///
+/// This is needed when creating init containers via the host's podman daemon:
+/// the container sees paths under `/mnt/<name>/...` but the host needs the
+/// actual filesystem path (e.g. `~/src/github/org/repo`).
+///
+/// Returns the original path unchanged if it doesn't match any source mount.
+pub fn source_path_to_host(path: &Path, config: &Config) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    for source in config.resolve_sources() {
+        let mount_prefix = format!("/mnt/{}", source.name);
+        if let Some(suffix) = path_str.strip_prefix(&mount_prefix) {
+            // Guard against false prefix matches: `/mnt/src` must not match
+            // `/mnt/srcode/foo`. The remainder after stripping must be empty
+            // (exact match) or start with `/`.
+            if !suffix.is_empty() && !suffix.starts_with('/') {
+                continue;
+            }
+            let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+            if suffix.is_empty() {
+                return source.path.clone();
+            }
+            return source.path.join(suffix);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Validate a source name. Must be non-empty, alphanumeric + hyphens/underscores.
+fn validate_source_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Names that must not be used as source names because they collide with
+/// top-level config keys. If TOML sees `bind = [...]` inside a `[sources]`
+/// section, it treats it as `sources.bind` rather than the top-level `bind`
+/// array — a silent misparse that produces confusing errors downstream.
+const RESERVED_SOURCE_NAMES: &[&str] = &[
+    "agent",
+    "bind",
+    "env",
+    "trusted",
+    "dotfiles",
+    "sidecar",
+    "secrets",
+    "gpu",
+    "ssh",
+    "mcp",
+    "git",
+    "journal",
+    "orchestration",
+];
+
 /// Target container(s) for a secret or configuration
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -26,6 +160,207 @@ pub enum ContainerTarget {
     /// Named container
     #[serde(untagged)]
     Named(String),
+}
+
+/// Agent configuration section
+///
+/// Controls which AI agent backend is used and how it's started.
+/// Profiles define named agent configurations with specific commands
+/// and environment variables.
+///
+/// The `default` field accepts either a single profile name or an ordered
+/// list of profile names for auto-detection:
+///
+/// Example configuration:
+/// ```toml
+/// [agent]
+/// # Single default (backwards compatible)
+/// default = "opencode"
+///
+/// # Or: ordered list for auto-detection (tries goose, falls back to opencode)
+/// default = ["goose", "opencode"]
+///
+/// [agent.profiles.opencode]
+/// command = ["opencode", "acp"]
+/// env = { OPENCODE_CONFIG = "~/.config/devaipod/agents/opencode/config.json" }
+///
+/// [agent.profiles.goose]
+/// command = ["goose", "acp"]
+/// env = { GOOSE_MODE = "auto", GOOSE_CONFIG_DIR = "~/.config/devaipod/agents/goose" }
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct AgentConfig {
+    /// Default agent profile name(s). Accepts a single string or an array.
+    /// When multiple profiles are specified, they're tried in order during
+    /// auto-detection. Falls back to "opencode" if empty or not set.
+    pub default: Vec<String>,
+    /// Named agent profiles
+    pub profiles: HashMap<String, AgentProfile>,
+}
+
+/// Helper for deserializing `default` field: accepts string or array of strings.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DefaultField {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for AgentConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AgentConfigRaw {
+            #[serde(default)]
+            default: Option<DefaultField>,
+            #[serde(default)]
+            profiles: HashMap<String, AgentProfile>,
+        }
+
+        let raw = AgentConfigRaw::deserialize(deserializer)?;
+        let default = match raw.default {
+            None => vec![],
+            Some(DefaultField::Single(s)) => vec![s],
+            Some(DefaultField::Multiple(v)) => v,
+        };
+
+        Ok(AgentConfig {
+            default,
+            profiles: raw.profiles,
+        })
+    }
+}
+
+impl AgentConfig {
+    /// Resolve which agent profile to use.
+    ///
+    /// Priority: CLI flag → config default → hardcoded "opencode" fallback.
+    /// If the resolved name matches a profile, returns (name, Some(profile)).
+    /// If no profile exists, returns (name, None) — the caller uses the
+    /// hardcoded default command.
+    ///
+    /// This returns the first candidate from the priority list for backwards
+    /// compatibility with callers that expect a single profile.
+    pub fn resolve_profile<'a>(
+        &'a self,
+        cli_agent: Option<&'a str>,
+    ) -> (String, Option<&'a AgentProfile>) {
+        // If CLI override is provided, use it directly (even if profile doesn't exist)
+        if let Some(name) = cli_agent.filter(|s| !s.is_empty()) {
+            let profile = self.profiles.get(name);
+            return (name.to_string(), profile);
+        }
+
+        // Otherwise use the first candidate from the priority list
+        let candidates = self.candidates_internal(None);
+        if let Some((name, profile)) = candidates.first() {
+            (name.to_string(), Some(profile))
+        } else {
+            // Empty list — use hardcoded opencode fallback
+            ("opencode".to_string(), None)
+        }
+    }
+
+    /// Get candidate agent profiles in priority order.
+    ///
+    /// Returns a list of (name, profile) pairs to try in order. If a CLI
+    /// override is provided, returns only that profile. Otherwise, returns
+    /// profiles from the `default` list (filtered to only those that exist
+    /// in `profiles`), followed by the hardcoded "opencode" fallback if it's
+    /// not already in the list.
+    ///
+    /// This is used for auto-detection: the container startup will probe for
+    /// each binary in order and use the first one available.
+    pub fn candidates(&self) -> Vec<(&str, &AgentProfile)> {
+        self.candidates_internal(None)
+    }
+
+    fn candidates_internal<'a>(
+        &'a self,
+        cli_agent: Option<&'a str>,
+    ) -> Vec<(&'a str, &'a AgentProfile)> {
+        let mut result = Vec::new();
+
+        // If CLI override is provided, only return that profile
+        if let Some(name) = cli_agent.filter(|s| !s.is_empty()) {
+            if let Some(profile) = self.profiles.get(name) {
+                result.push((name, profile));
+            }
+            return result;
+        }
+
+        // Collect profiles from the default list
+        let mut seen = std::collections::HashSet::new();
+        for name in &self.default {
+            if let Some(profile) = self.profiles.get(name) {
+                result.push((name.as_str(), profile));
+                seen.insert(name.as_str());
+            }
+        }
+
+        // Add hardcoded opencode fallback if not already present
+        if !seen.contains("opencode") {
+            if let Some(profile) = self.profiles.get("opencode") {
+                result.push(("opencode", profile));
+            } else {
+                // No opencode profile defined — caller will use hardcoded default
+                // This is represented by returning the name with a default profile
+                // But we can't construct a profile here without adding a field.
+                // Instead, return empty list to signal fallback needed.
+                if result.is_empty() {
+                    // No profiles found at all — return empty to trigger fallback
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Get the list of candidate binary names to check for availability.
+    ///
+    /// Extracts the first element of each candidate profile's command
+    /// (the binary name), in priority order. Used by the startup script
+    /// to verify at least one agent binary is available in the container.
+    pub fn candidate_binaries(&self) -> Vec<&str> {
+        self.candidates()
+            .iter()
+            .filter_map(|(_, profile)| profile.command.first().map(|s| s.as_str()))
+            .collect()
+    }
+}
+
+/// A named agent profile defining how to start a specific agent.
+///
+/// The command is what pod-api spawns as a child process. The env vars
+/// are set on the child process. Agent config files live in the user's
+/// dotfiles repo, pointed to by env vars.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfile {
+    /// Command to start the agent (e.g., ["opencode", "acp"])
+    pub command: Vec<String>,
+    /// Environment variables to set when starting the agent.
+    /// Values support ~ expansion to the container home path.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// Expand `~` prefix in a string value to the given home directory.
+///
+/// Used for agent profile env values where `~` should resolve to
+/// the container's home directory, not the host's.
+#[allow(dead_code)] // Used by pod.rs when wiring agent profiles in Phase 3
+pub fn expand_tilde(value: &str, home: &str) -> String {
+    if let Some(suffix) = value.strip_prefix("~/") {
+        format!("{}/{}", home, suffix)
+    } else if value == "~" {
+        home.to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 /// Top-level configuration
@@ -98,6 +433,166 @@ pub struct Config {
     /// Git-related configuration
     #[serde(default)]
     pub git: GitConfig,
+
+    /// Journal repository configuration (fallback source for agents without a specific repo)
+    #[serde(default)]
+    pub journal: JournalConfig,
+
+    /// Agent configuration (profiles, default agent selection)
+    #[serde(default)]
+    pub agent: AgentConfig,
+
+    /// Named source directories to bind-mount into containers.
+    /// Keys are names (used as mount point: /mnt/<name>), values are paths.
+    #[serde(default)]
+    pub sources: HashMap<String, SourceEntry>,
+
+    /// Generic bind mounts in podman/docker `-v` format.
+    /// Each entry is `source:target[:options]` (e.g. `~/data:/data:ro`).
+    /// Mounted into all containers (server, workspace, agent).
+    /// Tilde in the source path is expanded to the host home directory.
+    #[serde(default)]
+    pub bind: Vec<String>,
+}
+
+impl Config {
+    /// Resolve all configured sources, expanding ~ to the host home directory.
+    /// Uses DEVAIPOD_HOST_HOME if set (for container-side resolution to host paths),
+    /// otherwise falls back to HOME.
+    pub fn resolve_sources(&self) -> Vec<ResolvedSource> {
+        self.sources
+            .iter()
+            .filter_map(|(name, entry)| {
+                if !validate_source_name(name) {
+                    tracing::warn!(
+                        "Ignoring source '{}': names must be non-empty and \
+                         contain only alphanumeric characters, hyphens, or underscores.",
+                        name,
+                    );
+                    return None;
+                }
+                if RESERVED_SOURCE_NAMES.contains(&name.as_str()) {
+                    tracing::warn!(
+                        "Ignoring source '{}': name collides with a config key. \
+                         This usually means `{} = ...` was placed inside a [sources] \
+                         section instead of at the top level.",
+                        name,
+                        name,
+                    );
+                    return None;
+                }
+                let (raw_path, access) = match entry {
+                    SourceEntry::Short(p) => (p.clone(), SourceAccess::Controlplane),
+                    SourceEntry::Full(f) => (f.path.clone(), f.access.clone()),
+                };
+                let expanded = expand_source_path(&raw_path);
+                Some(ResolvedSource {
+                    name: name.clone(),
+                    path: expanded,
+                    access,
+                })
+            })
+            .collect()
+    }
+
+    /// Parse and resolve `[bind]` entries, expanding `~` in source paths.
+    ///
+    /// Each entry follows podman/docker `-v` syntax: `source:target[:options]`.
+    /// Invalid entries (missing `:`) are logged as warnings and skipped.
+    pub fn resolve_binds(&self) -> Vec<ResolvedBind> {
+        self.bind
+            .iter()
+            .filter_map(|spec| {
+                ResolvedBind::parse(spec)
+                    .map_err(|e| tracing::warn!("Ignoring invalid bind spec '{}': {}", spec, e))
+                    .ok()
+            })
+            .collect()
+    }
+}
+
+/// A parsed bind mount from the `[bind]` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBind {
+    /// Host-side path (tilde-expanded).
+    pub source: PathBuf,
+    /// Container-side mount target.
+    pub target: String,
+    /// Raw options string (e.g. "ro", "ro,Z"). Empty if none.
+    pub options: String,
+}
+
+impl ResolvedBind {
+    /// Parse a podman `-v` style spec: `source:target[:options]`.
+    fn parse(spec: &str) -> Result<Self, String> {
+        // Split on `:` but be careful with Windows-style paths (not relevant
+        // for us, but handle the common `source:target` vs `source:target:opts`).
+        let parts: Vec<&str> = spec.splitn(3, ':').collect();
+        if parts.len() < 2 {
+            return Err("expected source:target[:options]".to_string());
+        }
+        let source = expand_source_path(parts[0]);
+        let target = parts[1].to_string();
+        if target.is_empty() {
+            return Err("target path must not be empty".to_string());
+        }
+        let options = parts.get(2).unwrap_or(&"").to_string();
+        Ok(ResolvedBind {
+            source,
+            target,
+            options,
+        })
+    }
+
+    /// Format as a podman `-v` argument string.
+    pub fn to_podman_arg(&self) -> String {
+        if self.options.is_empty() {
+            format!("{}:{}", self.source.display(), self.target)
+        } else {
+            format!("{}:{}:{}", self.source.display(), self.target, self.options)
+        }
+    }
+}
+
+/// Journal repository configuration
+///
+/// The journal repo is a fallback for agents launched without a specific source
+/// repo. It provides a place for research notes, cross-cutting investigations,
+/// and other work that doesn't belong to a specific project.
+///
+/// Example configuration:
+/// ```toml
+/// [journal]
+/// repo = "~/src/journal"
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct JournalConfig {
+    /// Path to the journal git repository.
+    /// Can be a local path (~/src/journal) or a git URL.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+impl JournalConfig {
+    /// Returns the resolved journal repo path, expanding ~ to $HOME.
+    #[allow(dead_code)] // Used by tests; will be used by workspace creation
+    pub fn repo_path(&self) -> Option<std::path::PathBuf> {
+        self.repo.as_ref().map(|r| {
+            if let Some(suffix) = r.strip_prefix("~/")
+                && let Ok(home) = std::env::var("HOME")
+            {
+                return std::path::PathBuf::from(format!("{}/{}", home, suffix));
+            }
+            std::path::PathBuf::from(r)
+        })
+    }
+
+    /// Returns true if a journal repo is configured.
+    #[allow(dead_code)] // Used by tests; will be used by workspace creation
+    pub fn is_configured(&self) -> bool {
+        self.repo.is_some()
+    }
 }
 
 /// Git-related configuration
@@ -838,7 +1333,7 @@ impl Default for SshConfig {
 /// Configuration for additional MCP servers attached to agent pods
 ///
 /// These are HTTP-based MCP servers that run as sidecar containers or
-/// external services, connected to the agent via the opencode MCP config.
+/// external services, connected to the agent via MCP config.
 ///
 /// Example configuration:
 /// ```toml
@@ -853,7 +1348,7 @@ impl Default for SshConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct McpServersConfig {
     /// Named MCP server configurations.
-    /// The key is the server name used in the opencode config.
+    /// The key is the server name used in the agent config.
     #[serde(flatten)]
     pub servers: HashMap<String, McpServerEntry>,
 }
@@ -2413,5 +2908,743 @@ extra_hosts = []
         let toml = "";
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.git.extra_hosts.is_empty());
+    }
+
+    // =========================================================================
+    // Journal configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_journal_config_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.journal.is_configured());
+        assert!(config.journal.repo_path().is_none());
+    }
+
+    #[test]
+    fn test_journal_config_with_repo() {
+        let config: Config = toml::from_str(
+            r#"
+            [journal]
+            repo = "~/src/journal"
+        "#,
+        )
+        .unwrap();
+        assert!(config.journal.is_configured());
+        // Don't assert the exact path since HOME varies
+        assert!(config.journal.repo_path().is_some());
+    }
+
+    #[test]
+    fn test_journal_config_with_url() {
+        let config: Config = toml::from_str(
+            r#"
+            [journal]
+            repo = "https://github.com/user/journal"
+        "#,
+        )
+        .unwrap();
+        assert!(config.journal.is_configured());
+        assert_eq!(
+            config.journal.repo_path().unwrap().to_str().unwrap(),
+            "https://github.com/user/journal"
+        );
+    }
+
+    #[test]
+    fn test_journal_config_tilde_expansion() {
+        let config = JournalConfig {
+            repo: Some("~/src/journal".to_string()),
+        };
+        let path = config.repo_path().unwrap();
+        // Should expand ~ when HOME is set (which it is in test environments)
+        if std::env::var("HOME").is_ok() {
+            assert!(!path.to_str().unwrap().starts_with("~/"));
+            assert!(path.to_str().unwrap().ends_with("/src/journal"));
+        }
+    }
+
+    // =========================================================================
+    // Sources configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_sources_default_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.sources.is_empty());
+        assert!(config.resolve_sources().is_empty());
+    }
+
+    #[test]
+    fn test_parse_sources_shorthand() {
+        let toml = r#"
+[sources]
+src = "~/src"
+projects = "/opt/projects"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.sources.len(), 2);
+
+        // Verify shorthand entries are parsed as Short variant
+        assert!(matches!(config.sources["src"], SourceEntry::Short(ref p) if p == "~/src"));
+        assert!(
+            matches!(config.sources["projects"], SourceEntry::Short(ref p) if p == "/opt/projects")
+        );
+    }
+
+    #[test]
+    fn test_parse_sources_full_entry() {
+        let toml = r#"
+[sources]
+src = { path = "~/src", access = "controlplane" }
+work = { path = "/mnt/work", access = "agent" }
+readonly-src = { path = "~/readonly" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.sources.len(), 3);
+
+        // Controlplane access
+        match &config.sources["src"] {
+            SourceEntry::Full(f) => {
+                assert_eq!(f.path, "~/src");
+                assert_eq!(f.access, SourceAccess::Controlplane);
+            }
+            _ => panic!("Expected Full entry for 'src'"),
+        }
+
+        // Agent access
+        match &config.sources["work"] {
+            SourceEntry::Full(f) => {
+                assert_eq!(f.path, "/mnt/work");
+                assert_eq!(f.access, SourceAccess::Agent);
+            }
+            _ => panic!("Expected Full entry for 'work'"),
+        }
+
+        // Default (controlplane) access when no explicit level given
+        match &config.sources["readonly-src"] {
+            SourceEntry::Full(f) => {
+                assert_eq!(f.path, "~/readonly");
+                assert_eq!(f.access, SourceAccess::Controlplane);
+            }
+            _ => panic!("Expected Full entry for 'readonly-src'"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sources_mixed() {
+        let toml = r#"
+[sources]
+simple = "~/simple"
+complex = { path = "~/complex", access = "agent" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.sources.len(), 2);
+        assert!(matches!(config.sources["simple"], SourceEntry::Short(_)));
+        assert!(matches!(config.sources["complex"], SourceEntry::Full(_)));
+    }
+
+    #[test]
+    fn test_source_access_deserialize() {
+        // Test all access levels
+        for (input, expected) in [
+            ("readonly", SourceAccess::Readonly),
+            ("controlplane", SourceAccess::Controlplane),
+            ("agent", SourceAccess::Agent),
+        ] {
+            let toml = format!(
+                r#"
+[sources]
+test = {{ path = "/tmp", access = "{input}" }}
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap();
+            match &config.sources["test"] {
+                SourceEntry::Full(f) => assert_eq!(f.access, expected, "for access={input}"),
+                _ => panic!("Expected Full entry"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_source_access_default() {
+        assert_eq!(SourceAccess::default(), SourceAccess::Controlplane);
+    }
+
+    #[test]
+    fn test_resolve_sources_absolute_path() {
+        let toml = r#"
+[sources]
+data = "/opt/data"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_sources();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "data");
+        assert_eq!(resolved[0].path, PathBuf::from("/opt/data"));
+        assert_eq!(resolved[0].access, SourceAccess::Controlplane);
+    }
+
+    #[test]
+    fn test_resolve_sources_tilde_expansion() {
+        let toml = r#"
+[sources]
+src = "~/src"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_sources();
+        assert_eq!(resolved.len(), 1);
+        // Should expand ~ using HOME
+        let path_str = resolved[0].path.to_str().unwrap();
+        assert!(!path_str.starts_with("~/"), "tilde should be expanded");
+        assert!(path_str.ends_with("/src"));
+    }
+
+    #[test]
+    fn test_resolve_sources_full_entry_access() {
+        let toml = r#"
+[sources]
+src = { path = "/opt/src", access = "controlplane" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_sources();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "src");
+        assert_eq!(resolved[0].path, PathBuf::from("/opt/src"));
+        assert_eq!(resolved[0].access, SourceAccess::Controlplane);
+    }
+
+    #[test]
+    fn test_expand_source_path_absolute() {
+        assert_eq!(expand_source_path("/opt/data"), PathBuf::from("/opt/data"));
+    }
+
+    #[test]
+    fn test_expand_source_path_tilde() {
+        let expanded = expand_source_path("~/projects");
+        let path_str = expanded.to_str().unwrap();
+        assert!(!path_str.starts_with("~/"));
+        assert!(path_str.ends_with("/projects"));
+    }
+
+    #[test]
+    fn test_expand_source_path_no_tilde_prefix() {
+        // Only ~/... triggers expansion; bare ~ or ~user does not
+        assert_eq!(expand_source_path("~"), PathBuf::from("~"));
+        assert_eq!(
+            expand_source_path("relative/path"),
+            PathBuf::from("relative/path")
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_found() {
+        let toml = r#"
+[sources]
+src = "/opt/src"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = resolve_source_shorthand("src:github/org/repo", &config);
+        assert_eq!(result, Some(PathBuf::from("/mnt/src/github/org/repo")));
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_full_entry() {
+        let toml = r#"
+[sources]
+src = { path = "/opt/src", access = "controlplane" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let result = resolve_source_shorthand("src:myproject", &config);
+        assert_eq!(result, Some(PathBuf::from("/mnt/src/myproject")));
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_not_found() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(resolve_source_shorthand("src:foo", &config), None);
+    }
+
+    #[test]
+    fn test_resolve_source_shorthand_no_colon() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(resolve_source_shorthand("no-colon-here", &config), None);
+    }
+
+    #[test]
+    fn test_validate_source_name_valid() {
+        assert!(validate_source_name("src"));
+        assert!(validate_source_name("my-sources"));
+        assert!(validate_source_name("src_2"));
+        assert!(validate_source_name("Projects123"));
+        assert!(validate_source_name("a"));
+    }
+
+    #[test]
+    fn test_validate_source_name_invalid() {
+        assert!(!validate_source_name(""));
+        assert!(!validate_source_name("has spaces"));
+        assert!(!validate_source_name("has/slash"));
+        assert!(!validate_source_name("has.dot"));
+        assert!(!validate_source_name("special!char"));
+    }
+
+    #[test]
+    fn test_source_access_serialize() {
+        // SourceAccess derives Serialize; verify round-trip
+        let access = SourceAccess::Controlplane;
+        let json = serde_json::to_string(&access).unwrap();
+        assert_eq!(json, r#""controlplane""#);
+
+        let access = SourceAccess::Agent;
+        let json = serde_json::to_string(&access).unwrap();
+        assert_eq!(json, r#""agent""#);
+
+        let access = SourceAccess::Readonly;
+        let json = serde_json::to_string(&access).unwrap();
+        assert_eq!(json, r#""readonly""#);
+    }
+
+    #[test]
+    fn test_sources_with_other_config() {
+        // Ensure sources plays well alongside other config sections
+        let toml = r#"
+default-image = "ghcr.io/devcontainers/base:ubuntu"
+
+[sources]
+src = "~/src"
+work = { path = "/opt/work", access = "agent" }
+
+[env]
+allowlist = ["HOME"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.default_image,
+            Some("ghcr.io/devcontainers/base:ubuntu".to_string())
+        );
+        assert_eq!(config.sources.len(), 2);
+        assert_eq!(config.env.allowlist.len(), 1);
+    }
+
+    // =========================================================================
+    // Bind mount tests
+    // =========================================================================
+
+    #[test]
+    fn test_bind_default_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.bind.is_empty());
+        assert!(config.resolve_binds().is_empty());
+    }
+
+    #[test]
+    fn test_bind_parse_basic() {
+        let toml = r#"
+bind = ["/data:/data", "/cache:/var/cache:ro"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.bind.len(), 2);
+
+        let resolved = config.resolve_binds();
+        assert_eq!(resolved.len(), 2);
+
+        assert_eq!(resolved[0].source, PathBuf::from("/data"));
+        assert_eq!(resolved[0].target, "/data");
+        assert_eq!(resolved[0].options, "");
+
+        assert_eq!(resolved[1].source, PathBuf::from("/cache"));
+        assert_eq!(resolved[1].target, "/var/cache");
+        assert_eq!(resolved[1].options, "ro");
+    }
+
+    #[test]
+    fn test_bind_tilde_expansion() {
+        let toml = r#"
+bind = ["~/data:/data"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_binds();
+        assert_eq!(resolved.len(), 1);
+        let path_str = resolved[0].source.to_str().unwrap();
+        assert!(!path_str.starts_with("~/"), "tilde should be expanded");
+        assert!(path_str.ends_with("/data"));
+        assert_eq!(resolved[0].target, "/data");
+    }
+
+    #[test]
+    fn test_bind_invalid_spec_skipped() {
+        let toml = r#"
+bind = ["no-colon-here", "/valid:/valid"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_binds();
+        // Invalid entry is skipped, valid one kept
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].target, "/valid");
+    }
+
+    #[test]
+    fn test_bind_to_podman_arg() {
+        let bind = ResolvedBind {
+            source: PathBuf::from("/host/path"),
+            target: "/container/path".to_string(),
+            options: String::new(),
+        };
+        assert_eq!(bind.to_podman_arg(), "/host/path:/container/path");
+
+        let bind_ro = ResolvedBind {
+            source: PathBuf::from("/host"),
+            target: "/mnt".to_string(),
+            options: "ro".to_string(),
+        };
+        assert_eq!(bind_ro.to_podman_arg(), "/host:/mnt:ro");
+
+        let bind_opts = ResolvedBind {
+            source: PathBuf::from("/host"),
+            target: "/mnt".to_string(),
+            options: "ro,Z".to_string(),
+        };
+        assert_eq!(bind_opts.to_podman_arg(), "/host:/mnt:ro,Z");
+    }
+
+    #[test]
+    fn test_bind_with_sources() {
+        // bind and sources coexist
+        let toml = r#"
+bind = ["/data:/data:ro"]
+
+[sources]
+src = "~/src"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.bind.len(), 1);
+        assert_eq!(config.sources.len(), 1);
+
+        let binds = config.resolve_binds();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].target, "/data");
+
+        let sources = config.resolve_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "src");
+    }
+
+    #[test]
+    fn test_bind_after_sources_section_rejected() {
+        // If a user puts `bind = [...]` after `[sources]`, TOML scoping makes
+        // it `sources.bind` — a source named "bind" with a mangled value.
+        // resolve_sources() filters out reserved names to catch this.
+        let toml = r#"
+[sources]
+src = "~/src"
+
+bind = ["/tmp/data:/data:ro"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        // TOML puts "bind" in sources, not top-level bind
+        assert!(config.bind.is_empty(), "top-level bind should be empty");
+        assert!(
+            config.sources.contains_key("bind"),
+            "TOML puts bind in sources"
+        );
+
+        // But resolve_sources() rejects the reserved name
+        let resolved = config.resolve_sources();
+        assert_eq!(resolved.len(), 1, "only 'src' should resolve");
+        assert_eq!(resolved[0].name, "src");
+    }
+
+    // =========================================================================
+    // Agent configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_agent_config() {
+        let toml = r#"
+[agent]
+default = "opencode"
+
+[agent.profiles.opencode]
+command = ["opencode", "acp"]
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+env = { GOOSE_MODE = "auto" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default, vec!["opencode"]);
+        assert_eq!(config.agent.profiles.len(), 2);
+
+        let oc = &config.agent.profiles["opencode"];
+        assert_eq!(oc.command, vec!["opencode", "acp"]);
+        assert!(oc.env.is_empty());
+
+        let goose = &config.agent.profiles["goose"];
+        assert_eq!(goose.command, vec!["goose", "acp"]);
+        assert_eq!(goose.env["GOOSE_MODE"], "auto");
+    }
+
+    #[test]
+    fn test_parse_agent_config_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.agent.default.is_empty());
+        assert!(config.agent.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_agent_resolve_profile_cli_override() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string()];
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        let (name, profile) = config.resolve_profile(Some("opencode"));
+        assert_eq!(name, "opencode");
+        assert!(profile.is_some());
+    }
+
+    #[test]
+    fn test_agent_resolve_profile_config_default() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string()];
+        config.profiles.insert(
+            "goose".to_string(),
+            AgentProfile {
+                command: vec!["goose".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        let (name, profile) = config.resolve_profile(None);
+        assert_eq!(name, "goose");
+        assert!(profile.is_some());
+    }
+
+    #[test]
+    fn test_agent_resolve_profile_hardcoded_fallback() {
+        let config = AgentConfig::default();
+        let (name, profile) = config.resolve_profile(None);
+        assert_eq!(name, "opencode");
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn test_expand_tilde_in_env() {
+        assert_eq!(
+            expand_tilde("~/config/file.json", "/home/dev"),
+            "/home/dev/config/file.json"
+        );
+        assert_eq!(expand_tilde("~", "/home/dev"), "/home/dev");
+        assert_eq!(
+            expand_tilde("/absolute/path", "/home/dev"),
+            "/absolute/path"
+        );
+        assert_eq!(expand_tilde("relative/path", "/home/dev"), "relative/path");
+        assert_eq!(expand_tilde("~user/path", "/home/dev"), "~user/path");
+    }
+
+    #[test]
+    fn test_parse_agent_config_with_env() {
+        let toml = r#"
+[agent.profiles.claude]
+command = ["claude", "--dangerously-skip-permissions"]
+env = { CLAUDE_CONFIG_DIR = "~/.config/devaipod/agents/claude" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let claude = &config.agent.profiles["claude"];
+        assert_eq!(
+            claude.command,
+            vec!["claude", "--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            claude.env["CLAUDE_CONFIG_DIR"],
+            "~/.config/devaipod/agents/claude"
+        );
+    }
+
+    #[test]
+    fn test_multiple_agent_profiles_generic_framework() {
+        // Prove that the config system is fully generic: multiple agent
+        // profiles with different commands and env vars coexist, and
+        // resolution works for any of them without agent-specific code.
+        let toml = r#"
+[agent]
+default = "goose"
+
+[agent.profiles.opencode]
+command = ["opencode", "acp"]
+env = { OPENCODE_CONFIG = "~/.config/opencode/config.json" }
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+env = { GOOSE_MODE = "auto", GOOSE_CONFIG_DIR = "~/.config/goose" }
+
+[agent.profiles.claude-code]
+command = ["claude", "--dangerously-skip-permissions"]
+env = { CLAUDE_CONFIG_DIR = "~/.config/claude" }
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.profiles.len(), 3);
+
+        // Default resolves to goose (from config).
+        let (name, profile) = config.agent.resolve_profile(None);
+        assert_eq!(name, "goose");
+        let p = profile.expect("goose profile should exist");
+        assert_eq!(p.command, vec!["goose", "acp"]);
+
+        // CLI override to claude-code.
+        let (name, profile) = config.agent.resolve_profile(Some("claude-code"));
+        assert_eq!(name, "claude-code");
+        let p = profile.expect("claude-code profile should exist");
+        assert_eq!(p.command, vec!["claude", "--dangerously-skip-permissions"]);
+
+        // CLI override to opencode.
+        let (name, profile) = config.agent.resolve_profile(Some("opencode"));
+        assert_eq!(name, "opencode");
+        let p = profile.expect("opencode profile should exist");
+        assert_eq!(p.command, vec!["opencode", "acp"]);
+
+        // All profiles have distinct env vars — no agent-specific parsing.
+        assert!(
+            config.agent.profiles["goose"]
+                .env
+                .contains_key("GOOSE_MODE")
+        );
+        assert_eq!(config.agent.profiles["goose"].env["GOOSE_MODE"], "auto");
+        assert!(
+            config.agent.profiles["goose"]
+                .env
+                .contains_key("GOOSE_CONFIG_DIR")
+        );
+        assert!(
+            config.agent.profiles["claude-code"]
+                .env
+                .contains_key("CLAUDE_CONFIG_DIR")
+        );
+        assert!(
+            config.agent.profiles["opencode"]
+                .env
+                .contains_key("OPENCODE_CONFIG")
+        );
+
+        // Unknown agent name returns (name, None) — caller uses hardcoded
+        // fallback, no panic or special handling needed.
+        let (name, profile) = config.agent.resolve_profile(Some("nonexistent"));
+        assert_eq!(name, "nonexistent");
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn test_parse_agent_config_array_default() {
+        // Test that default accepts an array of profile names
+        let toml = r#"
+[agent]
+default = ["goose", "opencode"]
+
+[agent.profiles.opencode]
+command = ["opencode", "acp"]
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default, vec!["goose", "opencode"]);
+
+        // First candidate should be goose
+        let (name, profile) = config.agent.resolve_profile(None);
+        assert_eq!(name, "goose");
+        assert!(profile.is_some());
+    }
+
+    #[test]
+    fn test_agent_candidates_priority_order() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string(), "opencode".to_string()];
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        config.profiles.insert(
+            "goose".to_string(),
+            AgentProfile {
+                command: vec!["goose".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+
+        let candidates = config.candidates();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0, "goose");
+        assert_eq!(candidates[1].0, "opencode");
+    }
+
+    #[test]
+    fn test_agent_candidate_binaries() {
+        let mut config = AgentConfig::default();
+        config.default = vec!["goose".to_string(), "opencode".to_string()];
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        config.profiles.insert(
+            "goose".to_string(),
+            AgentProfile {
+                command: vec!["goose".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+
+        let binaries = config.candidate_binaries();
+        assert_eq!(binaries, vec!["goose", "opencode"]);
+    }
+
+    #[test]
+    fn test_agent_candidates_with_hardcoded_fallback() {
+        // When no default is set and no opencode profile exists,
+        // candidates should be empty (signaling hardcoded fallback needed)
+        let config = AgentConfig::default();
+        let candidates = config.candidates();
+        assert_eq!(candidates.len(), 0);
+
+        // When opencode profile exists, it should be included even if not in default
+        let mut config = AgentConfig::default();
+        config.profiles.insert(
+            "opencode".to_string(),
+            AgentProfile {
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                env: HashMap::new(),
+            },
+        );
+        let candidates = config.candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "opencode");
+    }
+
+    #[test]
+    fn test_parse_agent_config_string_backwards_compat() {
+        // Ensure single string still works (backwards compatibility)
+        let toml = r#"
+[agent]
+default = "goose"
+
+[agent.profiles.goose]
+command = ["goose", "acp"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.default, vec!["goose"]);
+
+        let (name, profile) = config.agent.resolve_profile(None);
+        assert_eq!(name, "goose");
+        assert!(profile.is_some());
     }
 }

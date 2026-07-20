@@ -1,5 +1,11 @@
 # devaipod development tasks
 
+# Prefix for container-run: set to e.g. "test-" to run an isolated
+# instance alongside production. Usage: just prefix=test- port=8081 container-run
+prefix := ""
+# Host port for the web UI (container always listens on 8080 internally)
+port := "8080"
+
 # Default recipe: show available commands
 default:
     @just --list
@@ -44,7 +50,7 @@ _podman_socket_format := "{" + "{" + ".ConnectionInfo.PodmanSocket.Path" + "}" +
 # features will fail; use `just test-integration` for full correctness.
 # Requires: podman installed. Socket is auto-started if missing.
 test-integration-local: build
-    DEVAIPOD_PATH="{{justfile_directory()}}/target/debug/devaipod" \
+    DEVAIPOD_PATH="{{justfile_directory()}}/target/debug/devaipod-server" \
     DEVAIPOD_HOST_MODE=1 \
         cargo test -p integration-tests
 
@@ -61,18 +67,36 @@ clean:
 
 # Run devaipod with arguments (builds release first)
 run *ARGS: build-release
-    ./target/release/devaipod {{ARGS}}
+    ./target/release/devaipod-server {{ARGS}}
 
-# Build and install to ~/.cargo/bin
-install:
+# Build and install the host CLI shim to ~/.local/bin, build the
+# container image, and start the server. This is the one-stop
+# "get me running" target for local development.
+install: container-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p devaipod-host
+    install -D -m 0755 target/release/devaipod ~/.local/bin/devaipod
+    echo "Installed devaipod to ~/.local/bin/devaipod"
+    echo "Make sure ~/.local/bin is on your PATH."
+    echo ""
+    echo "Starting server (image: localhost/devaipod:latest)..."
+    ~/.local/bin/devaipod server start --image localhost/devaipod:latest
+
+# Build and install the server binary to ~/.cargo/bin (for direct use)
+install-server:
     cargo install --path .
+
+# Build and install the host-side CLI shim to ~/.cargo/bin.
+install-host-shim:
+    cargo install --path crates/host-shim
 
 # Quick smoke test: start workspace, check agent
 smoke-test:
     cargo build
-    ./target/debug/devaipod up . --no-agent
-    ./target/debug/devaipod list
-    ./target/debug/devaipod delete devc --force
+    ./target/debug/devaipod-server up . --no-agent
+    ./target/debug/devaipod-server list
+    ./target/debug/devaipod-server delete devc --force
 
 # Run devaipod against our own local git tree for self-hosting development.
 # This tears down any existing devcontainer completely and starts a fresh workspace
@@ -87,7 +111,7 @@ self-devenv:
     devpod stop devaipod 2>/dev/null || true
     devpod delete devaipod --force 2>/dev/null || true
     # Start fresh workspace with our local tree (uses devcontainer.json with feature)
-    ./target/release/devaipod up .
+    ./target/release/devaipod-server up .
 
 # Alias for self-devenv (used by devenv-self convention)
 devenv-self: self-devenv
@@ -117,10 +141,10 @@ setup-e2e-gh workspace=default_test_workspace:
     echo "Building devaipod..."
     cargo build --release
     echo "Deploying to {{workspace}}.devpod..."
-    scp target/release/devaipod {{workspace}}.devpod:/tmp/
-    ssh {{workspace}}.devpod 'sudo cp /tmp/devaipod /usr/local/bin/devaipod && sudo chmod +x /usr/local/bin/devaipod'
+    scp target/release/devaipod-server {{workspace}}.devpod:/tmp/
+    ssh {{workspace}}.devpod 'sudo cp /tmp/devaipod-server /usr/local/bin/devaipod-server && sudo chmod +x /usr/local/bin/devaipod-server'
     echo "Verifying installation..."
-    ssh {{workspace}}.devpod 'devaipod --help | head -5'
+    ssh {{workspace}}.devpod 'devaipod-server --help | head -5'
     
     # Configure gh auth if GH_TOKEN is available
     if [ -n "${GH_TOKEN:-}" ]; then
@@ -249,11 +273,19 @@ test-integration image=default_test_image: container-build build-integration
     if ! podman run --rm --privileged alpine true 2>/dev/null; then
         PRIV_FLAG="--security-opt label=disable"
     fi
+    # Create the workspaces directory for workspace-v2 bind mounts.
+    # Same pattern as container-run: the host dir is bind-mounted into
+    # the runner at /var/lib/devaipod-workspaces, and DEVAIPOD_HOST_WORKDIR
+    # tells devaipod the host-side path for creating sibling container mounts.
+    WORKSPACES_DIR="$HOME/.local/share/devaipod/workspaces"
+    mkdir -p "$WORKSPACES_DIR"
     podman run --rm $PRIV_FLAG --pids-limit=-1 \
         -v "$HOST_SOCKET":/run/docker.sock \
         -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
         -v /tmp:/tmp \
         -v "$CONFIG":/root/.config/devaipod.toml:ro \
+        -v "$WORKSPACES_DIR":/var/lib/devaipod-workspaces \
+        -e DEVAIPOD_HOST_WORKDIR="$WORKSPACES_DIR" \
         -e DEVAIPOD_TEST_IMAGE={{image}} \
         -e DEVAIPOD_CONTAINER_IMAGE={{ CONTAINER_IMAGE }}:latest \
         {{ CONTAINER_IMAGE }}-integration:latest
@@ -342,7 +374,7 @@ container-test: container-build
     echo "Testing container image..."
     
     # Verify the binary runs
-    podman run --rm {{ CONTAINER_IMAGE }}:latest devaipod --help
+    podman run --rm {{ CONTAINER_IMAGE }}:latest devaipod-server --help
     
     # Verify runtime dependencies are present
     podman run --rm {{ CONTAINER_IMAGE }}:latest git --version
@@ -362,10 +394,17 @@ container-push tag="latest": container-build
 # Agent pods publish ports on 0.0.0.0 so they are reachable from the container network.
 # Socket: Linux uses XDG_RUNTIME_DIR; macOS/Windows use VM path /run/podman/podman.sock (container runs in VM).
 # The target mount point is always /run/docker.sock (the well-known path honored by devaipod).
+#
+# Use `prefix` to run a second isolated instance alongside production, e.g.:
+#   just prefix=test- port=8081 container-run
+# This creates container "test-devaipod" with its own state, workspaces, and
+# DEVAIPOD_INSTANCE label so its pods don't appear in the production UI.
 [group('container')]
 container-run: container-build
     #!/usr/bin/env bash
     set -euo pipefail
+    NAME="{{prefix}}devaipod"
+    PORT="{{port}}"
     SOCKET=""
     if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "${XDG_RUNTIME_DIR}/podman/podman.sock" ]; then
         SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"
@@ -377,14 +416,18 @@ container-run: container-build
         exit 1
     fi
     echo "Using podman socket: $SOCKET"
-    mkdir -p ~/.ssh/config.d/devaipod
+    SSH_DIR="$HOME/.ssh/config.d/$NAME"
+    WORKSPACES_DIR="$HOME/.local/share/$NAME/workspaces"
+    STATE_VOL="${NAME}-state"
+    mkdir -p "$SSH_DIR"
+    mkdir -p "$WORKSPACES_DIR"
     if [ ! -f ~/.config/devaipod.toml ]; then
         echo "Warning: ~/.config/devaipod.toml not found; container may exit. Run 'devaipod init' on the host first."
     fi
-    # Allocate devaipod-state volume if missing (auth token and other state stored there by default)
-    if ! podman volume exists devaipod-state 2>/dev/null; then
-        podman volume create devaipod-state
-        echo "Created volume devaipod-state"
+    # Allocate state volume if missing (auth token and other state stored there by default)
+    if ! podman volume exists "$STATE_VOL" 2>/dev/null; then
+        podman volume create "$STATE_VOL"
+        echo "Created volume $STATE_VOL"
     fi
     # Linux: mount the host socket (path is on the host). macOS/podman machine: the container runs in the VM,
     # so the volume source must be the VM's path, not the Mac path. Use the VM's podman socket path so the
@@ -399,61 +442,121 @@ container-run: container-build
         HOST_SOCKET="/run/podman/podman.sock"
         ADD_HOST=""
     fi
-    podman run -d --name devaipod --privileged --replace \
-        -p 8080:8080 \
+    # When a prefix is set, pass DEVAIPOD_INSTANCE so this instance's pods
+    # are isolated from the default (production) instance.
+    INSTANCE_ENV=""
+    if [ -n "{{prefix}}" ]; then
+        INSTANCE_ENV="-e DEVAIPOD_INSTANCE=$NAME"
+    fi
+    # The launcher container reads the config, resolves [sources], and creates
+    # the real server container with the appropriate bind mounts.
+    # The launcher does NOT bind the host port — only the server container does.
+    # When no sources are configured, the launcher skips relaunching and serves
+    # directly, but without port publishing. The wait loop detects this and
+    # re-creates the container with port publishing.
+    # Forward env vars from the [env] allowlist in devaipod.toml so they
+    # reach the server container (which passes them to pod containers).
+    ALLOWLIST_ENV=""
+    if [ -f ~/.config/devaipod.toml ]; then
+        for key in $(grep -A100 '^\[env\]' ~/.config/devaipod.toml \
+            | grep '^allowlist' \
+            | sed 's/.*\[//;s/\].*//;s/"//g;s/,/ /g'); do
+            val="${!key:-}"
+            if [ -n "$val" ]; then
+                ALLOWLIST_ENV="$ALLOWLIST_ENV -e $key=$val"
+            fi
+        done
+    fi
+    LAUNCHER="${NAME}-launcher"
+    podman run -d --name "$LAUNCHER" --privileged --replace \
         $ADD_HOST \
         -v "$HOST_SOCKET":/run/docker.sock \
         -e DEVAIPOD_HOST_SOCKET="$HOST_SOCKET" \
-        -v devaipod-state:/var/lib/devaipod \
+        -e DEVAIPOD_HOST_PORT="$PORT" \
+        -e DEVAIPOD_HOST_HOME="$HOME" \
+        -e DEVAIPOD_CONTAINER_NAME="$LAUNCHER" \
+        -v "$WORKSPACES_DIR":/var/lib/devaipod-workspaces \
+        -e DEVAIPOD_HOST_WORKDIR="$WORKSPACES_DIR" \
+        -v "$STATE_VOL":/var/lib/devaipod \
         -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \
-        -v ~/.ssh/config.d/devaipod:/run/devaipod-ssh:Z \
+        -v "$SSH_DIR":/run/devaipod-ssh:Z \
+        $INSTANCE_ENV \
+        $ALLOWLIST_ENV \
         {{ CONTAINER_IMAGE }}:latest
-    echo "devaipod container started"
-    echo "Web UI: http://127.0.0.1:8080/"
-    echo "SSH configs will be written to ~/.ssh/config.d/devaipod/"
+    echo "Launcher started; waiting for server container '$NAME'..."
+    # The launcher creates the server container and then exits.
+    # Wait for the launcher to finish first, then check the server.
+    if ! podman wait "$LAUNCHER" >/dev/null 2>&1; then
+        echo "WARNING: Could not wait for launcher (may have already exited)"
+    fi
+    # Poll for the server container (should exist now, but give it a moment
+    # on macOS where podman VM adds latency).
+    for i in $(seq 1 30); do
+        if podman inspect "$NAME" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    if ! podman inspect "$NAME" >/dev/null 2>&1; then
+        echo "ERROR: Server container '$NAME' did not start. Check: podman logs $LAUNCHER"
+        exit 1
+    fi
+    echo "$NAME container started (port $PORT)"
+    echo "Web UI: http://127.0.0.1:$PORT/"
+    echo "SSH configs will be written to $SSH_DIR/"
     echo ""
-    echo "Ensure your ~/.ssh/config has: Include config.d/devaipod/*"
+    echo "Ensure your ~/.ssh/config has: Include config.d/${NAME}/*"
     echo ""
-    echo "If you cannot connect to 127.0.0.1:8080, run: just container-debug"
+    echo "TUI: podman exec -ti $NAME devaipod-server tui"
+    echo ""
+    if [ -n "{{prefix}}" ]; then
+        echo "This is an isolated instance (DEVAIPOD_INSTANCE=$NAME)."
+        echo "Its pods won't appear in the default devaipod UI and vice versa."
+        echo ""
+    fi
+    echo "If you cannot connect to 127.0.0.1:$PORT, run: just container-debug name=$NAME"
 
 # Debug connection to devaipod container (run after container-run)
 # Checks: container running, port mapping, recent logs, curl to /health
 [group('container')]
-container-debug:
+container-debug name="devaipod":
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "=== devaipod container connection debug ==="
+    NAME="{{name}}"
+    echo "=== $NAME container connection debug ==="
     echo ""
-    if ! podman container exists devaipod 2>/dev/null; then
-        echo "FAIL: Container 'devaipod' does not exist. Run 'just container-run' first."
+    if ! podman container exists "$NAME" 2>/dev/null; then
+        echo "FAIL: Container '$NAME' does not exist. Run 'just container-run' first."
         exit 1
     fi
     echo "1. Container state:"
-    podman inspect devaipod --format '   State: {{ '{{' }}.State.Status{{ '}}' }} (Running={{ '{{' }}.State.Running{{ '}}' }})'
-    if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' devaipod 2>/dev/null)" != "true" ]; then
+    podman inspect "$NAME" --format '   State: {{ '{{' }}.State.Status{{ '}}' }} (Running={{ '{{' }}.State.Running{{ '}}' }})'
+    if [ "$(podman inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' "$NAME" 2>/dev/null)" != "true" ]; then
         echo "   Container is not running. Last logs:"
-        podman logs devaipod 2>&1 | tail -30
+        podman logs "$NAME" 2>&1 | tail -30
         exit 1
     fi
     echo ""
     echo "2. Port mapping (host -> container):"
-    podman port devaipod 2>/dev/null || echo "   (no ports published)"
+    podman port "$NAME" 2>/dev/null || echo "   (no ports published)"
     echo ""
     echo "3. Process inside container (devaipod web):"
-    podman top devaipod 2>/dev/null || true
+    podman top "$NAME" 2>/dev/null || true
     echo ""
     echo "4. Last 15 lines of container logs:"
-    podman logs devaipod 2>&1 | tail -15
+    podman logs "$NAME" 2>&1 | tail -15
     echo ""
-    echo "5. Curl from host to 127.0.0.1:8080/_devaipod/health:"
-    if curl -sf --connect-timeout 3 http://127.0.0.1:8080/_devaipod/health 2>/dev/null; then
+    # Determine the host port from the actual port mapping
+    HOST_PORT=$(podman port "$NAME" 8080/tcp 2>/dev/null | head -1 | cut -d: -f2 || echo "8080")
+    echo "5. Curl from host to 127.0.0.1:${HOST_PORT}/_devaipod/health:"
+    if curl -sf --connect-timeout 3 "http://127.0.0.1:${HOST_PORT}/_devaipod/health" 2>/dev/null; then
         echo ""
         echo "   OK: Connection succeeded."
     else
         echo "   FAIL: Connection refused or timeout."
         if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
             echo ""
-            echo "   On macOS with podman machine, port forwarding (-p 8080:8080) may not reach the host."
+            echo "   On macOS with podman machine, port forwarding may not reach the host."
             echo "   Workaround: use Podman Desktop port forwarding, or run devaipod on the host:"
             echo "   cargo run -- web --port 8080"
         fi
@@ -524,7 +627,7 @@ e2e-draft-pr repo=e2e_test_repo:
     echo "  Task: ${TASK}"
     
     # Start the agent with the task
-    ./target/release/devaipod run "https://github.com/${REPO}" "${TASK}" --name "${POD_NAME}" || {
+    ./target/release/devaipod-server run "https://github.com/${REPO}" "${TASK}" --name "${POD_NAME}" || {
         echo "Failed to start devaipod"
         exit 1
     }
@@ -532,7 +635,7 @@ e2e-draft-pr repo=e2e_test_repo:
     # Function to cleanup on exit
     cleanup() {
         echo "Cleaning up pod ${POD_NAME}..."
-        ./target/release/devaipod delete "${POD_NAME}" --force 2>/dev/null || true
+        ./target/release/devaipod-server delete "${POD_NAME}" --force 2>/dev/null || true
     }
     trap cleanup EXIT
     

@@ -133,51 +133,43 @@ fn test_advisor_launch_with_image() -> Result<()> {
 }
 podman_integration_test!(test_advisor_launch_with_image);
 
-/// Test creating a pod from a remote URL with `--image` override.
+/// Test creating a pod from a local repo with `--image` override.
 ///
-/// This is the actual advisor flow: a remote URL (dotfiles) is used as the
-/// workspace source and the image is overridden to the devaipod container.
-/// The combination of remote clone + image override was triggering the
-/// "exit code 125" failure in the workspace volume setup.
+/// This exercises the advisor-like flow: a local repo is used as the
+/// workspace source and the image is overridden to a different container.
+/// The combination of local clone + image override was previously triggering
+/// the "exit code 125" failure in the workspace volume setup.
 fn test_advisor_launch_remote_with_image() -> Result<()> {
     let test_image = std::env::var("DEVAIPOD_TEST_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/bootc-dev/devenv-debian:latest".to_string());
 
+    // Use a local test repo instead of a remote URL, since workspace-v2
+    // requires remote URLs to resolve to a local clone.
+    let repo = crate::TestRepo::new()?;
     let pod_name = unique_test_name("advisor-remote");
 
     let mut guard = PodGuard::new();
     guard.add(&pod_name);
 
-    // Use a small public repo as the source (simulating dotfiles)
-    let output = run_devaipod(&[
-        "run",
-        "https://github.com/cgwalters/playground",
-        "--name",
-        short_name(&pod_name),
-        "--image",
-        &test_image,
-        "--service-gator-ro",
-        "Test advisor from remote",
-    ])?;
+    let output = run_devaipod_in(
+        &repo.repo_path,
+        &[
+            "run",
+            ".",
+            "--name",
+            short_name(&pod_name),
+            "--image",
+            &test_image,
+            "--service-gator-ro",
+            "Test advisor from local repo with image override",
+        ],
+    )?;
 
     if !output.success() {
-        let combined = output.combined();
-        // If the failure is due to a git clone error (e.g. no network access
-        // inside the test container), skip gracefully rather than failing.
-        if combined.contains("Failed to clone") || combined.contains("fatal: unable to access") {
-            eprintln!(
-                "Note: remote clone failed (likely no network access), skipping test: {}",
-                combined.trim()
-            );
-            return Ok(());
-        }
-        eprintln!("Remote advisor-like pod creation failed:");
+        eprintln!("Advisor-like pod creation failed:");
         eprintln!("stdout: {}", output.stdout);
         eprintln!("stderr: {}", output.stderr);
-        bail!(
-            "remote advisor-like pod creation failed: {}",
-            output.combined()
-        );
+        bail!("advisor-like pod creation failed: {}", output.combined());
     }
 
     drop(guard);

@@ -247,6 +247,64 @@ fn start_pod_api(pod_api_port: u16, opencode_port: u16) -> Result<std::process::
     Ok(child)
 }
 
+/// Start the pod-api binary with ACP backend (no opencode port).
+///
+/// Returns the child process. Caller is responsible for killing it.
+fn start_pod_api_acp(pod_api_port: u16) -> Result<std::process::Child> {
+    let binary = get_devaipod_binary_path()?;
+    let workspace = std::env::temp_dir().join("devaipod-integration-test-workspace-acp");
+    std::fs::create_dir_all(&workspace)?;
+
+    // Initialize a minimal git repo so the git watcher doesn't error
+    let git_dir = workspace.join(".git");
+    if !git_dir.exists() {
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(&workspace)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&workspace)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&workspace)
+            .output();
+        let readme = workspace.join("README.md");
+        if !readme.exists() {
+            std::fs::write(&readme, "# test\n")?;
+        }
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&workspace)
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&workspace)
+            .output();
+    }
+
+    let state_dir = workspace.join(".devaipod-state");
+    std::fs::create_dir_all(&state_dir)?;
+
+    // ACP backend doesn't use --opencode-port
+    let child = Command::new(&binary)
+        .args([
+            "pod-api",
+            "--port",
+            &pod_api_port.to_string(),
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ])
+        .env("DEVAIPOD_STATE_DIR", &state_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to start {binary} pod-api"))?;
+
+    Ok(child)
+}
+
 /// Simple HTTP GET that returns the response body as a string.
 fn http_get(url: &str) -> Result<(u16, String)> {
     // Minimal HTTP/1.1 client using std::net
@@ -305,11 +363,13 @@ impl Drop for ProcessGuard {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// GET /summary with a working agent returns correct activity and fields.
+/// GET /summary with ACP backend but no connected client returns Unknown.
 fn test_pod_api_summary_working() -> Result<()> {
-    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_WORKING)?;
+    // ACP backend uses stdio, not HTTP. When no ACP client is connected,
+    // pod_summary() returns a default AgentStatusSummary with activity Unknown.
     let api_port = free_port()?;
-    let child = start_pod_api(api_port, mock_port)?;
+    // Don't pass --opencode-port; ACP backend ignores it
+    let child = start_pod_api_acp(api_port)?;
     let _guard = ProcessGuard::new(child);
 
     wait_for_port(api_port, Duration::from_secs(30)).context("pod-api should start within 30s")?;
@@ -320,44 +380,45 @@ fn test_pod_api_summary_working() -> Result<()> {
     let json: serde_json::Value =
         serde_json::from_str(&body).context("response should be valid JSON")?;
 
-    // Verify all fields exist
+    // With no ACP client connected, activity is Unknown
     assert_eq!(
         json["activity"].as_str(),
-        Some("Working"),
-        "agent with no completed time and running tool should be Working"
+        Some("Unknown"),
+        "ACP backend with no client should report Unknown activity"
     );
     assert_eq!(
         json["session_count"].as_u64(),
-        Some(2),
-        "should count both sessions"
+        Some(0),
+        "no connected client means no sessions"
     );
     assert!(
         json["recent_output"].as_array().is_some(),
-        "should have recent_output array"
-    );
-    assert_eq!(
-        json["current_tool"].as_str(),
-        Some("edit"),
-        "should report the running tool"
+        "should have recent_output array (even if empty)"
     );
     assert!(
         json["status_line"].as_str().is_some(),
         "should have a status_line"
     );
+    // current_tool and last_message_ts can be null when no client
     assert!(
-        json["last_message_ts"].as_i64().is_some(),
-        "should have last_message_ts"
+        json.get("current_tool").is_some(),
+        "current_tool field should exist"
+    );
+    assert!(
+        json.get("last_message_ts").is_some(),
+        "last_message_ts field should exist"
     );
 
     Ok(())
 }
 integration_test!(test_pod_api_summary_working);
 
-/// GET /summary with an idle agent returns Idle activity.
+/// GET /summary with ACP backend but no connected client returns Unknown.
 fn test_pod_api_summary_idle() -> Result<()> {
-    let (mock_port, _mock_handle) = start_mock_opencode(MOCK_SESSIONS, MOCK_MESSAGES_IDLE)?;
+    // ACP backend uses stdio, not HTTP. When no ACP client is connected,
+    // pod_summary() returns Unknown (same as "working" test).
     let api_port = free_port()?;
-    let child = start_pod_api(api_port, mock_port)?;
+    let child = start_pod_api_acp(api_port)?;
     let _guard = ProcessGuard::new(child);
 
     wait_for_port(api_port, Duration::from_secs(30))?;
@@ -368,23 +429,24 @@ fn test_pod_api_summary_idle() -> Result<()> {
     let json: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(
         json["activity"].as_str(),
-        Some("Idle"),
-        "agent with completed time and stop finish should be Idle"
+        Some("Unknown"),
+        "ACP backend with no client should report Unknown activity"
     );
     assert!(
         json["current_tool"].is_null(),
-        "idle agent should have no current_tool"
+        "no client means no current_tool"
     );
 
     Ok(())
 }
 integration_test!(test_pod_api_summary_idle);
 
-/// GET /summary with no sessions returns Idle with zero sessions.
+/// GET /summary with ACP backend and no client returns Unknown with zero sessions.
 fn test_pod_api_summary_no_sessions() -> Result<()> {
-    let (mock_port, _mock_handle) = start_mock_opencode("[]", "[]")?;
+    // ACP backend uses stdio, not HTTP. When no ACP client is connected,
+    // pod_summary() returns Unknown (same as other tests).
     let api_port = free_port()?;
-    let child = start_pod_api(api_port, mock_port)?;
+    let child = start_pod_api_acp(api_port)?;
     let _guard = ProcessGuard::new(child);
 
     wait_for_port(api_port, Duration::from_secs(30))?;
@@ -393,12 +455,11 @@ fn test_pod_api_summary_no_sessions() -> Result<()> {
     assert_eq!(status, 200);
 
     let json: serde_json::Value = serde_json::from_str(&body)?;
-    assert_eq!(json["activity"].as_str(), Some("Idle"));
+    assert_eq!(json["activity"].as_str(), Some("Unknown"));
     assert_eq!(json["session_count"].as_u64(), Some(0));
-    assert_eq!(
-        json["status_line"].as_str(),
-        Some("Waiting for input..."),
-        "no-session state should say waiting"
+    assert!(
+        json["status_line"].as_str().is_some(),
+        "should have a status_line"
     );
 
     Ok(())

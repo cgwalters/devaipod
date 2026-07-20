@@ -10,30 +10,37 @@ without explicit human approval.
 
 **Implemented:**
 
-- Advisor module (`src/advisor.rs`) with data types, storage layer, and pod
-  introspection functions
+- Advisor module (`src/advisor.rs`) with data types, storage layer, pod
+  introspection, and workspace introspection functions
+- MCP server (`src/mcp.rs`) exposing advisor tools via Streamable HTTP
+  (JSON-RPC over HTTP POST) at `/api/devaipod/mcp` on the control plane
 - `DraftStore` with load/save/add/list/update_status operations, persisted as
   JSON at `/var/lib/devaipod-drafts.json` inside the advisor pod
 - Pod introspection via podman CLI: `list_pods()`, `pod_status()`, `pod_logs()`
+- Workspace introspection via direct filesystem access: `list_workspace_summaries()`,
+  `workspace_diff()` — shows all workspaces with git branch/commit info
 - `DraftProposal` struct with priority, status lifecycle
   (pending/approved/dismissed/expired), and source tracking
 - Generic `--mcp name=url` CLI flag on `up` and `run` commands, with
   corresponding `[mcp]` config section in `devaipod.toml`
 - `McpServersConfig` with merge semantics (CLI overrides config file)
-- Advisor MCP port constant: 8766
 - Container image (`ghcr.io/cgwalters/devaipod:latest`) includes the opencode
   CLI binary so it can serve as the agent container for advisor pods
-
 - `devaipod advisor` CLI subcommand: checks for `devaipod-advisor` pod,
   creates it if missing (using the devaipod repo as workspace source and
-  our own image), attaches if running. Supports `--status` and `--proposals`
-  flags. Uses `cmd_run()` under the hood with the advisor MCP attached.
+  our own image), attaches if running. Supports `--status`, `--proposals`,
+  and `--source-dir` flags. Uses `cmd_run()` under the hood with the
+  devaipod MCP server attached via Bearer auth.
+- Separate MCP token auth (distinct from web API token) to isolate
+  advisor access from general API access
+- Default system prompt that instructs the advisor to survey review
+  requests (via service-gator), workspaces, and pods, then propose agents
 
 **Not yet implemented:**
 
-- Advisor MCP HTTP server (SSE transport exposing the tools)
 - Proposal approval UI (CLI prompts or web integration)
 - Launching agent pods from approved proposals
+- Patrol cycle (periodic re-survey without human prompting)
 
 ## Motivation
 
@@ -54,51 +61,43 @@ Key scenarios:
 
 ## Architecture
 
-The advisor runs as a devaipod pod using devaipod's own container image
-(`ghcr.io/cgwalters/devaipod:latest`), which includes both the devaipod binary
-and the opencode CLI. Inside the pod, an advisor MCP server (port 8766) exposes
-read-only pod introspection and draft proposal management. The opencode agent
-connects to this server via the generic MCP attachment mechanism.
+The advisor runs as a devaipod pod using devaipod's own container image.
+It connects to two MCP servers:
 
-The MCP attachment is not advisor-specific — any pod can connect to additional
-MCP servers using the `--mcp name=url` CLI flag or the `[mcp]` config section
-in `devaipod.toml`:
+1. **devaipod MCP** (on the control plane at `http://host.containers.internal:8080/api/devaipod/mcp`)
+   — provides pod/workspace introspection and proposal management tools.
+   Authenticated via a separate Bearer token (distinct from the web API token).
 
-```toml
-[mcp.advisor]
-url = "http://localhost:8766/mcp"
-enabled = true
-```
+2. **service-gator** (in-pod at `:8765`, read-only) — provides GitHub/GitLab
+   API access for discovering PRs, issues, notifications, etc.
 
-Or on the command line:
+The MCP server runs on the control plane (not inside the advisor pod) because
+it needs direct access to the podman socket and host-side workspace directories.
+This keeps the advisor pod truly sandboxed while giving it read-only visibility
+through the MCP protocol.
 
 ```
-devaipod run <repo> --mcp advisor=http://localhost:8766/mcp -c 'analyze issues'
-```
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Advisor Pod (image: ghcr.io/cgwalters/devaipod:latest)              │
-│                                                                      │
-│  ┌────────────────────────┐   ┌──────────────────────────────────┐  │
-│  │ opencode Agent         │   │ Advisor MCP Server (:8766)       │  │
-│  │ • Observes pods        │──▶│ • list_pods (read-only)          │  │
-│  │ • Analyzes issues      │   │ • pod_status / pod_logs          │  │
-│  │ • Proposes agents      │   │ • propose_agent (creates draft)  │  │
-│  │ • NO direct actions    │   │ • list_proposals                 │  │
-│  └────────────────────────┘   └──────────────────────────────────┘  │
-│         │                              │                             │
-│         │ --mcp advisor=...            │ Drafts: /var/lib/           │
-│         │                              │   devaipod-drafts.json      │
-│  ┌──────┴─────────────────────────────────────────────────────────┐  │
-│  │ Service-gator (:8765, read-only)                               │  │
-│  │ • GitHub issues, PRs                                           │  │
-│  │ • JIRA tickets                                                 │  │
-│  │ • NO write access                                              │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────┐     ┌──────────────────────────────┐
+│  Advisor Pod                      │     │  Control Plane (:8080)       │
+│                                   │     │                              │
+│  ┌─────────────────────────┐     │     │  POST /api/devaipod/mcp      │
+│  │ opencode Agent           │─MCP─┼────▶│  • list_pods (read-only)     │
+│  │ • Surveys GitHub (gator) │     │     │  • pod_status / pod_logs     │
+│  │ • Inspects workspaces    │     │     │  • list_workspaces           │
+│  │ • Proposes agents        │     │     │  • workspace_diff            │
+│  │ • NO direct actions      │     │     │  • propose_agent             │
+│  └────────┬────────────────┘     │     │  • list_proposals            │
+│           │                       │     └──────────────────────────────┘
+│  ┌────────┴────────────────┐     │
+│  │ Service-gator (:8765 RO) │     │
+│  │ • GitHub PRs, issues     │     │
+│  │ • Notifications          │     │
+│  └─────────────────────────┘     │
+│                                   │
+│  /mnt/source/ (read-only)         │  ← optional --source-dir mounts
+└──────────────────────────────────┘
          │
-         │ Draft proposals
+         │ Draft proposals (via MCP)
          ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Human (CLI / TUI / Web)                                             │
@@ -115,21 +114,23 @@ devaipod run <repo> --mcp advisor=http://localhost:8766/mcp -c 'analyze issues'
 
 ## MCP Tools
 
-The advisor MCP server (port 8766, next to service-gator's 8765) exposes a
-small set of tools, all read-only except for the ability to create draft
-proposals (which are inert until human-approved).
+The devaipod MCP server (at `/api/devaipod/mcp` on the control plane)
+exposes tools for pod/workspace introspection and proposal management.
+GitHub/issue access is handled separately by service-gator.
 
-### Introspection tools (implemented)
+### Introspection tools
 
-These give the advisor visibility into the running devaipod environment. The
-backing functions are implemented in `src/advisor.rs` and shell out to the
-podman CLI:
+These give the advisor visibility into the running devaipod environment.
+Pod introspection functions in `src/advisor.rs` shell out to podman CLI;
+workspace introspection reads host-side directories directly.
 
 | Tool | Description | Implementation |
 |------|-------------|----------------|
-| `list_pods` | List all devaipod pods with status, task, and age | `list_pods()` — runs `podman pod ps --filter name=devaipod-* --format json` |
-| `pod_status` | Detailed status for a specific pod | `pod_status()` — runs `podman pod inspect` |
-| `pod_logs` | Read recent logs from a pod's agent container | `pod_logs()` — runs `podman logs --tail N` |
+| `list_pods` | List all devaipod pods with status, task, and age | `list_pods()` — `podman pod ps` |
+| `pod_status` | Detailed status for a specific pod | `pod_status()` — `podman pod inspect` |
+| `pod_logs` | Read recent logs from a pod's agent container | `pod_logs()` — `podman logs --tail N` |
+| `list_workspaces` | All workspaces with git branches, commits ahead, completion status | `list_workspace_summaries()` — direct filesystem |
+| `workspace_diff` | Git diff for a workspace vs upstream | `workspace_diff()` — direct filesystem |
 | `list_proposals` | List existing draft proposals and their status | `DraftStore::list()` with optional status filter |
 
 These are strictly read-only. The advisor cannot stop, restart, or modify
@@ -170,7 +171,7 @@ The proposal is completely inert — no pod is created, no code is touched —
 until a human explicitly approves it. On approval, devaipod translates the
 proposal into a `devaipod run` invocation.
 
-## CLI Command (planned)
+## CLI Command (implemented)
 
 `devaipod advisor` manages the advisor pod lifecycle:
 

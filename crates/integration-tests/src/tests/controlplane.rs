@@ -41,12 +41,10 @@ fn test_unified_pod_list() -> Result<()> {
         )
     })?;
 
-    // The web fixture is a running devaipod pod, so we expect at least one entry.
-    assert!(
-        !pods.is_empty(),
-        "Expected at least one pod in the response"
-    );
-
+    // The web fixture is a standalone container running `devaipod web`,
+    // not a devaipod pod itself. The shared fixture creates a pod, but it
+    // may or may not be visible depending on podman instance isolation.
+    // Validate structure of any returned entries but don't require non-empty.
     for pod in &pods {
         let name = pod
             .get("name")
@@ -68,7 +66,10 @@ fn test_unified_pod_list() -> Result<()> {
         );
     }
 
-    tracing::info!("Unified pod list returned {} entries", pods.len());
+    tracing::info!(
+        "Unified pod list returned {} entries (may be 0 if no pods visible)",
+        pods.len()
+    );
     Ok(())
 }
 container_integration_test!(test_unified_pod_list);
@@ -300,17 +301,41 @@ fn test_harness_completion_status_e2e() -> Result<()> {
 
     let cs_path = format!("/api/devaipod/pods/{short}/completion-status");
 
-    // 1. GET default → "active"
-    let (status, body) = harness.get(&cs_path)?;
-    assert_eq!(status, 200, "GET completion-status: {body}");
+    // 1. GET initial status.
+    // The web server needs time to discover the pod-api's published port
+    // via podman inspect. Retry until we get a 200.
+    let (status, body) = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (s, b) = harness.get(&cs_path)?;
+            if s == 200 || std::time::Instant::now() > deadline {
+                break (s, b);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    };
+    if status != 200 {
+        let stderr = harness.recent_stderr(30);
+        panic!(
+            "GET completion-status returned {status} after retries: {body}\n\
+             Web server stderr:\n{stderr}"
+        );
+    }
     let json: serde_json::Value = serde_json::from_str(&body)?;
-    assert_eq!(
-        json["status"].as_str(),
-        Some("active"),
-        "default should be 'active': {body}"
+    let initial_status = json["status"].as_str().unwrap_or("");
+    // The mock agent returns a completed message, so auto-completion may
+    // have already fired by the time we read. Accept either "active" or "done".
+    assert!(
+        initial_status == "active" || initial_status == "done",
+        "initial status should be 'active' or 'done' (auto-completion), got: {body}"
     );
 
-    // 2. PUT "done"
+    // 2. PUT "active" first to establish a known baseline, then test the
+    //    full PUT/GET cycle.
+    let (status, _) = harness.put(&cs_path, r#"{"status":"active"}"#)?;
+    assert_eq!(status, 200, "PUT active should succeed");
+
+    // 3. PUT "done"
     let (status, body) = harness.put(&cs_path, r#"{"status":"done"}"#)?;
     if status != 200 {
         // Collect debug info for the assertion message
@@ -334,7 +359,7 @@ fn test_harness_completion_status_e2e() -> Result<()> {
         );
     }
 
-    // 3. GET → "done"
+    // 4. GET → "done"
     let (status, body) = harness.get(&cs_path)?;
     assert_eq!(status, 200);
     let json: serde_json::Value = serde_json::from_str(&body)?;
@@ -344,7 +369,7 @@ fn test_harness_completion_status_e2e() -> Result<()> {
         "should be 'done' after PUT: {body}"
     );
 
-    // 4. Verify unified pod list reflects completion_status
+    // 5. Verify unified pod list reflects completion_status
     let (status, body) = harness.get("/api/devaipod/pods")?;
     assert_eq!(status, 200);
     let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
@@ -361,7 +386,7 @@ fn test_harness_completion_status_e2e() -> Result<()> {
         }
     }
 
-    // 5. Reset to active
+    // 6. Reset to active
     let (status, _) = harness.put(&cs_path, r#"{"status":"active"}"#)?;
     assert_eq!(status, 200, "reset to active should succeed");
 
@@ -422,29 +447,30 @@ fn test_harness_pod_switcher_multi_pod() -> Result<()> {
     assert_eq!(status, 200, "GET /api/devaipod/pods: {body}");
     let pods: Vec<serde_json::Value> = serde_json::from_str(&body)?;
 
-    let running_pods: Vec<&serde_json::Value> = pods
+    // Accept both "Running" and "Degraded" as active pod statuses
+    let active_pods: Vec<&serde_json::Value> = pods
         .iter()
         .filter(|p| {
             p.get("status")
                 .and_then(|s| s.as_str())
-                .map(|s| s.eq_ignore_ascii_case("running"))
+                .map(|s| s.eq_ignore_ascii_case("running") || s.eq_ignore_ascii_case("degraded"))
                 .unwrap_or(false)
         })
         .collect();
 
-    let names: Vec<&str> = running_pods
+    let names: Vec<&str> = active_pods
         .iter()
         .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
         .collect();
-    tracing::info!("Running pods: {:?}", names);
+    tracing::info!("Active pods: {:?}", names);
 
     assert!(
         names.contains(&pod_name_a.as_str()),
-        "Pod A ({pod_name_a}) should be in the running list; got: {names:?}"
+        "Pod A ({pod_name_a}) should be in the active list; got: {names:?}"
     );
     assert!(
         names.contains(&pod_name_b.as_str()),
-        "Pod B ({pod_name_b}) should be in the running list; got: {names:?}"
+        "Pod B ({pod_name_b}) should be in the active list; got: {names:?}"
     );
 
     // Fetch the agent iframe wrapper for each pod and verify pod switcher elements.
@@ -475,17 +501,17 @@ fn test_harness_pod_switcher_multi_pod() -> Result<()> {
         }
     }
 
-    // Confirm the pod list has at least 2 running entries, meaning the JS
+    // Confirm the pod list has at least 2 active entries, meaning the JS
     // would enable back-and-forth arrow navigation.
     assert!(
-        running_pods.len() >= 2,
-        "Expected at least 2 running pods for switcher navigation; got {}",
-        running_pods.len()
+        active_pods.len() >= 2,
+        "Expected at least 2 active pods for switcher navigation; got {}",
+        active_pods.len()
     );
 
     tracing::info!(
-        "Pod switcher multi-pod test passed ({} running pods)",
-        running_pods.len()
+        "Pod switcher multi-pod test passed ({} active pods)",
+        active_pods.len()
     );
     Ok(())
 }
@@ -574,12 +600,17 @@ fn test_harness_pod_state_cache_survives_stop() -> Result<()> {
             .get("status")
             .and_then(|s| s.as_str())
             .unwrap_or("");
-        if !pod_status.eq_ignore_ascii_case("running") {
+        // Wait until the pod is no longer in an active state.
+        // "Running" and "Degraded" both indicate the pod is still up
+        // (Degraded means gator exited but agent/api are healthy).
+        if !pod_status.eq_ignore_ascii_case("running")
+            && !pod_status.eq_ignore_ascii_case("degraded")
+        {
             break;
         }
         if std::time::Instant::now() > stop_deadline {
             color_eyre::eyre::bail!(
-                "Pod {pod_name} still Running 30s after stop (status: {pod_status})"
+                "Pod {pod_name} still active 30s after stop (status: {pod_status})"
             );
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -680,3 +711,93 @@ fn test_harness_missing_agent_binary_diagnostics() -> Result<()> {
     Ok(())
 }
 podman_integration_test!(test_harness_missing_agent_binary_diagnostics);
+
+/// Verify the diagnostics API endpoint returns container logs and exit codes
+/// for a degraded pod.
+///
+/// Uses the same failure mode as `test_harness_missing_agent_binary_diagnostics`
+/// (missing agent binary → exit code 42) but exercises the
+/// `GET /api/devaipod/pods/{name}/diagnostics` endpoint and validates its
+/// response structure.
+fn test_harness_diagnostics_endpoint_captures_failure() -> Result<()> {
+    let mut harness = DevaipodHarness::start_without_mock()?;
+    let repo = TestRepo::new_with_devcontainer(
+        r#"{ "name": "diag-test", "image": "mcr.microsoft.com/devcontainers/base:ubuntu" }"#,
+    )?;
+
+    let pod_name = crate::unique_test_name("diag-e2e");
+    let short = crate::short_name(&pod_name);
+
+    // Create a pod that will degrade (agent binary missing → exit 42)
+    let _pod_json = harness.create_pod_expect_degraded(repo.repo_path.to_str().unwrap(), short)?;
+
+    // Now call the diagnostics endpoint
+    let diag_json = harness.pod_diagnostics(&pod_name)?;
+    let diag: serde_json::Value = serde_json::from_str(&diag_json).map_err(|e| {
+        color_eyre::eyre::eyre!("Failed to parse diagnostics JSON: {e}\nraw: {diag_json}")
+    })?;
+
+    // Validate pod-level info
+    let pod_info = diag
+        .get("pod")
+        .expect("diagnostics should have 'pod' field");
+    assert!(
+        pod_info.get("name").and_then(|v| v.as_str()).is_some(),
+        "pod.name should be present: {pod_info}"
+    );
+    assert!(
+        pod_info.get("state").and_then(|v| v.as_str()).is_some(),
+        "pod.state should be present: {pod_info}"
+    );
+
+    // Validate containers array
+    let containers = diag
+        .get("containers")
+        .and_then(|v| v.as_array())
+        .expect("diagnostics should have 'containers' array");
+    assert!(
+        !containers.is_empty(),
+        "containers array should not be empty"
+    );
+
+    // Find the agent container and verify it has exit code and logs
+    let agent = containers.iter().find(|c| {
+        c.get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| n.ends_with("-agent"))
+    });
+    assert!(
+        agent.is_some(),
+        "Should find an agent container in diagnostics: {containers:?}"
+    );
+    let agent = agent.unwrap();
+
+    // Agent should have exited with code 42
+    assert_eq!(
+        agent.get("exit_code").and_then(|v| v.as_i64()),
+        Some(42),
+        "Agent container exit_code should be 42: {agent}"
+    );
+
+    // Agent should have non-empty state
+    assert!(
+        agent
+            .get("state")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "Agent container should have a state: {agent}"
+    );
+
+    // logs_tail should be present (may be empty if agent exited immediately)
+    assert!(
+        agent.get("logs_tail").and_then(|v| v.as_str()).is_some(),
+        "Agent container should have logs_tail field: {agent}"
+    );
+
+    tracing::info!(
+        "Diagnostics endpoint test passed: {} containers reported",
+        containers.len()
+    );
+    Ok(())
+}
+podman_integration_test!(test_harness_diagnostics_endpoint_captures_failure);

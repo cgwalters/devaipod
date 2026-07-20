@@ -23,7 +23,7 @@ bin:
 	cargo build --release --workspace
 
 install:
-	install -D -m 0755 -t $(DESTDIR)$(prefix)/bin target/release/devaipod
+	install -D -m 0755 -t $(DESTDIR)$(prefix)/bin target/release/devaipod-server
 
 .PHONY: validate
 validate:

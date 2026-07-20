@@ -33,7 +33,10 @@ function findFreePort(): number {
 }
 
 function createTestRepo(name: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `devaipod-e2e-${name}-`))
+  // Use /tmp explicitly (not tmpdir() which returns /var/folders/... on macOS).
+  // The Justfile mounts -v /tmp:/tmp:shared so /tmp is visible to both the
+  // test container and sibling containers spawned by devaipod.
+  const dir = mkdtempSync(join("/tmp", `devaipod-e2e-${name}-`))
   const repo = join(dir, "repo")
   mkdirSync(repo)
   execSync("git init", { cwd: repo })
@@ -167,13 +170,19 @@ export default async function globalSetup() {
   const baseUrl = `http://127.0.0.1:${port}`
   const tmpDirs: string[] = []
 
+  // Workspace directory must be under /tmp (shared with sibling containers
+  // via the Justfile's -v /tmp:/tmp:shared mount).
+  const workspacesDir = mkdtempSync(join("/tmp", "devaipod-e2e-workspaces-"))
+  tmpDirs.push(workspacesDir)
+
   // Start devaipod web server
-  const proc = spawn("devaipod", ["web", "--port", String(port)], {
+  const proc = spawn("devaipod-server", ["web", "--port", String(port)], {
     env: {
       ...process.env,
       DEVAIPOD_INSTANCE: "integration-test",
       DEVAIPOD_HOST_MODE: "1",
       DEVAIPOD_MOCK_AGENT: "1",
+      DEVAIPOD_HOST_WORKDIR: workspacesDir,
     },
     stdio: ["ignore", "pipe", "pipe"],
   })

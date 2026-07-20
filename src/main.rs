@@ -11,8 +11,11 @@ use std::process::Command as ProcessCommand;
 use clap::{Args, CommandFactory, Parser};
 use color_eyre::eyre::{Context, Result, bail};
 
-#[allow(dead_code)] // MCP server will use these in a follow-up
+mod acp_client;
 mod advisor;
+mod agent;
+mod agent_acp;
+mod agent_dir;
 mod config;
 mod devcontainer;
 mod forge;
@@ -25,6 +28,7 @@ mod pod;
 mod pod_api;
 mod podman;
 mod prompt;
+mod review_tui;
 mod secrets;
 mod service_gator;
 mod ssh_server;
@@ -67,6 +71,18 @@ pub(crate) fn get_instance_id() -> Option<String> {
 /// if the name already has the prefix, it won't be added again.
 fn normalize_pod_name(name: &str) -> String {
     if name.starts_with(POD_NAME_PREFIX) {
+        // The input already has the prefix. It might be the full pod name
+        // (e.g. "devaipod-myproject-abc"), or it might be a stripped display
+        // name for a project whose name itself starts with "devaipod"
+        // (e.g. "devaipod-abc" from pod "devaipod-devaipod-abc").
+        // Try the name as-is first; if the pod doesn't exist, try adding
+        // the prefix again.
+        if !pod_exists(name).unwrap_or(true) {
+            let with_prefix = format!("{}{}", POD_NAME_PREFIX, name);
+            if pod_exists(&with_prefix).unwrap_or(false) {
+                return with_prefix;
+            }
+        }
         name.to_string()
     } else {
         format!("{}{}", POD_NAME_PREFIX, name)
@@ -109,13 +125,34 @@ fn get_attach_container_name(pod_name: &str, target: AttachTarget) -> String {
 
 /// Resolve a workspace name, handling the --latest flag
 ///
-/// If a workspace name is provided, normalizes it. If --latest is set,
-/// finds the most recently created running workspace.
+/// If a workspace name is provided, normalizes it. If --latest is set (or no
+/// workspace is given and `latest` is true — the default for diff/fetch/etc.),
+/// first tries to scope to workspaces for the current git repo. When multiple
+/// workspaces exist for the same repo, shows an interactive chooser on TTYs or
+/// picks the most recent one on non-TTYs.
 fn resolve_workspace(workspace: Option<&str>, latest: bool) -> Result<String> {
     match (workspace, latest) {
         (Some(name), false) => Ok(normalize_pod_name(name)),
         (None, true) | (Some(_), true) => {
-            // Find the most recent workspace
+            // If we're inside a git repo, try to scope to workspaces for it
+            if let Ok(repo_root) = repo_root_path() {
+                let workspaces = find_workspaces_for_repo(&repo_root);
+                match workspaces.len() {
+                    0 => {
+                        // No workspaces for this repo; fall through to global latest
+                    }
+                    1 => {
+                        let ws = &workspaces[0];
+                        tracing::info!("Using workspace for this repo: {}", ws.short_name);
+                        return Ok(ws.pod_name.clone());
+                    }
+                    _ => {
+                        return resolve_workspace_interactive(&workspaces);
+                    }
+                }
+            }
+
+            // Fall back to globally latest workspace
             let pod_name = get_latest_workspace()?;
             tracing::info!("Using latest workspace: {}", strip_pod_prefix(&pod_name));
             Ok(pod_name)
@@ -126,6 +163,66 @@ fn resolve_workspace(workspace: Option<&str>, latest: bool) -> Result<String> {
             );
         }
     }
+}
+
+/// Present an interactive chooser when multiple workspaces match the current repo.
+///
+/// On non-TTY stdin (e.g. piped), automatically picks the most recent workspace
+/// and prints a hint about specifying a name explicitly.
+fn resolve_workspace_interactive(workspaces: &[RepoWorkspaceInfo]) -> Result<String> {
+    // Build display labels for each workspace
+    let labels: Vec<String> = workspaces
+        .iter()
+        .map(|ws| {
+            let commits = if ws.commit_count == 1 {
+                "1 commit".to_string()
+            } else {
+                format!("{} commits", ws.commit_count)
+            };
+            let task = ws
+                .task_summary
+                .as_deref()
+                .map(|t| format!("  \"{}\"", t))
+                .unwrap_or_default();
+            format!(
+                "{:<10} {:<12} {:<14}{}",
+                ws.short_name, commits, ws.age_display, task
+            )
+        })
+        .collect();
+
+    if !std::io::stdin().is_terminal() {
+        // Non-interactive: pick the first (most recent, since list_workspaces
+        // sorts newest-first) and print a hint.
+        let ws = &workspaces[0];
+        let commits = if ws.commit_count == 1 {
+            "1 commit".to_string()
+        } else {
+            format!("{} commits", ws.commit_count)
+        };
+        eprintln!(
+            "Using most recent workspace: {} ({}, {})",
+            ws.short_name, commits, ws.age_display
+        );
+        eprintln!(
+            "Tip: specify a workspace name to choose: devaipod diff {}",
+            if workspaces.len() > 1 {
+                &workspaces[1].short_name
+            } else {
+                &ws.short_name
+            }
+        );
+        return Ok(ws.pod_name.clone());
+    }
+
+    let selection = dialoguer::Select::new()
+        .with_prompt("Multiple agents have worked on this repo. Select one")
+        .items(&labels)
+        .default(0)
+        .interact()
+        .context("Failed to show workspace chooser")?;
+
+    Ok(workspaces[selection].pod_name.clone())
 }
 
 /// Get the most recently created devaipod workspace
@@ -181,26 +278,46 @@ fn get_latest_workspace() -> Result<String> {
     Ok(latest.to_string())
 }
 
-/// Resolve the source for a workspace, using dotfiles.url as fallback
+/// If `source` matches a configured source shorthand (e.g. `src:github/org/repo`),
+/// resolve it to a full container path. Otherwise return the source unchanged.
+fn maybe_resolve_shorthand(source: Option<&str>, config: &config::Config) -> Option<String> {
+    source.map(|s| {
+        if let Some(resolved) = config::resolve_source_shorthand(s, config) {
+            let resolved_str = resolved.to_string_lossy().to_string();
+            tracing::info!("Resolved source shorthand '{}' -> {}", s, resolved_str);
+            resolved_str
+        } else {
+            s.to_string()
+        }
+    })
+}
+
+/// Resolve the source for a workspace, using journal or dotfiles as fallback
 ///
-/// If source is provided, returns it. Otherwise, returns the dotfiles URL
-/// from config, or an error if neither is available.
-fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Result<&'a str> {
+/// If source is provided, returns it. Otherwise, falls back to the journal
+/// repo (if configured), then the dotfiles URL, or returns an error.
+fn resolve_source<'a>(source: Option<&'a str>, config: &'a config::Config) -> Option<&'a str> {
     if let Some(s) = source {
-        return Ok(s);
+        return Some(s);
     }
-    config
-        .dotfiles
-        .as_ref()
-        .map(|d| d.url.as_str())
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "No source specified and no dotfiles repository configured.\n\
-                 Either provide a source argument or configure dotfiles in your config:\n\n\
-                 [dotfiles]\n\
-                 url = \"https://github.com/youruser/dotfiles\""
-            )
-        })
+
+    // If CWD is inside a git repo, default to "." (the current repo)
+    if repo_root_path().is_ok() {
+        tracing::info!("No source specified, using current git repo");
+        return Some(".");
+    }
+
+    // Fall back to journal repo if configured
+    if let Some(ref repo) = config.journal.repo {
+        tracing::info!("No source specified, using journal repo: {}", repo);
+        return Some(repo.as_str());
+    }
+
+    if let Some(ref dotfiles) = config.dotfiles {
+        return Some(dotfiles.url.as_str());
+    }
+
+    None
 }
 
 /// Sanitize a name for use in pod names (alphanumeric and hyphens only)
@@ -263,24 +380,32 @@ fn make_pr_pod_name(repo: &str, pr_number: u64) -> String {
 // =============================================================================
 
 #[derive(Debug, Parser)]
-#[command(name = "devaipod")]
+#[command(name = "devaipod-server")]
 #[command(about = "Sandboxed AI coding agents in reproducible dev environments")]
 #[command(after_help = "\
 QUICK START:
-  devaipod run https://github.com/org/repo    Start agent with interactive task prompt
-  devaipod run <url> -c 'fix the bug'         Start agent with inline task
+  devaipod run <url> 'fix the bug'            Create workspace and start agent
   devaipod attach -l                          Attach to most recent workspace
 
-COMMON WORKFLOWS:
-  devaipod list                               See all workspaces
-  devaipod attach <workspace>                 Connect to agent in workspace
-  devaipod exec <workspace>                   Get a shell in agent container
-  devaipod exec <workspace> -W                Get a shell in workspace container
-  devaipod logs <workspace> -f                Follow agent logs
-  devaipod delete <workspace>                 Clean up when done
+WORKSPACE LIFECYCLE:
+  up, run                                     Create workspaces
+  list, tui, status                           View workspaces
+  start, stop, delete                         Manage lifecycle
+  done, prune, cleanup                        Mark complete and clean up
+  rebuild, title                              Reconfigure workspaces
 
-FIRST TIME SETUP:
-  devaipod init                               Configure API keys and tokens
+AGENT INTERACTION:
+  attach, exec                                Connect to workspace
+  logs, debug                                 Inspect workspace
+  advisor                                     Launch advisor agent
+
+GIT & CODE REVIEW:
+  fetch, diff, review                         Review agent changes
+  apply, push, pr                             Integrate agent work
+
+ADVANCED (use '<command> --help' for details):
+  opencode, gator, controlplane (cp)          Programmatic / service APIs
+  web, ssh-config, completions, init          Infrastructure & setup
 
 DOCS: https://github.com/cgwalters/devaipod")]
 struct HostCli {
@@ -342,7 +467,7 @@ struct UpOptions {
     /// Generate configuration files but don't start containers
     #[arg(long)]
     dry_run: bool,
-    /// Exec into workspace container after starting
+    /// Exec into agent container after starting
     #[arg(short = 'S', long = "exec")]
     exec_after: bool,
     /// Internal: mode of workspace creation (not exposed as CLI arg)
@@ -412,6 +537,29 @@ struct UpOptions {
     /// interactive approval for tool usage.
     #[arg(long)]
     no_auto_approve: bool,
+    /// Additional source directories to mount read-only in the agent container.
+    ///
+    /// Each directory is bind-mounted at /mnt/source/<dirname>/ (read-only).
+    /// Can be specified multiple times.
+    /// If the directory is a git repository, it will be automatically cloned
+    /// into the agent workspace for convenience.
+    ///
+    /// Examples:
+    ///   --source-dir ~/src/api --source-dir ~/docs
+    ///   --source-dir .   # Current directory as read-only source
+    #[arg(long = "source-dir", value_name = "DIR")]
+    source_dirs: Vec<PathBuf>,
+    /// Forward a port from the container to the host.
+    ///
+    /// Uses devcontainer.json forwardPorts syntax: a plain port number
+    /// (random host port) or hostPort:containerPort (explicit mapping).
+    /// Can be specified multiple times.
+    ///
+    /// Examples:
+    ///   -p 3000           # Forward container port 3000 to a random host port
+    ///   -p 8080:3000      # Forward container port 3000 to host port 8080
+    #[arg(short = 'p', long = "port", value_name = "PORT")]
+    ports: Vec<String>,
 }
 
 /// Internal options for workspace creation (like `podman create` vs `podman run`)
@@ -445,6 +593,10 @@ struct CreateOptions {
     use_default_devcontainer: bool,
     /// Whether to auto-approve all tool permissions (default: true)
     auto_approve: bool,
+    /// Additional source directories to mount read-only
+    source_dirs: Vec<PathBuf>,
+    /// Ports to forward (CLI --port flags)
+    ports: Vec<String>,
 }
 
 impl CreateOptions {
@@ -464,8 +616,47 @@ impl CreateOptions {
             devcontainer_json: opts.devcontainer_json.clone(),
             use_default_devcontainer: opts.use_default_devcontainer,
             auto_approve: !opts.no_auto_approve,
+            source_dirs: opts.source_dirs.clone(),
+            ports: opts.ports.clone(),
         }
     }
+}
+
+/// Create an [`AgentBackend`] from the resolved agent name and optional profile.
+///
+/// If a profile is provided, uses AcpBackend with the profile's command.
+/// Otherwise, uses ACP backend with default command `["opencode", "acp"]`.
+///
+/// The `agent_config` parameter is used to extract candidate binaries for
+/// auto-detection in the startup script.
+fn create_agent_backend(
+    name: &str,
+    profile: Option<&crate::config::AgentProfile>,
+    agent_config: &crate::config::AgentConfig,
+) -> color_eyre::Result<Box<dyn crate::agent::AgentBackend>> {
+    tracing::debug!("Creating agent backend for profile '{name}'");
+    let candidate_binaries: Vec<String> = agent_config
+        .candidate_binaries()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    if let Some(profile) = profile {
+        return Ok(Box::new(crate::agent_acp::AcpBackend::new_with_candidates(
+            profile.command.clone(),
+            candidate_binaries,
+        )));
+    }
+
+    // No profile — use ACP backend with default opencode command
+    Ok(Box::new(crate::agent_acp::AcpBackend::new_with_candidates(
+        vec!["opencode".to_string(), "acp".to_string()],
+        if candidate_binaries.is_empty() {
+            vec!["opencode".to_string()]
+        } else {
+            candidate_binaries
+        },
+    )))
 }
 
 #[derive(Debug, Parser)]
@@ -478,11 +669,11 @@ enum HostCommand {
     /// For remote URLs (GitHub repos/PRs), service-gator is automatically enabled
     /// with read + draft PR permissions for that repository.
     ///
-    /// If no source is specified, uses the dotfiles repository from config
-    /// (which must contain a devcontainer.json).
+    /// If no source is specified, falls back to the journal repo (if configured),
+    /// then the dotfiles repository from config.
     ///
     /// Examples:
-    ///   devaipod up                                        # Use dotfiles repo
+    ///   devaipod up                                        # Use journal/dotfiles repo
     ///   devaipod up .                                      # Local repo
     ///   devaipod up . -S                                   # Local repo, SSH in after
     ///   devaipod up https://github.com/user/repo           # Remote repo
@@ -490,7 +681,7 @@ enum HostCommand {
     ///   devaipod up . 'fix the bug'                        # With task for agent
     ///   devaipod up . --service-gator=github:myorg/*       # Custom permissions
     Up {
-        /// Source: local path, git URL, or PR URL (default: dotfiles repo from config)
+        /// Source: local path, git URL, or PR URL (default: journal or dotfiles repo from config)
         source: Option<String>,
         #[command(flatten)]
         opts: UpOptions,
@@ -580,6 +771,7 @@ enum HostCommand {
     ///
     /// Example:
     ///   devaipod ssh-config my-repo >> ~/.ssh/config
+    #[command(hide = true)]
     SshConfig {
         /// Workspace name (devaipod- prefix optional)
         #[arg(allow_hyphen_values = true)]
@@ -596,27 +788,49 @@ enum HostCommand {
     ///
     /// This is run automatically on `devaipod delete`, but can be run
     /// manually to clean up after crashes or external pod deletions.
+    #[command(hide = true)]
     Cleanup {
         /// Dry run - show what would be cleaned without doing it
         #[arg(long, short = 'n')]
         dry_run: bool,
     },
     /// List workspaces
+    ///
+    /// When run from a git repository, only workspaces for the current repo
+    /// are shown. Use -A to show all workspaces. Inactive (stopped/exited)
+    /// pods are hidden by default; use --inactive to include them.
     List {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+        /// Show all workspaces (default: filter to current repo)
+        #[arg(short = 'A', long)]
+        all: bool,
+        /// Include inactive (stopped/exited) workspaces
+        #[arg(long)]
+        inactive: bool,
     },
     /// Interactive TUI dashboard
     ///
     /// Opens a terminal UI for managing devaipod instances. Shows real-time
     /// status of all instances with agent health, tasks, and repository info.
     ///
+    /// When run from a git repository, only workspaces for the current repo
+    /// are shown. Use -A to show all workspaces.
+    ///
+    /// Instances are grouped by repository. Inactive (stopped/exited) pods
+    /// are hidden by default; press 'i' to toggle.
+    ///
     /// Keybindings:
     ///   j/k or arrows: Navigate
+    ///   i: Toggle inactive pods
     ///   r: Refresh
     ///   q: Quit
-    Tui,
+    Tui {
+        /// Show all workspaces (default: filter to current repo)
+        #[arg(short = 'A', long)]
+        all: bool,
+    },
     /// Start a stopped workspace
     ///
     /// Starts a previously stopped pod (restarts all containers).
@@ -705,16 +919,29 @@ enum HostCommand {
         #[arg(short = 'n', long)]
         tail: Option<u32>,
     },
-    /// Show detailed status of a pod
+    /// Show status of agent workspaces, branches, and PRs
     ///
-    /// Displays pod status, container states, agent health, and exposed ports.
+    /// When run from a git repository with no arguments, displays a
+    /// comprehensive overview of all agent work related to the current
+    /// repository: workspace status, harvested branches, push status,
+    /// and associated pull requests.
+    ///
+    /// When a workspace name is given, displays detailed pod status
+    /// including container states, agent health, and exposed ports.
+    ///
+    /// Examples:
+    ///   devaipod status                          # Repo overview (from a git repo)
+    ///   devaipod status myworkspace              # Pod-level status
     Status {
-        /// Workspace name (devaipod- prefix optional)
+        /// Workspace name (devaipod- prefix optional). Omit for repo overview.
         #[arg(allow_hyphen_values = true)]
-        workspace: String,
+        workspace: Option<String>,
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+        /// Show all workspaces (default: filter to current repo)
+        #[arg(short = 'A', long)]
+        all: bool,
     },
     /// Debug and diagnose a workspace
     ///
@@ -742,17 +969,17 @@ enum HostCommand {
     /// "Fix <issue_url>". If no task is provided and stdin is a TTY, prompts
     /// interactively with the default pre-filled.
     ///
-    /// If no source is specified, uses the dotfiles repository from config
-    /// (which must contain a devcontainer.json).
+    /// If no source is specified, falls back to the journal repo (if configured),
+    /// then the dotfiles repository from config.
     ///
     /// Examples:
-    ///   devaipod run                                         # Use dotfiles repo
+    ///   devaipod run                                         # Use journal/dotfiles repo
     ///   devaipod run https://github.com/org/repo
     ///   devaipod run https://github.com/org/repo 'fix typos in README.md'
     ///   devaipod run https://github.com/org/repo/issues/123  # Default: "Fix <url>"
     ///   devaipod run . 'add unit tests for the parser module'
     Run {
-        /// Source: local path, git URL, issue URL, or PR URL (default: dotfiles repo from config)
+        /// Source: local path, git URL, issue URL, or PR URL (default: journal or dotfiles repo from config)
         source: Option<String>,
         /// Task description for the AI agent
         #[arg(value_name = "TASK")]
@@ -810,6 +1037,27 @@ enum HostCommand {
         /// Human-readable title for this session (e.g. "refactoring auth")
         #[arg(long, value_name = "TITLE")]
         title: Option<String>,
+        /// Additional source directories to mount read-only in the agent container
+        #[arg(long = "source-dir", value_name = "DIR")]
+        source_dirs: Vec<PathBuf>,
+        /// Forward a port from the container to the host.
+        ///
+        /// Uses devcontainer.json forwardPorts syntax: a plain port number
+        /// (random host port) or hostPort:containerPort (explicit mapping).
+        /// Can be specified multiple times.
+        ///
+        /// Examples:
+        ///   -p 3000           # Forward container port 3000 to a random host port
+        ///   -p 8080:3000      # Forward container port 3000 to host port 8080
+        #[arg(short = 'p', long = "port", value_name = "PORT")]
+        ports: Vec<String>,
+        /// Create a scratch workspace without source context
+        ///
+        /// By default, `run` auto-detects the current git repo. This flag
+        /// creates a clean workspace using only the default devcontainer image,
+        /// similar to how the advisor pod works.
+        #[arg(short = 'N', long = "no-context")]
+        no_context: bool,
     },
     /// Generate shell completions
     ///
@@ -819,6 +1067,7 @@ enum HostCommand {
     ///   devaipod completions bash > ~/.local/share/bash-completion/completions/devaipod
     ///   devaipod completions zsh > ~/.zfunc/_devaipod
     ///   devaipod completions fish > ~/.config/fish/completions/devaipod.fish
+    #[command(hide = true)]
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
@@ -849,6 +1098,7 @@ enum HostCommand {
     ///   devaipod opencode myworkspace mcp tools         # List available tools
     ///   devaipod opencode myworkspace session list      # List sessions
     ///   devaipod opencode myworkspace send "fix bug"    # Send message to agent
+    #[command(hide = true)]
     Opencode {
         /// Workspace name (devaipod- prefix optional)
         #[arg(allow_hyphen_values = true)]
@@ -896,6 +1146,7 @@ enum HostCommand {
     /// Examples:
     ///   devaipod web                    # Start on default port 8080
     ///   devaipod web --port 3000        # Start on port 3000
+    #[command(hide = true)]
     Web {
         /// Port to bind the web server
         #[arg(long, default_value = "8080")]
@@ -915,20 +1166,9 @@ enum HostCommand {
     ///   devaipod pod-api                              # Default port 8090, workspace /workspaces
     ///   devaipod pod-api --port 9000                  # Custom port
     ///   devaipod pod-api --workspace /home/user/repo  # Custom workspace path
+    #[command(hide = true)]
     PodApi(pod_api::PodApiArgs),
 
-    /// Mock opencode server for integration testing.
-    ///
-    /// Serves a minimal HTTP API on the specified port that mimics the opencode
-    /// session/message endpoints. Used by integration tests so the pod-api
-    /// sidecar has a functioning "opencode" to talk to without needing a real
-    /// AI provider.
-    #[command(hide = true)]
-    MockOpencode {
-        /// Port to listen on
-        #[arg(long, default_value = "4096")]
-        port: u16,
-    },
     /// Manage service-gator scopes for a workspace
     ///
     /// Service-gator provides scope-restricted access to external services
@@ -970,6 +1210,125 @@ enum HostCommand {
         /// Override the advisor pod name (default: advisor → devaipod-advisor)
         #[arg(long)]
         name: Option<String>,
+        /// Additional source directories to mount read-only in the advisor pod.
+        ///
+        /// The advisor can browse these to understand project structure,
+        /// check git status, and correlate across repos — without being
+        /// able to modify anything.
+        ///
+        /// Example: --source-dir ~/src
+        #[arg(long = "source-dir", value_name = "DIR")]
+        source_dirs: Vec<PathBuf>,
+    },
+
+    /// Fetch agent commits into the current git repo
+    ///
+    /// Adds a git remote pointing at the agent's workspace directory and fetches
+    /// all refs. This lets you review agent commits from your source repository
+    /// using standard git tools (git log, git diff, etc.).
+    ///
+    /// When run from a git repo without a workspace name, fetches from all
+    /// workspaces for the current repo. Use -A to fetch all regardless.
+    ///
+    /// Examples:
+    ///   devaipod fetch                           # Fetch all workspaces for this repo
+    ///   devaipod fetch myworkspace               # Fetch from named workspace
+    ///   devaipod fetch -A                        # Fetch all workspaces (all repos)
+    Fetch {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+        /// Fetch from all workspaces for the current repo
+        #[arg(short = 'A', long)]
+        all: bool,
+    },
+
+    /// Show diff of agent changes relative to current branch
+    ///
+    /// Fetches agent commits (if not already fetched) and shows the diff between
+    /// your current branch and the agent's main branch. Uses three-dot diff
+    /// (HEAD...remote/main) to show only what the agent changed.
+    ///
+    /// Examples:
+    ///   devaipod diff                            # Diff against latest workspace
+    ///   devaipod diff myworkspace                # Diff against named workspace
+    ///   devaipod diff --stat                     # Show diffstat instead of full diff
+    Diff {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+        /// Show stat instead of full diff
+        #[arg(long)]
+        stat: bool,
+    },
+
+    /// Interactive review of agent changes
+    ///
+    /// Opens a TUI showing the agent's commits and diff. Navigate the diff,
+    /// add inline comments, and submit them back to the agent as review
+    /// feedback. The agent receives the comments and iterates on its work.
+    ///
+    /// Examples:
+    ///   devaipod review                            # Review latest workspace
+    ///   devaipod review myworkspace                # Review named workspace
+    Review {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+    },
+
+    /// Apply agent changes to the current branch
+    ///
+    /// Fetches the latest agent commits and merges them into your current
+    /// branch. Equivalent to `devaipod fetch` followed by `git merge`.
+    ///
+    /// Must be run from your source repository.
+    ///
+    /// Examples:
+    ///   devaipod apply                          # Apply from latest workspace
+    ///   devaipod apply myworkspace              # Apply from named workspace
+    ///   devaipod apply --cherry-pick myws       # Cherry-pick instead of merge
+    Apply {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+        /// Cherry-pick instead of merge (for individual commits)
+        #[arg(long)]
+        cherry_pick: bool,
+    },
+
+    /// Push agent branch to origin
+    ///
+    /// Pushes the most recently harvested branch from the named (or latest)
+    /// workspace to the remote origin. Equivalent to running `devaipod fetch`
+    /// then `git push origin <ref>:<branch>`.
+    ///
+    /// Must be run from your source repository.
+    ///
+    /// Examples:
+    ///   devaipod push                            # Push latest workspace's branch
+    ///   devaipod push myworkspace                # Push specific workspace
+    Push {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+    },
+
+    /// Create a pull request from agent work
+    ///
+    /// Pushes the agent branch and creates a PR using `gh pr create`.
+    /// Requires the `gh` CLI to be installed and authenticated.
+    ///
+    /// Must be run from your source repository.
+    ///
+    /// Examples:
+    ///   devaipod pr                              # PR from latest workspace
+    ///   devaipod pr myworkspace                  # PR from specific workspace
+    ///   devaipod pr --draft myworkspace          # Create as draft PR
+    Pr {
+        /// Workspace name (uses latest if omitted)
+        workspace: Option<String>,
+        /// Create as draft PR
+        #[arg(long)]
+        draft: bool,
+        /// PR title (auto-generated from commits if omitted)
+        #[arg(long)]
+        title: Option<String>,
     },
 
     /// Get or set the session title for a pod
@@ -986,6 +1345,22 @@ enum HostCommand {
         name: String,
         /// New title (omit to show current title)
         title: Option<String>,
+    },
+
+    /// Manage standalone devcontainers (human dev environment, no AI agent)
+    ///
+    /// Creates and manages devcontainer pods with a workspace container
+    /// and API sidecar, but no AI agent or service-gator.
+    ///
+    /// Examples:
+    ///   devaipod devcontainer run .                              # Local repo
+    ///   devaipod devcontainer run https://github.com/user/repo   # Remote repo
+    ///   devaipod devcontainer list                               # List devcontainers
+    ///   devaipod devcontainer rm my-workspace                    # Remove a devcontainer
+    #[command(alias = "dc")]
+    Devcontainer {
+        #[command(subcommand)]
+        action: DevcontainerAction,
     },
 
     /// Internal helper commands (not for direct user use)
@@ -1123,12 +1498,75 @@ enum GatorAction {
     },
 }
 
+/// Devcontainer management actions
+#[derive(Debug, Parser)]
+enum DevcontainerAction {
+    /// Create a standalone devcontainer (no AI agent)
+    ///
+    /// Creates a pod with a workspace container and API sidecar.
+    /// The workspace gets trusted credentials, devcontainer lifecycle
+    /// commands, dotfiles, and SSH access.
+    ///
+    /// Examples:
+    ///   devaipod devcontainer run .
+    ///   devaipod devcontainer run https://github.com/user/repo
+    ///   devaipod devcontainer run . --image mcr.microsoft.com/devcontainers/rust:1
+    Run {
+        /// Source: local path or git URL
+        source: Option<String>,
+        /// Use a specific container image instead of building from devcontainer.json
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+        /// Explicit pod name (default: derived from source with unique suffix)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Use this devcontainer JSON instead of the repo's devcontainer.json
+        #[arg(long, value_name = "JSON")]
+        devcontainer_json: Option<String>,
+        /// Use the devcontainer.json from your dotfiles repo instead of the project's
+        #[arg(long)]
+        use_default_devcontainer: bool,
+        /// Forward a port from the container to the host.
+        ///
+        /// Uses devcontainer.json forwardPorts syntax: a plain port number
+        /// (random host port) or hostPort:containerPort (explicit mapping).
+        /// Can be specified multiple times.
+        ///
+        /// Examples:
+        ///   -p 3000           # Forward container port 3000 to a random host port
+        ///   -p 8080:3000      # Forward container port 3000 to host port 8080
+        #[arg(short = 'p', long = "port", value_name = "PORT")]
+        ports: Vec<String>,
+    },
+    /// List running devcontainer pods
+    ///
+    /// Shows only devcontainer pods (not agent pods).
+    List {
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a devcontainer pod and its volumes
+    ///
+    /// Examples:
+    ///   devaipod devcontainer rm my-workspace
+    ///   devaipod devcontainer rm my-workspace --force
+    Rm {
+        /// Workspace name (devaipod- prefix optional)
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// Force deletion (stop running containers first)
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
 // =============================================================================
 // Container CLI - commands that run inside a devcontainer
 // =============================================================================
 
 #[derive(Debug, Parser)]
-#[command(name = "devaipod")]
+#[command(name = "devaipod-server")]
 #[command(about = "Sandboxed AI coding agents (container mode)", long_about = None)]
 struct ContainerCli {
     /// Path to config file (default: ~/.config/devaipod.toml)
@@ -1242,8 +1680,17 @@ fn command_requires_config(cmd: &HostCommand) -> bool {
         HostCommand::Init { .. }
             | HostCommand::Completions { .. }
             | HostCommand::PodApi(_)
-            | HostCommand::MockOpencode { .. }
             | HostCommand::Internals { .. }
+            | HostCommand::Fetch { .. }
+            | HostCommand::Diff { .. }
+            | HostCommand::Review { .. }
+            | HostCommand::Apply { .. }
+            | HostCommand::Push { .. }
+            | HostCommand::Pr { .. }
+            | HostCommand::Status {
+                workspace: None,
+                ..
+            }
     )
 }
 
@@ -1254,8 +1701,17 @@ fn command_allowed_on_host(cmd: &HostCommand) -> bool {
         HostCommand::Init { .. }
             | HostCommand::Completions { .. }
             | HostCommand::PodApi(_)
-            | HostCommand::MockOpencode { .. }
             | HostCommand::Internals { .. }
+            | HostCommand::Fetch { .. }
+            | HostCommand::Diff { .. }
+            | HostCommand::Review { .. }
+            | HostCommand::Apply { .. }
+            | HostCommand::Push { .. }
+            | HostCommand::Pr { .. }
+            | HostCommand::Status {
+                workspace: None,
+                ..
+            }
     )
 }
 
@@ -1266,24 +1722,20 @@ async fn run_host(cli: HostCli) -> Result<()> {
         && !is_host_mode_env()
         && !command_allowed_on_host(&cli.command)
     {
-        eprintln!("Error: devaipod is designed to run inside the devaipod container.");
+        eprintln!("Error: this is the server binary, which runs inside the devaipod container.");
         eprintln!();
-        eprintln!("For proper isolation and security, devaipod should be run inside its");
-        eprintln!("container image (ghcr.io/cgwalters/devaipod).");
+        eprintln!("Install the host CLI shim instead:");
+        eprintln!("  cargo install --git https://github.com/cgwalters/devaipod devaipod-host");
+        eprintln!("  # or from a local checkout:");
+        eprintln!("  just install-host-shim");
         eprintln!();
-        eprintln!("To run inside the container:");
-        eprintln!("  SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock");
-        eprintln!("  podman run -d --name devaipod -p 8080:8080 --privileged \\");
-        eprintln!("    -v $SOCKET:/run/docker.sock -e DEVAIPOD_HOST_SOCKET=$SOCKET \\");
-        eprintln!("    -v ~/.config/devaipod.toml:/root/.config/devaipod.toml:ro \\");
-        eprintln!("    ghcr.io/cgwalters/devaipod");
+        eprintln!("Then use:");
+        eprintln!("  devaipod server start   # start the server container");
+        eprintln!("  devaipod list            # commands are proxied into the container");
         eprintln!();
-        eprintln!("To bypass this check and run directly on the host:");
+        eprintln!("To bypass this check and run the server binary directly:");
         eprintln!("  devaipod --host <command>");
-        eprintln!("  # or");
         eprintln!("  DEVAIPOD_HOST_MODE=1 devaipod <command>");
-        eprintln!();
-        eprintln!("See https://github.com/cgwalters/devaipod/blob/main/docs/src/quickstart.md");
         std::process::exit(1);
     }
 
@@ -1311,8 +1763,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
 
     match cli.command {
         HostCommand::Up { source, opts } => {
-            let source = resolve_source(source.as_deref(), &config)?;
-            cmd_up(&config, source, opts).await
+            let source = resolve_source(source.as_deref(), &config);
+            let source = maybe_resolve_shorthand(source, &config);
+            cmd_up(&config, source.as_deref(), opts).await
         }
 
         HostCommand::Attach {
@@ -1331,6 +1784,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             let target = if worker {
                 AttachTarget::Worker
             } else if workspace_mode {
+                tracing::warn!(
+                    "Agent pods no longer have a workspace container; -W targets a container that may not exist"
+                );
                 AttachTarget::Workspace
             } else {
                 AttachTarget::Agent
@@ -1347,6 +1803,9 @@ async fn run_host(cli: HostCli) -> Result<()> {
             let target = if worker {
                 AttachTarget::Worker
             } else if workspace_mode {
+                tracing::warn!(
+                    "Agent pods no longer have a workspace container; -W targets a container that may not exist"
+                );
                 AttachTarget::Workspace
             } else {
                 AttachTarget::Agent
@@ -1357,8 +1816,12 @@ async fn run_host(cli: HostCli) -> Result<()> {
             cmd_ssh_config(&normalize_pod_name(&workspace), user.as_deref())
         }
         HostCommand::Cleanup { dry_run } => cmd_cleanup(dry_run),
-        HostCommand::List { json } => cmd_list(json),
-        HostCommand::Tui => tui::run().await,
+        HostCommand::List {
+            json,
+            all,
+            inactive,
+        } => cmd_list(json, all, inactive),
+        HostCommand::Tui { all } => tui::run(all).await,
         HostCommand::Start { workspace } => cmd_start(&normalize_pod_name(&workspace)),
         HostCommand::Stop { workspace } => cmd_stop(&normalize_pod_name(&workspace)),
         HostCommand::Delete { workspace, force } => {
@@ -1387,9 +1850,21 @@ async fn run_host(cli: HostCli) -> Result<()> {
             follow,
             tail,
         } => cmd_logs(&normalize_pod_name(&workspace), &container, follow, tail),
-        HostCommand::Status { workspace, json } => {
-            cmd_status(&normalize_pod_name(&workspace), json)
-        }
+        HostCommand::Status {
+            workspace: Some(workspace),
+            json,
+            ..
+        } => cmd_status(&normalize_pod_name(&workspace), json),
+        HostCommand::Status {
+            workspace: None,
+            all: true,
+            ..
+        } => cmd_list(false, true, true),
+        HostCommand::Status {
+            workspace: None,
+            all: false,
+            ..
+        } => cmd_repo_status(),
         HostCommand::Debug { workspace, json } => cmd_debug(&normalize_pod_name(&workspace), json),
         HostCommand::Run {
             source,
@@ -1406,43 +1881,111 @@ async fn run_host(cli: HostCli) -> Result<()> {
             use_default_devcontainer,
             no_auto_approve,
             title,
+            source_dirs,
+            ports,
+            no_context,
         } => {
-            let source = resolve_source(source.as_deref(), &config)?;
+            let source = if no_context {
+                if source.is_some() {
+                    tracing::warn!("--no-context: ignoring source argument");
+                }
+                None
+            } else {
+                let source = resolve_source(source.as_deref(), &config);
+                maybe_resolve_shorthand(source, &config)
+            };
+            let source = source.as_deref();
+
+            // Merge task sources: positional arg takes precedence, then -c/--command
+            let explicit_task = task.or(command);
+
+            // If no source and no explicit task, error out early with guidance
+            // (skip this check when --no-context is set — scratch workspace is intentional)
+            if !no_context && source.is_none() && explicit_task.is_none() {
+                bail!(
+                    "No source specified. Either provide a git URL, or use -c to specify a task for a scratch workspace.\n\
+                     You can also configure a fallback in your config:\n\n\
+                     [journal]\n\
+                     repo = \"~/src/journal\"\n\n\
+                     [dotfiles]\n\
+                     url = \"https://github.com/youruser/dotfiles\""
+                );
+            }
+
+            // Expand issue/PR shorthands like "#123" or "issues/123" to full
+            // forge URLs using the current repo's origin remote.
+            let source = match source {
+                Some(ref s) => {
+                    let trimmed = s.trim();
+                    let issue_number = if let Some(n) = trimmed.strip_prefix('#') {
+                        n.parse::<u64>().ok()
+                    } else if let Some(n) = trimmed.strip_prefix("issues/") {
+                        n.parse::<u64>().ok()
+                    } else {
+                        None
+                    };
+                    if let Some(num) = issue_number {
+                        // Get the origin URL for the current repo
+                        let origin = ProcessCommand::new("git")
+                            .args(["remote", "get-url", "origin"])
+                            .output()
+                            .ok()
+                            .filter(|o| o.status.success())
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                        if let Some(origin_url) = origin {
+                            let base = normalize_source(&origin_url, &config.git.extra_hosts);
+                            let expanded = format!("{}/issues/{}", base.trim_end_matches('/'), num);
+                            tracing::info!("Expanded '{}' to {}", trimmed, expanded);
+                            Some(expanded)
+                        } else {
+                            bail!(
+                                "Cannot expand '{}': not in a git repo with an 'origin' remote",
+                                trimmed
+                            );
+                        }
+                    } else {
+                        source.as_ref().map(|s| s.to_string())
+                    }
+                }
+                None => None,
+            };
 
             // Check if source is an issue or PR URL - if so, set default task
             // Format: "<url> - work on" so human can easily edit the action
-            let (effective_source, default_task) =
-                if let Some(issue_ref) = forge::parse_issue_url(source) {
-                    let issue_url = issue_ref.issue_url();
-                    let repo_url = issue_ref.repo_url();
-                    tracing::info!("Issue URL detected: {}", issue_ref.short_display());
-                    (repo_url, Some(format!("{} - work on", issue_url)))
-                } else if let Some(pr_ref) = forge::parse_pr_url(source) {
-                    let pr_url = pr_ref.pr_url();
-                    tracing::info!("PR URL detected: {}", pr_ref.short_display());
-                    // For PRs, keep the PR URL as source (will be handled by create_workspace_from_pr)
-                    (source.to_string(), Some(format!("{} - work on", pr_url)))
-                } else {
-                    (source.to_string(), None)
-                };
-
-            // Merge task sources: positional arg takes precedence, then -c/--command
-            // Note: default_task from issue URL is NOT merged here - it's used as
-            // the pre-filled text in the interactive prompt instead
-            let explicit_task = task.or(command);
+            let (effective_source, default_task) = match source.as_deref() {
+                Some(source) => {
+                    if let Some(issue_ref) = forge::parse_issue_url(source) {
+                        let issue_url = issue_ref.issue_url();
+                        let repo_url = issue_ref.repo_url();
+                        tracing::info!("Issue URL detected: {}", issue_ref.short_display());
+                        (Some(repo_url), Some(format!("{} - work on", issue_url)))
+                    } else if let Some(pr_ref) = forge::parse_pr_url(source) {
+                        let pr_url = pr_ref.pr_url();
+                        tracing::info!("PR URL detected: {}", pr_ref.short_display());
+                        (
+                            Some(source.to_string()),
+                            Some(format!("{} - work on", pr_url)),
+                        )
+                    } else {
+                        (Some(source.to_string()), None)
+                    }
+                }
+                None => (None, None),
+            };
 
             // Determine final source and task: explicit task, or prompt interactively
             let (effective_source, effective_task) = match explicit_task {
                 Some(t) => (effective_source, Some(t)),
-                None if std::io::stdin().is_terminal() => {
+                None if effective_source.is_some() && std::io::stdin().is_terminal() => {
                     // Use TUI-style editable prompt for both source and task
+                    // (only when we have a source to show)
                     match tui::prompt_launch_input(
-                        &effective_source,
+                        effective_source.as_deref().unwrap(),
                         default_task.as_deref().unwrap_or(""),
                     )
                     .await?
                     {
-                        Some(result) => (result.url, Some(result.task)),
+                        Some(result) => (Some(result.url), Some(result.task)),
                         None => {
                             // User cancelled with Esc
                             std::process::exit(130)
@@ -1450,7 +1993,7 @@ async fn run_host(cli: HostCli) -> Result<()> {
                     }
                 }
                 // Non-interactive: try to read from stdin (for piped input), fall back to default_task
-                None => {
+                None if effective_source.is_some() => {
                     use std::io::BufRead;
                     let stdin = std::io::stdin();
                     let mut line = String::new();
@@ -1467,11 +2010,13 @@ async fn run_host(cli: HostCli) -> Result<()> {
                         Err(_) => (effective_source, default_task), // Read error, use default
                     }
                 }
+                // No source and explicit_task was None — we already bailed above
+                None => (effective_source, None),
             };
 
             let pod_name = cmd_run(
                 &config,
-                &effective_source,
+                effective_source.as_deref(),
                 effective_task.as_deref(),
                 image.as_deref(),
                 name.as_deref(),
@@ -1483,6 +2028,8 @@ async fn run_host(cli: HostCli) -> Result<()> {
                 use_default_devcontainer,
                 !no_auto_approve,
                 title.as_deref(),
+                &source_dirs,
+                &ports,
             )
             .await?;
 
@@ -1522,20 +2069,603 @@ async fn run_host(cli: HostCli) -> Result<()> {
 
             crate::web::run_web_server(port, token, mcp_token).await
         }
+        HostCommand::Fetch { workspace, all } => {
+            if all || (workspace.is_none() && repo_root_path().is_ok()) {
+                // Fetch all workspaces for the current repo
+                let repo_root = repo_root_path()?;
+                let workspaces = find_workspaces_for_repo(&repo_root);
+                if workspaces.is_empty() {
+                    println!("No workspaces found for this repo.");
+                    println!("Use 'devaipod up .' to create one.");
+                } else {
+                    let mut errors = 0;
+                    for ws in &workspaces {
+                        match cmd_fetch(&ws.pod_name) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("Error fetching {}: {:#}", ws.short_name, e);
+                                errors += 1;
+                            }
+                        }
+                    }
+                    if errors > 0 {
+                        bail!("{} workspace(s) failed to fetch", errors);
+                    }
+                }
+                Ok(())
+            } else {
+                let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+                cmd_fetch(&pod_name).map(|_| ())
+            }
+        }
+        HostCommand::Diff {
+            workspace, stat, ..
+        } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            cmd_diff(&pod_name, stat)
+        }
+        HostCommand::Review { workspace } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            crate::review_tui::run(&pod_name).await
+        }
+        HostCommand::Apply {
+            workspace,
+            cherry_pick,
+        } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            cmd_apply(&pod_name, cherry_pick)
+        }
+        HostCommand::Push { workspace } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            cmd_push(&pod_name)
+        }
+        HostCommand::Pr {
+            workspace,
+            draft,
+            title,
+        } => {
+            let pod_name = resolve_workspace(workspace.as_deref(), workspace.is_none())?;
+            cmd_pr(&pod_name, draft, title.as_deref())
+        }
         HostCommand::Title { name, title } => {
             cmd_title(&normalize_pod_name(&name), title.as_deref()).await
         }
         HostCommand::PodApi(args) => crate::pod_api::run(args).await,
-        HostCommand::MockOpencode { port } => crate::pod_api::run_mock_opencode(port).await,
         HostCommand::Advisor {
             task,
             status,
             proposals,
             name,
-        } => cmd_advisor(&config, task.as_deref(), status, proposals, name.as_deref()).await,
+            source_dirs,
+        } => {
+            cmd_advisor(
+                &config,
+                task.as_deref(),
+                status,
+                proposals,
+                name.as_deref(),
+                &source_dirs,
+            )
+            .await
+        }
+        HostCommand::Devcontainer { action } => cmd_devcontainer(&config, action).await,
         HostCommand::Helper { action } => run_helper_async(action).await,
         HostCommand::Internals { action } => run_internals(action),
     }
+}
+
+/// Dispatch devcontainer subcommands
+async fn cmd_devcontainer(config: &config::Config, action: DevcontainerAction) -> Result<()> {
+    match action {
+        DevcontainerAction::Run {
+            source,
+            image,
+            name,
+            devcontainer_json,
+            use_default_devcontainer,
+            ports,
+        } => {
+            let source = resolve_source(source.as_deref(), config);
+            match source {
+                Some(source) => {
+                    cmd_devcontainer_run(
+                        config,
+                        source,
+                        image.as_deref(),
+                        name.as_deref(),
+                        devcontainer_json.as_deref(),
+                        use_default_devcontainer,
+                        &ports,
+                    )
+                    .await
+                }
+                None => {
+                    bail!(
+                        "No source specified for devcontainer.\n\
+                         Either provide a source argument, or configure a fallback in your config."
+                    );
+                }
+            }
+        }
+        DevcontainerAction::List { json } => cmd_devcontainer_list(json),
+        DevcontainerAction::Rm { name, force } => cmd_delete(&normalize_pod_name(&name), force),
+    }
+}
+
+/// Create a standalone devcontainer pod
+async fn cmd_devcontainer_run(
+    config: &config::Config,
+    source: &str,
+    image: Option<&str>,
+    explicit_name: Option<&str>,
+    devcontainer_json: Option<&str>,
+    use_default_devcontainer: bool,
+    ports: &[String],
+) -> Result<()> {
+    let source = normalize_source(source, &config.git.extra_hosts);
+    let source = source.as_ref();
+
+    // Build CreateOptions-like state for devcontainer config resolution
+    let create_opts = CreateOptions {
+        task: None,
+        title: None,
+        image: image.map(|s| s.to_string()),
+        name: explicit_name.map(|s| s.to_string()),
+        service_gator_scopes: vec![],
+        service_gator_image: None,
+        mode: WorkspaceMode::Up, // doesn't matter, we use our own label
+        service_gator_ro: false,
+        mcp_servers: vec![],
+        devcontainer_json: devcontainer_json.map(|s| s.to_string()),
+        use_default_devcontainer,
+        auto_approve: false,
+        source_dirs: vec![],
+        ports: ports.to_vec(),
+    };
+
+    // Resolve the source (local vs remote)
+    let result = if source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("git@")
+    {
+        cmd_devcontainer_run_remote(config, source, &create_opts).await?
+    } else {
+        cmd_devcontainer_run_local(config, source, &create_opts).await?
+    };
+
+    // Auto-create SSH config entry
+    if config.ssh.auto_config
+        && let Some(config_path) = write_ssh_config_devcontainer(&result.pod_name)
+    {
+        tracing::info!("Created SSH config: {}", config_path.display());
+        if !is_using_container_ssh_export() && !ssh_config_has_include() {
+            tracing::warn!(
+                "Add 'Include ~/.ssh/config.d/*' to the top of ~/.ssh/config for SSH integration"
+            );
+        }
+    }
+
+    let short_name = strip_pod_prefix(&result.pod_name);
+    tracing::info!("Devcontainer ready ({})", short_name);
+    tracing::info!("  SSH: ssh {}.devaipod", result.pod_name);
+    tracing::info!("  Shell: devaipod exec {} -W", short_name);
+
+    Ok(())
+}
+
+/// Create a devcontainer from a local path
+async fn cmd_devcontainer_run_local(
+    config: &config::Config,
+    source: &str,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    let source_path = std::path::Path::new(source).canonicalize().ok();
+    let project_path = match source_path {
+        Some(ref p) => p,
+        None => bail!("Path '{}' does not exist or is not accessible.", source),
+    };
+
+    let git_info =
+        git::detect_git_info(project_path).context("Failed to detect git repository info")?;
+
+    if git_info.remote_url.is_none() {
+        bail!(
+            "No git remote configured for {}.\n\
+             devaipod clones the repository into containers and requires a git remote.\n\
+             Configure with: git remote add origin <url>",
+            project_path.display()
+        );
+    }
+
+    let (mut devcontainer_config, effective_image) = resolve_devcontainer_config(
+        config,
+        project_path,
+        opts,
+        &project_path.display().to_string(),
+    )
+    .await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
+
+    let project_name = project_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+    let pod_name = if let Some(ref name) = opts.name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name(&project_name)
+    };
+
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    let ws_source = pod::WorkspaceSource::LocalRepo(git_info);
+
+    let mut extra_labels = vec![("io.devaipod.mode".to_string(), "devcontainer".to_string())];
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
+    }
+
+    let devaipod_pod = pod::DevaipodPod::create_devcontainer(
+        &podman,
+        project_path,
+        &devcontainer_config,
+        &pod_name,
+        config,
+        &ws_source,
+        &extra_labels,
+        effective_image.as_deref(),
+    )
+    .await
+    .context("Failed to create devcontainer pod")?;
+
+    finalize_devcontainer_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    drop(podman);
+    Ok(CreateResult { pod_name })
+}
+
+/// Create a devcontainer from a remote URL
+async fn cmd_devcontainer_run_remote(
+    config: &config::Config,
+    remote_url: &str,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    tracing::info!("Setting up {}...", remote_url);
+
+    let repo_name = git::extract_repo_name(remote_url).unwrap_or_else(|| "project".to_string());
+
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_path = temp_dir.path();
+
+    let gh_token = git::get_github_token_with_secret(config);
+    let clone_url = git::authenticated_clone_url(remote_url, gh_token.as_deref());
+
+    let clone_output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &clone_url,
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to clone repository")?;
+
+    if !clone_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clone_output.stderr);
+        bail!("Failed to clone repository: {}", stderr);
+    }
+
+    let branch_output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(temp_path)
+        .output()
+        .await
+        .context("Failed to get default branch")?;
+
+    let default_branch = if branch_output.status.success() {
+        String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string()
+    } else {
+        "main".to_string()
+    };
+
+    let (mut devcontainer_config, effective_image) =
+        resolve_devcontainer_config(config, temp_path, opts, remote_url).await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
+
+    let pod_name = if let Some(ref name) = opts.name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name(&repo_name)
+    };
+
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    let remote_info = git::RemoteRepoInfo {
+        remote_url: remote_url.to_string(),
+        default_branch,
+        repo_name,
+        fork_url: None,
+    };
+    let ws_source = pod::WorkspaceSource::RemoteRepo(remote_info);
+
+    let mut extra_labels = vec![("io.devaipod.mode".to_string(), "devcontainer".to_string())];
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
+    }
+
+    let devaipod_pod = pod::DevaipodPod::create_devcontainer(
+        &podman,
+        temp_path,
+        &devcontainer_config,
+        &pod_name,
+        config,
+        &ws_source,
+        &extra_labels,
+        effective_image.as_deref(),
+    )
+    .await
+    .context("Failed to create devcontainer pod")?;
+
+    finalize_devcontainer_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    drop(podman);
+    Ok(CreateResult { pod_name })
+}
+
+/// Post-creation steps for devcontainer pods
+async fn finalize_devcontainer_pod(
+    podman: &podman::PodmanService,
+    devaipod_pod: &pod::DevaipodPod,
+    devcontainer_config: &devcontainer::DevcontainerConfig,
+    config: &config::Config,
+) -> Result<()> {
+    devaipod_pod
+        .start(podman)
+        .await
+        .context("Failed to start pod")?;
+
+    // Copy bind_home files into workspace container
+    devaipod_pod
+        .copy_bind_home_files_workspace(
+            podman,
+            &devaipod_pod.workspace_bind_home,
+            &devaipod_pod.container_home,
+            devcontainer_config.effective_user(),
+        )
+        .await
+        .context("Failed to copy bind_home files")?;
+
+    // Install dotfiles in workspace container
+    if let Some(ref dotfiles) = config.dotfiles {
+        devaipod_pod
+            .install_dotfiles_workspace(podman, dotfiles, devcontainer_config.effective_user())
+            .await
+            .context("Failed to install dotfiles")?;
+    }
+
+    // Run lifecycle commands in workspace container
+    devaipod_pod
+        .run_lifecycle_commands_workspace(podman, devcontainer_config)
+        .await
+        .context("Failed to run lifecycle commands")?;
+
+    Ok(())
+}
+
+/// Write SSH config for a devcontainer pod
+///
+/// The SSH ProxyCommand uses `-W` to target the workspace container.
+fn write_ssh_config_devcontainer(pod_name: &str) -> Option<std::path::PathBuf> {
+    let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+
+    let devaipod_cmd = if is_using_container_ssh_export() {
+        "podman exec -i devaipod devaipod-server".to_string()
+    } else {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "devaipod-server".to_string())
+    };
+
+    let config_content = format!(
+        r#"# Generated by devaipod devcontainer
+Host {pod}.devaipod
+    ProxyCommand {devaipod} exec -W --stdio {pod}
+    User {user}
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+"#,
+        pod = pod_name,
+        devaipod = devaipod_cmd,
+        user = username,
+    );
+
+    let config_dir = get_ssh_config_dir().ok()?;
+    std::fs::create_dir_all(&config_dir).ok()?;
+
+    use cap_std_ext::cap_primitives::fs::PermissionsExt;
+    use cap_std_ext::cap_std;
+    use cap_std_ext::dirext::CapStdExtDirExt;
+
+    let dir = cap_std::fs::Dir::open_ambient_dir(&config_dir, cap_std::ambient_authority()).ok()?;
+    let config_path = get_ssh_config_path(pod_name).ok()?;
+    let filename = config_path.file_name()?;
+
+    dir.atomic_write_with_perms(
+        filename,
+        config_content.as_bytes(),
+        cap_std::fs::Permissions::from_mode(0o600),
+    )
+    .ok()?;
+
+    Some(config_path)
+}
+
+/// List devcontainer pods (those with io.devaipod.mode=devcontainer)
+fn cmd_devcontainer_list(json_output: bool) -> Result<()> {
+    let name_filter = format!("name={}*", POD_NAME_PREFIX);
+    let mut args = vec!["pod", "ps", "--filter", &name_filter];
+
+    let label_filter;
+    if let Some(instance_id) = get_instance_id() {
+        label_filter = format!("label={INSTANCE_LABEL_KEY}={instance_id}");
+        args.extend(["--filter", &label_filter]);
+    }
+    args.push("--format=json");
+
+    let output = podman_command()
+        .args(&args)
+        .output()
+        .context("Failed to run podman pod ps")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("podman pod ps failed: {}", stderr.trim());
+    }
+
+    let pods: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| Vec::new());
+
+    // Filter to only devcontainer pods
+    let mut devcontainer_pods = Vec::new();
+    for pod in &pods {
+        let full_name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+        let labels = get_pod_labels(full_name);
+        if !pod_labels_match_instance(labels.as_ref()) {
+            continue;
+        }
+        let mode = labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .and_then(|v| v.as_str());
+        if mode != Some("devcontainer") {
+            continue;
+        }
+        devcontainer_pods.push((pod, labels));
+    }
+
+    if json_output {
+        let enriched: Vec<serde_json::Value> = devcontainer_pods
+            .iter()
+            .map(|(pod, labels)| {
+                let mut enriched = (*pod).clone();
+                if let Some(labels) = labels {
+                    enriched["Labels"] = labels.clone();
+                }
+                enriched
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&enriched)?);
+        return Ok(());
+    }
+
+    if devcontainer_pods.is_empty() {
+        println!("No devcontainer pods found.");
+        println!("Use 'devaipod devcontainer run <path>' to create one.");
+        return Ok(());
+    }
+
+    // Calculate column widths
+    let name_width = devcontainer_pods
+        .iter()
+        .filter_map(|(pod, _)| pod.get("Name").and_then(|v| v.as_str()))
+        .map(|n| strip_pod_prefix(n).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let repo_width = devcontainer_pods
+        .iter()
+        .filter_map(|(_, labels)| {
+            labels
+                .as_ref()
+                .and_then(|l| l.get("io.devaipod.repo"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let has_repo = devcontainer_pods.iter().any(|(_, labels)| {
+        labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.repo"))
+            .is_some()
+    });
+
+    if has_repo {
+        println!(
+            "{:<name_width$}  {:<10}  {:<repo_width$}  CREATED",
+            "NAME",
+            "STATUS",
+            "REPO",
+            name_width = name_width,
+            repo_width = repo_width
+        );
+    } else {
+        println!(
+            "{:<name_width$}  {:<10}  CREATED",
+            "NAME",
+            "STATUS",
+            name_width = name_width
+        );
+    }
+
+    for (pod, labels) in &devcontainer_pods {
+        let full_name = pod.get("Name").and_then(|v| v.as_str()).unwrap_or("-");
+        let name = strip_pod_prefix(full_name);
+        let status = pod.get("Status").and_then(|v| v.as_str()).unwrap_or("-");
+        let created = pod.get("Created").and_then(|v| v.as_str()).unwrap_or("-");
+        let created_display = format_created_time(created);
+
+        let base_status = match status.to_lowercase().as_str() {
+            "running" => "Running",
+            "stopped" => "Stopped",
+            "exited" => "Exited",
+            "degraded" => "Degraded",
+            _ => status,
+        };
+
+        if has_repo {
+            let repo = labels
+                .as_ref()
+                .and_then(|l| l.get("io.devaipod.repo"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            println!(
+                "{:<name_width$}  {:<10}  {:<repo_width$}  {}",
+                name,
+                base_status,
+                repo,
+                created_display,
+                name_width = name_width,
+                repo_width = repo_width
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:<10}  {}",
+                name,
+                base_status,
+                created_display,
+                name_width = name_width
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn run_container(cli: ContainerCli) -> Result<()> {
@@ -1781,6 +2911,63 @@ fn merge_cli_mcp_into_config(
 
 /// Create a workspace from a source (local path, remote URL, or PR)
 ///
+/// Canonicalize a list of `--source-dir` paths, warning and skipping any that
+/// don't resolve (e.g. non-existent directories).
+fn canonicalize_source_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        .filter_map(|d| match d.canonicalize() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("Skipping --source-dir {}: {}", d.display(), e);
+                None
+            }
+        })
+        .collect()
+}
+
+/// Write the workspace state file for a host-dir workspace.
+///
+/// Best-effort: logs a warning on failure rather than propagating errors,
+/// since the pod is already created and running at this point.
+fn write_workspace_state(
+    pod_name: &str,
+    source: String,
+    source_dirs: &[PathBuf],
+    task: Option<&str>,
+    title: Option<&str>,
+) {
+    let ws_dir = match agent_dir::agent_dir_container_path(pod_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Cannot resolve workspace dir for state file: {e:#}");
+            return;
+        }
+    };
+    if !ws_dir.exists() {
+        // Not a host-dir workspace (remote/PR with volumes) — skip.
+        return;
+    }
+
+    let state = agent_dir::WorkspaceState {
+        pod_name: pod_name.to_string(),
+        source,
+        source_dirs: source_dirs.to_vec(),
+        created: chrono::Utc::now().to_rfc3339(),
+        last_active: None,
+        task: task.map(|s| s.to_string()),
+        title: title.map(|s| s.to_string()),
+        completion_status: None,
+        last_harvested: std::collections::HashMap::new(),
+    };
+
+    if let Err(e) = state.save(&ws_dir) {
+        tracing::warn!("Failed to write workspace state for {pod_name}: {e:#}");
+    }
+
+    // Record in recent sources for the launcher
+    agent_dir::record_recent_source(&state.source);
+}
+
 /// This is the inner "create" operation that handles all the common pod setup
 /// logic without any SSH or other post-setup behavior. Both `cmd_up` and `cmd_run`
 /// use this function internally.
@@ -1789,12 +2976,9 @@ fn merge_cli_mcp_into_config(
 /// the pod but doesn't perform any interactive operations afterward.
 async fn create_workspace(
     config: &config::Config,
-    source: &str,
+    source: Option<&str>,
     opts: &CreateOptions,
 ) -> Result<CreateResult> {
-    let source = normalize_source(source, &config.git.extra_hosts);
-    let source = source.as_ref();
-
     // Merge CLI --mcp servers into config if any were provided.
     // We need to create a modified config since Config doesn't derive Clone.
     // Instead, we merge into a local McpServersConfig and swap it in via
@@ -1808,15 +2992,87 @@ async fn create_workspace(
     };
 
     // Dispatch based on source type
-    let result = if let Some(pr_ref) = forge::parse_pr_url(source) {
-        create_workspace_from_pr(config, pr_ref, opts).await?
-    } else if source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("git@")
-    {
-        create_workspace_from_remote(config, source, opts).await?
-    } else {
+    let result = if let Some(source) = source {
+        let source = normalize_source(source, &config.git.extra_hosts);
+        let source = source.as_ref();
+
+        // Try to resolve remote URLs to local source directories.
+        // Users are expected to maintain pristine local clones; devaipod
+        // works with those instead of cloning remotely.
+        let source: std::borrow::Cow<'_, str> = if source.starts_with("https://")
+            || source.starts_with("http://")
+            || source.starts_with("git@")
+        {
+            if let Some(local_path) = resolve_url_to_local_source(source, config) {
+                tracing::info!(
+                    "Resolved {} to local source: {}",
+                    source,
+                    local_path.display()
+                );
+                std::borrow::Cow::Owned(local_path.to_string_lossy().to_string())
+            } else {
+                let suffix = extract_repo_suffix(source).unwrap_or_else(|| source.to_string());
+                // Trim to host/org/repo for display
+                let display_suffix: String = {
+                    let parts: Vec<&str> = suffix.splitn(4, '/').collect();
+                    if parts.len() >= 3 {
+                        format!("{}/{}/{}", parts[0], parts[1], parts[2])
+                    } else {
+                        suffix.clone()
+                    }
+                };
+                let sources_list: Vec<String> = config
+                    .resolve_sources()
+                    .iter()
+                    .map(|s| format!("  {} = {}", s.name, s.path.display()))
+                    .collect();
+                let sources_display = if sources_list.is_empty() {
+                    "  (none configured)".to_string()
+                } else {
+                    sources_list.join("\n")
+                };
+                // Suggest a TLD-less clone path
+                let clone_suggestion = {
+                    let parts: Vec<&str> = display_suffix.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        let host = parts[0];
+                        let short_host = host.split('.').next().unwrap_or(host);
+                        format!("{}/{}", short_host, parts[1])
+                    } else {
+                        display_suffix.clone()
+                    }
+                };
+                bail!(
+                    "Repository '{}' not found in your source directories.\n\
+                         Clone it first:\n\
+                         \n  git clone {} ~/src/{}\n\
+                         \n\
+                         Configured sources:\n{}",
+                    display_suffix,
+                    source,
+                    clone_suggestion,
+                    sources_display,
+                );
+            }
+        } else {
+            std::borrow::Cow::Borrowed(source)
+        };
+        let source: &str = &source;
+
+        if forge::parse_pr_url(source).is_some()
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+            || source.starts_with("git@")
+        {
+            bail!(
+                "Internal error: URL '{}' should have been resolved to a local path",
+                source
+            );
+        }
+
         create_workspace_from_local(config, source, opts).await?
+    } else {
+        create_workspace_without_source(config, opts).await?
     };
 
     // Auto-create SSH config entry if enabled (default: true)
@@ -1969,6 +3225,29 @@ async fn clone_dotfiles_for_devcontainer(
     }
 }
 
+/// Merge CLI `--port` flags into a devcontainer config's `forward_ports`.
+///
+/// Each port spec is either a plain port number (e.g. "3000") or a
+/// "hostPort:containerPort" mapping (e.g. "8080:3000"), matching the
+/// devcontainer.json `forwardPorts` syntax.
+fn merge_cli_ports_into_config(
+    devcontainer_config: &mut devcontainer::DevcontainerConfig,
+    ports: &[String],
+) {
+    for port_spec in ports {
+        if let Ok(port_num) = port_spec.parse::<u16>() {
+            devcontainer_config
+                .forward_ports
+                .push(serde_json::json!(port_num));
+        } else {
+            // "host:container" string format
+            devcontainer_config
+                .forward_ports
+                .push(serde_json::json!(port_spec));
+        }
+    }
+}
+
 /// Create a workspace from a local git repository
 async fn create_workspace_from_local(
     config: &config::Config,
@@ -2038,13 +3317,16 @@ async fn create_workspace_from_local(
         git_info.fork_url = Some(fork_info.clone_url);
     }
 
-    let (devcontainer_config, effective_image) = resolve_devcontainer_config(
+    let (mut devcontainer_config, effective_image) = resolve_devcontainer_config(
         config,
         project_path,
         opts,
         &project_path.display().to_string(),
     )
     .await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     // Derive project/pod name from path
     let project_name = project_path
@@ -2151,6 +3433,12 @@ async fn create_workspace_from_local(
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         project_path,
@@ -2167,18 +3455,132 @@ async fn create_workspace_from_local(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
+        &source_dirs,
+        backend.as_ref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
 
     finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
 
+    // Write workspace state file for host-dir workspaces
+    write_workspace_state(
+        &pod_name,
+        project_path.display().to_string(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
+
     drop(podman);
 
     Ok(CreateResult { pod_name })
 }
 
+/// Create a scratch workspace without a git repo source.
+///
+/// The devcontainer image is resolved from fallback sources (dotfiles repo
+/// devcontainer.json, --image flag, or default-image in config). The workspace
+/// gets an empty directory instead of a git clone.
+async fn create_workspace_without_source(
+    config: &config::Config,
+    opts: &CreateOptions,
+) -> Result<CreateResult> {
+    tracing::info!("Creating scratch workspace (no source repo)...");
+
+    // Resolve devcontainer config without a project path — this will use
+    // fallback sources (dotfiles repo, --image, or default-image config)
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let (mut devcontainer_config, effective_image) =
+        resolve_devcontainer_config(config, temp_dir.path(), opts, "scratch workspace").await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
+
+    let pod_name = if let Some(ref name) = opts.name {
+        normalize_pod_name(name)
+    } else {
+        make_pod_name("scratch")
+    };
+
+    check_api_keys_configured();
+
+    // Use base service-gator config (no repo-specific scopes)
+    let service_gator_config = if !opts.service_gator_scopes.is_empty() {
+        let cli_scopes = service_gator::parse_scopes(&opts.service_gator_scopes)
+            .context("Failed to parse --service-gator scopes")?;
+        service_gator::merge_configs(&config.service_gator, &cli_scopes)
+    } else {
+        config.service_gator.clone()
+    };
+
+    let enable_gator = service_gator_config.is_enabled();
+
+    let podman = podman::PodmanService::spawn()
+        .await
+        .context("Failed to start podman service")?;
+
+    let source = pod::WorkspaceSource::Scratch;
+
+    let mut extra_labels = Vec::new();
+    extra_labels.push((
+        "io.devaipod.mode".to_string(),
+        opts.mode.as_str().to_string(),
+    ));
+    if let Some(ref task_desc) = opts.task {
+        extra_labels.push(("io.devaipod.task".to_string(), task_desc.clone()));
+    }
+    if let Some(ref title) = opts.title {
+        extra_labels.push(("io.devaipod.title".to_string(), title.clone()));
+    }
+    if let Some(instance_id) = get_instance_id() {
+        extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
+    }
+
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
+    let devaipod_pod = pod::DevaipodPod::create(
+        &podman,
+        temp_dir.path(),
+        &devcontainer_config,
+        &pod_name,
+        enable_gator,
+        config,
+        &source,
+        &extra_labels,
+        Some(&service_gator_config),
+        effective_image.as_deref(),
+        opts.service_gator_image.as_deref(),
+        opts.task.as_deref(),
+        config.orchestration.is_enabled(),
+        config.orchestration.worker.gator.clone(),
+        opts.auto_approve,
+        &source_dirs,
+        backend.as_ref(),
+    )
+    .await
+    .context("Failed to create scratch workspace pod")?;
+
+    finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    write_workspace_state(
+        &pod_name,
+        "scratch".to_string(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
+
+    drop(podman);
+    Ok(CreateResult { pod_name })
+}
+
 /// Create a workspace from a remote git URL
+#[allow(dead_code)] // Retained for possible future use; URLs now resolve to local paths
 async fn create_workspace_from_remote(
     config: &config::Config,
     remote_url: &str,
@@ -2233,8 +3635,11 @@ async fn create_workspace_from_remote(
         "main".to_string() // Fallback
     };
 
-    let (devcontainer_config, effective_image) =
+    let (mut devcontainer_config, effective_image) =
         resolve_devcontainer_config(config, temp_path, opts, remote_url).await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     // Use explicit name if provided, otherwise generate a unique name
     let pod_name = if let Some(ref name) = opts.name {
@@ -2340,6 +3745,12 @@ async fn create_workspace_from_remote(
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -2358,11 +3769,23 @@ async fn create_workspace_from_remote(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
+        &source_dirs,
+        backend.as_ref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
 
     finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    // Write workspace state file (best-effort; remote workspaces may not
+    // have a host-dir yet, in which case this is a no-op).
+    write_workspace_state(
+        &pod_name,
+        remote_url.to_string(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
 
     drop(podman);
 
@@ -2370,6 +3793,7 @@ async fn create_workspace_from_remote(
 }
 
 /// Create a workspace from a PR/MR URL
+#[allow(dead_code)] // Retained for possible future use; URLs now resolve to local paths
 async fn create_workspace_from_pr(
     config: &config::Config,
     pr_ref: forge::PullRequestRef,
@@ -2421,8 +3845,11 @@ async fn create_workspace_from_pr(
     }
 
     let pr_description = format!("{}#{}", pr_ref.repo, pr_ref.number);
-    let (devcontainer_config, effective_image) =
+    let (mut devcontainer_config, effective_image) =
         resolve_devcontainer_config(config, temp_path, opts, &pr_description).await?;
+
+    // Merge CLI --port flags into devcontainer config
+    merge_cli_ports_into_config(&mut devcontainer_config, &opts.ports);
 
     // Use explicit name if provided, otherwise generate a unique name
     let pod_name = if let Some(ref name) = opts.name {
@@ -2507,6 +3934,12 @@ async fn create_workspace_from_pr(
         extra_labels.push((INSTANCE_LABEL_KEY.to_string(), instance_id));
     }
 
+    let source_dirs = canonicalize_source_dirs(&opts.source_dirs);
+
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     // Create the pod
     tracing::debug!("Creating pod '{}'...", pod_name);
     let devaipod_pod = pod::DevaipodPod::create(
@@ -2525,11 +3958,22 @@ async fn create_workspace_from_pr(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         opts.auto_approve,
+        &source_dirs,
+        backend.as_ref(),
     )
     .await
     .context("Failed to create devaipod pod")?;
 
     finalize_pod(&podman, &devaipod_pod, &devcontainer_config, config).await?;
+
+    // Write workspace state file for PR workspaces (best-effort).
+    write_workspace_state(
+        &pod_name,
+        pr_ref.pr_url(),
+        &source_dirs,
+        opts.task.as_deref(),
+        opts.title.as_deref(),
+    );
 
     drop(podman);
 
@@ -2544,13 +3988,13 @@ async fn create_workspace_from_pr(
 ///
 /// This is a thin wrapper around `create_workspace` that handles:
 /// - Dry-run mode (prints what would be created)
-/// - Optional SSH into the workspace after creation
+/// - Optional exec into the agent container after creation
 ///
 /// Uses podman-native multi-container setup with a pod containing:
-/// - workspace: The user's development environment
-/// - agent: Container running opencode serve with restricted security
+/// - agent: Container running opencode serve
+/// - api: Pod-api sidecar for git/PTY endpoints
 /// - gator (optional): Service-gator MCP server container
-async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Result<()> {
+async fn cmd_up(config: &config::Config, source: Option<&str>, opts: UpOptions) -> Result<()> {
     // Handle dry-run mode
     if opts.dry_run {
         return cmd_dry_run(config, source, &opts).await;
@@ -2560,12 +4004,11 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
     let create_opts = CreateOptions::from_up_options(&opts);
     let result = create_workspace(config, source, &create_opts).await?;
 
-    // Optionally exec into the workspace container - go directly to bash
-    // (the monitor is for observing a running agent, but `up -S` is for interactive work)
+    // Optionally exec into the agent container - go directly to bash
     if opts.exec_after {
         return cmd_exec(
             &result.pod_name,
-            AttachTarget::Workspace,
+            AttachTarget::Agent,
             false,
             &["bash".to_string()],
         )
@@ -2588,7 +4031,7 @@ async fn cmd_up(config: &config::Config, source: &str, opts: UpOptions) -> Resul
 #[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     config: &config::Config,
-    source: &str,
+    source: Option<&str>,
     command: Option<&str>,
     image: Option<&str>,
     explicit_name: Option<&str>,
@@ -2600,6 +4043,8 @@ async fn cmd_run(
     use_default_devcontainer: bool,
     auto_approve: bool,
     title: Option<&str>,
+    source_dirs: &[PathBuf],
+    ports: &[String],
 ) -> Result<String> {
     // Build CreateOptions with mode=Run
     let create_opts = CreateOptions {
@@ -2615,14 +4060,24 @@ async fn cmd_run(
         devcontainer_json: devcontainer_json.map(|s| s.to_string()),
         use_default_devcontainer,
         auto_approve,
+        source_dirs: source_dirs.to_vec(),
+        ports: ports.to_vec(),
     };
 
     // Create the workspace - no SSH by default (async execution)
     let result = create_workspace(config, source, &create_opts).await?;
 
-    // If a task was provided, send the initial message to start the agent working
-    if let Some(task) = command {
-        start_agent_task(&result.pod_name, task, config.orchestration.is_enabled())?;
+    // The initial task message is now sent by the pod-api sidecar, which reads
+    // the task file written during workspace creation and sends it to opencode
+    // once the server is reachable. This makes startup self-contained — the CLI
+    // doesn't need to poll the agent for health.
+    if command.is_some() {
+        let short = strip_pod_prefix(&result.pod_name);
+        println!(
+            "Workspace created. Agent will start working shortly.\n\
+             Attach with: devaipod attach {}",
+            short
+        );
     }
 
     Ok(result.pod_name)
@@ -2704,28 +4159,37 @@ Please start working on this task now. Make commits with clear messages as you w
         orchestration_section = orchestration_section
     );
 
-    // Create session and send message (reusing the existing API logic)
-    match send_initial_message(pod_name, &initial_message) {
-        Ok(_) => {
-            tracing::info!(
-                "Agent started. Attach with: devaipod attach {}",
-                strip_pod_prefix(pod_name)
-            );
-            Ok(())
-        }
-        Err(e) => {
-            // Log the error but don't fail - the task is still configured
-            tracing::warn!(
-                "Failed to send initial message: {}. Agent may need manual start.",
-                e
-            );
-            tracing::info!(
-                "To start manually: devaipod opencode {} send 'Start working on your task'",
-                strip_pod_prefix(pod_name)
-            );
-            Ok(())
+    // Create session and send message, retrying a few times since the
+    // opencode API may not be fully ready even after the health check passes.
+    let short = strip_pod_prefix(pod_name);
+    let mut last_err = None;
+    for attempt in 1..=5 {
+        match send_initial_message(pod_name, &initial_message) {
+            Ok(_) => {
+                println!(
+                    "Agent started on task. Attach with: devaipod attach {}",
+                    short
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!("send_initial_message attempt {}/5 failed: {}", attempt, e);
+                last_err = Some(e);
+                if attempt < 5 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
         }
     }
+    // All retries failed — report loudly
+    let e = last_err.unwrap();
+    eprintln!(
+        "Warning: failed to send initial message to agent: {:#}\n\
+         The workspace was created but the agent may be idle.\n\
+         To start manually: devaipod opencode {} send 'Start working on your task'",
+        e, short
+    );
+    Ok(())
 }
 
 /// Send an initial message to the agent to start working
@@ -2759,7 +4223,7 @@ fn send_initial_message(pod_name: &str, message: &str) -> Result<()> {
 /// Spawns a curl process in the background and returns immediately.
 /// Used for starting agent tasks where we don't need to wait for the response.
 fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result<()> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
     let url = format!(
         "http://localhost:{}/session/{}/message",
         pod::OPENCODE_PORT,
@@ -2773,7 +4237,7 @@ fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result
         .args([
             "exec",
             "-d", // detached mode - run in background
-            &workspace_container,
+            &agent_container,
             "curl",
             "-sf",
             "-X",
@@ -2795,7 +4259,30 @@ fn send_message_async(pod_name: &str, session_id: &str, payload: &str) -> Result
 /// Handle dry-run mode for the up command
 ///
 /// Prints what would be created without actually creating anything.
-async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) -> Result<()> {
+async fn cmd_dry_run(
+    config: &config::Config,
+    source: Option<&str>,
+    opts: &UpOptions,
+) -> Result<()> {
+    let source = match source {
+        Some(s) => s,
+        None => {
+            let pod_name = if let Some(ref name) = opts.name {
+                normalize_pod_name(name)
+            } else {
+                make_pod_name("scratch")
+            };
+            tracing::info!("Dry run mode - would create scratch pod '{}'", pod_name);
+            tracing::info!("  source: (none — scratch workspace)");
+            if let Some(ref img) = opts.image {
+                tracing::info!("  image: {}", img);
+            }
+            if let Some(ref task) = opts.task {
+                tracing::info!("  Task: {}", task);
+            }
+            return Ok(());
+        }
+    };
     // Dispatch based on source type for dry-run info
     if let Some(pr_ref) = forge::parse_pr_url(source) {
         // PR dry-run
@@ -2897,6 +4384,1298 @@ async fn cmd_dry_run(config: &config::Config, source: &str, opts: &UpOptions) ->
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Fetch / Diff Commands
+// =============================================================================
+
+/// Find ALL git repos inside an agent's host-side workspace directory.
+///
+/// Resolves the pod's workspace directory and delegates to the shared
+/// [`agent_dir::find_git_repos_in_dir`]. Returns an error if the directory
+/// doesn't exist or contains no git repos.
+fn find_all_agent_git_repos(pod_name: &str) -> Result<Vec<(String, PathBuf)>> {
+    let base = agent_dir::agent_workdir_base()?;
+    let pod_dir = base.join(pod_name);
+
+    if !pod_dir.exists() {
+        let pod_exists = podman_command()
+            .args(["pod", "exists", pod_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if pod_exists {
+            bail!(
+                "Workspace '{}' has no host directory (possibly a legacy volume-based workspace). \
+                 Try recreating it with `devaipod delete` then `devaipod up`.",
+                strip_pod_prefix(pod_name)
+            );
+        } else {
+            bail!(
+                "Workspace '{}' not found. Run `devaipod list` to see available workspaces.",
+                strip_pod_prefix(pod_name)
+            );
+        }
+    }
+
+    let repos = agent_dir::find_git_repos_in_dir(&pod_dir);
+
+    if repos.is_empty() {
+        bail!(
+            "No git repository found in agent workspace at {}. \
+             The agent may not have cloned the repo yet.",
+            pod_dir.display()
+        );
+    }
+
+    Ok(repos)
+}
+
+/// Check whether the given path is a git repository.
+fn is_git_repo(path: &Path) -> bool {
+    ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-dir"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Resolve the local git repo that corresponds to a workspace.
+///
+/// Tries in order:
+/// 1. CWD, if it is a git repo whose source matches the workspace
+/// 2. Auto-detected from source mounts (e.g. `/mnt/src/github/org/repo`)
+/// 3. Error with a helpful message
+fn resolve_target_repo(pod_name: &str) -> Result<PathBuf> {
+    let base = agent_dir::agent_workdir_base()?;
+    let pod_dir = base.join(pod_name);
+    let state = agent_dir::WorkspaceState::load(&pod_dir)?;
+
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+
+    // If CWD is a git repo that matches the workspace source, use it.
+    if is_git_repo(&cwd) {
+        if let Some(ref state) = state {
+            if source_matches_repo(&state.source, &state.source_dirs, &cwd) {
+                return Ok(cwd);
+            }
+        } else {
+            // No workspace state — can't validate, use CWD as before.
+            return Ok(cwd);
+        }
+    }
+
+    // CWD doesn't match. Try to find the repo from source mounts.
+    let state = state.as_ref();
+    let source = state.map(|s| s.source.as_str()).unwrap_or("");
+    if let Some(suffix) = extract_repo_suffix(source) {
+        // The suffix is like "github.com/org/repo". Build candidate paths:
+        // 1. As-is: /mnt/src/github.com/org/repo
+        // 2. Strip TLD from host: /mnt/src/github/org/repo (common convention)
+        let mut suffixes = vec![suffix.clone()];
+        if let Some(pos) = suffix.find('/') {
+            let host_part = &suffix[..pos];
+            if let Some(stripped) = host_part.split('.').next() {
+                let alt = format!("{}{}", stripped, &suffix[pos..]);
+                if alt != suffix {
+                    suffixes.push(alt);
+                }
+            }
+        }
+
+        let config = config::load_config(None)?;
+        for resolved in config.resolve_sources() {
+            // Inside the container, sources are mounted at /mnt/<name>
+            let mount_point = PathBuf::from(format!("/mnt/{}", resolved.name));
+            for s in &suffixes {
+                let candidate = mount_point.join(s);
+                if candidate.exists() && is_git_repo(&candidate) {
+                    tracing::info!(
+                        "Auto-resolved repo for workspace '{}' at {}",
+                        strip_pod_prefix(pod_name),
+                        candidate.display()
+                    );
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    // Nothing worked — produce a helpful error.
+    if is_git_repo(&cwd) {
+        bail!(
+            "Current directory ({}) does not match workspace '{}' (source: {}). \
+             Run this from the repo that the workspace was created for.",
+            cwd.display(),
+            strip_pod_prefix(pod_name),
+            source,
+        );
+    } else {
+        bail!(
+            "Not inside a git repo, and could not auto-detect the local repo \
+             for workspace '{}' (source: {}). \
+             Run this from the repo that the workspace was created for.",
+            strip_pod_prefix(pod_name),
+            source,
+        );
+    }
+}
+
+/// Fetch agent commits into the matching local git repo.
+///
+/// Discovers all git repos in the agent's workspace and fetches each one.
+/// For single-repo workspaces the remote is named `devaipod/<workspace>`;
+/// for multi-repo workspaces each remote is `devaipod/<workspace>/<repo>`.
+///
+/// The target local repo is resolved from the workspace state — if CWD
+/// matches the workspace source it is used directly; otherwise the correct
+/// repo is auto-detected from configured source mounts.
+///
+/// When the agent container is running, uses `ext::` git transport to tunnel
+/// git-upload-pack through `podman exec`. This avoids the broken-alternates
+/// problem with workspace-v2 repos whose git alternates point to
+/// container-internal paths that don't exist on the host.
+///
+/// Falls back to direct filesystem access when the container is not running
+/// (works for self-contained repos without alternates).
+///
+/// Returns the path to the local repo where branches were fetched.
+fn cmd_fetch(pod_name: &str) -> Result<PathBuf> {
+    let target_repo = resolve_target_repo(pod_name)?;
+
+    let repos = find_all_agent_git_repos(pod_name)?;
+    let short_name = strip_pod_prefix(pod_name);
+
+    // Check if the agent container is running for ext:: transport
+    let agent_container = get_attach_container_name(pod_name, AttachTarget::Agent);
+    let container_running = agent_dir::is_container_running(&agent_container);
+
+    if container_running {
+        tracing::debug!(
+            "Agent container '{}' is running, using ext:: transport",
+            agent_container
+        );
+    } else {
+        tracing::debug!(
+            "Agent container '{}' is not running, using direct filesystem access",
+            agent_container
+        );
+    }
+
+    for (repo_name, _agent_repo) in &repos {
+        let remote_name = if repos.len() == 1 {
+            format!("devaipod/{}", short_name)
+        } else {
+            format!("devaipod/{}/{}", short_name, repo_name)
+        };
+
+        // Record pre-fetch HEAD so we can detect changes
+        let pre_fetch_ref = resolve_remote_default_ref_in(&remote_name, &target_repo)
+            .ok()
+            .flatten();
+        let pre_fetch_sha = pre_fetch_ref.as_ref().and_then(|r| {
+            ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&target_repo)
+                .args(["rev-parse", r])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        });
+
+        let workspace_path = format!("/workspaces/{}", repo_name);
+        let _result = if container_running {
+            // Use ext:: transport through podman exec into the running agent
+            tracing::info!(
+                "Fetching from agent container: {}:{}",
+                agent_container,
+                workspace_path
+            );
+            agent_dir::harvest_one_repo_via_exec(
+                &target_repo,
+                &agent_container,
+                &workspace_path,
+                &remote_name,
+            )?
+        } else {
+            // Agent is stopped — spawn a transient container that mounts the
+            // workspace volume + host-side workspace dir so alternates resolve.
+            let image = pod::detect_self_image();
+            tracing::info!(
+                "Agent not running; fetching via transient container for {}",
+                pod_name
+            );
+            agent_dir::harvest_one_repo_via_transient(
+                &target_repo,
+                pod_name,
+                &workspace_path,
+                &remote_name,
+                &image,
+            )?
+        };
+
+        // Detect what changed and show a useful summary
+        let post_fetch_ref = resolve_remote_default_ref_in(&remote_name, &target_repo)
+            .ok()
+            .flatten();
+
+        let Some(ref full_ref) = post_fetch_ref else {
+            println!("No branches found for remote '{}'.", remote_name);
+            continue;
+        };
+
+        let post_fetch_sha = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&target_repo)
+            .args(["rev-parse", full_ref])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+        let is_new = pre_fetch_sha.is_none();
+        let changed = is_new || pre_fetch_sha.as_ref() != post_fetch_sha.as_ref();
+
+        println!();
+        if !changed {
+            println!("Already up to date ({}).", short_name);
+        } else {
+            // Count new commits
+            let new_commits = if is_new {
+                // First fetch — count all commits on the agent branch
+                ProcessCommand::new("git")
+                    .arg("-C")
+                    .arg(&target_repo)
+                    .args(["rev-list", "--count", full_ref])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                    })
+            } else {
+                // Subsequent fetch — count commits between old and new HEAD
+                let range = format!(
+                    "{}..{}",
+                    pre_fetch_sha.as_deref().unwrap_or(""),
+                    post_fetch_sha.as_deref().unwrap_or("")
+                );
+                ProcessCommand::new("git")
+                    .arg("-C")
+                    .arg(&target_repo)
+                    .args(["rev-list", "--count", &range])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                    })
+            };
+
+            if let Some(n) = new_commits {
+                if is_new {
+                    println!("Fetched {} commit(s) from {}.", n, short_name);
+                } else {
+                    println!("Fetched {} new commit(s) from {}.", n, short_name);
+                }
+            } else {
+                println!("Fetched new commits from {}.", short_name);
+            }
+
+            // Show diffstat (agent changes vs merge-base with current branch)
+            let merge_base = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&target_repo)
+                .args(["merge-base", "HEAD", full_ref])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+            if let Some(base) = merge_base {
+                let stat = ProcessCommand::new("git")
+                    .arg("-C")
+                    .arg(&target_repo)
+                    .args(["diff", "--stat", &format!("{}..{}", base, full_ref)])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+                if let Some(ref s) = stat {
+                    if !s.is_empty() {
+                        println!();
+                        println!("{}", s);
+                    }
+                }
+            }
+        }
+
+        // Always show the commands for further inspection
+        println!();
+        println!("  git log {}", full_ref);
+        println!("  git diff HEAD...{}", full_ref);
+        if repos.len() == 1 {
+            println!("  devaipod diff {}", short_name);
+        }
+    }
+
+    Ok(target_repo)
+}
+
+/// Resolve the default branch for a remote, returning the fully-qualified
+/// `refs/remotes/...` path to avoid ambiguity.
+///
+/// Tries in order: the remote's symbolic HEAD, then `main`, then `master`,
+/// then falls back to the first available branch. Returns `None` if the remote
+/// has no branches.
+///
+/// Returns a fully-qualified ref like `refs/remotes/devaipod/ws/main` that
+/// git will resolve unambiguously even when the remote name contains slashes.
+/// Resolve the default branch for a remote in the given repo, returning the
+/// fully-qualified `refs/remotes/...` path to avoid ambiguity.
+fn resolve_remote_default_ref_in(remote_name: &str, repo: &Path) -> Result<Option<String>> {
+    // Try the remote's symbolic HEAD (set by `git clone` or `git remote set-head`)
+    let head_ref = format!("refs/remotes/{}/HEAD", remote_name);
+    let head_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["symbolic-ref", &head_ref])
+        .output()
+        .ok();
+    if let Some(output) = head_output.filter(|o| o.status.success()) {
+        let target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !target.is_empty() {
+            return Ok(Some(target));
+        }
+    }
+
+    // Try well-known branch names
+    for branch in ["main", "master"] {
+        let ref_name = format!("refs/remotes/{}/{}", remote_name, branch);
+        let verify = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", &ref_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if verify.is_ok_and(|s| s.success()) {
+            return Ok(Some(ref_name));
+        }
+    }
+
+    // Fall back to the first available branch (skip HEAD symref)
+    let branch_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/{}/", remote_name),
+        ])
+        .output()
+        .context("Failed to list remote refs")?;
+
+    if branch_output.status.success() {
+        let refs = String::from_utf8_lossy(&branch_output.stdout);
+        if let Some(first) = refs
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+        {
+            return Ok(Some(first.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Show diff of agent changes relative to current branch
+fn cmd_diff(pod_name: &str, stat: bool) -> Result<()> {
+    // Fetch first — resolve_target_repo validates CWD / auto-detects the repo
+    let target_repo = cmd_fetch(pod_name)?;
+
+    let short_name = strip_pod_prefix(pod_name);
+    let remote_name = format!("devaipod/{}", short_name);
+
+    // Find the remote's default branch using fully-qualified refs to avoid
+    // ambiguity (remote names with slashes can confuse git's ref resolution).
+    let remote_ref = resolve_remote_default_ref_in(&remote_name, &target_repo)?;
+    let Some(remote_ref) = remote_ref else {
+        println!("No changes from agent yet.");
+        return Ok(());
+    };
+
+    // Check if there are any commits beyond the merge base
+    let merge_base = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&target_repo)
+        .args(["merge-base", "HEAD", &remote_ref])
+        .output()
+        .context("Failed to find merge base")?;
+
+    if merge_base.status.success() {
+        let base_sha = String::from_utf8_lossy(&merge_base.stdout)
+            .trim()
+            .to_string();
+        let remote_sha_output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&target_repo)
+            .args(["rev-parse", &remote_ref])
+            .output()
+            .context("Failed to get remote HEAD")?;
+
+        if remote_sha_output.status.success() {
+            let remote_sha = String::from_utf8_lossy(&remote_sha_output.stdout)
+                .trim()
+                .to_string();
+            if base_sha == remote_sha {
+                println!("No changes from agent yet.");
+                return Ok(());
+            }
+        }
+    }
+
+    // Run the diff
+    let mut diff_args = vec![
+        "-C".to_string(),
+        target_repo.to_string_lossy().to_string(),
+        "diff".to_string(),
+    ];
+    if stat {
+        diff_args.push("--stat".to_string());
+    }
+    diff_args.push(format!("HEAD...{}", remote_ref));
+
+    let status = ProcessCommand::new("git")
+        .args(&diff_args)
+        .status()
+        .context("Failed to run git diff")?;
+
+    if !status.success() {
+        bail!("git diff failed");
+    }
+
+    Ok(())
+}
+
+/// Apply agent changes to the current branch.
+///
+/// Fetches the latest commits (like `cmd_fetch`), then merges or cherry-picks
+/// the agent's branch into the current branch.
+fn cmd_apply(pod_name: &str, cherry_pick: bool) -> Result<()> {
+    // Fetch first to ensure we have the latest
+    let target_repo = cmd_fetch(pod_name)?;
+
+    let short_name = strip_pod_prefix(pod_name);
+    let remote_name = format!("devaipod/{}", short_name);
+
+    let ref_name = resolve_remote_default_ref_in(&remote_name, &target_repo)?.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No branches found for remote '{}'. The agent may not have made any commits.",
+            remote_name
+        )
+    })?;
+
+    // Count how many commits the agent is ahead
+    let ahead_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&target_repo)
+        .args(["rev-list", "--count", &format!("HEAD..{}", ref_name)])
+        .output()
+        .context("Failed to count commits")?;
+
+    let count: usize = String::from_utf8_lossy(&ahead_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+
+    if count == 0 {
+        println!("Already up to date with {}.", ref_name);
+        return Ok(());
+    }
+
+    println!("Applying {} commit(s) from {}...", count, ref_name);
+
+    if cherry_pick {
+        let list_output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&target_repo)
+            .args(["rev-list", "--reverse", &format!("HEAD..{}", ref_name)])
+            .output()
+            .context("Failed to list commits")?;
+
+        let sha_strings: Vec<String> = String::from_utf8_lossy(&list_output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for sha in &sha_strings {
+            let result = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&target_repo)
+                .args(["cherry-pick", sha])
+                .status()
+                .context("Failed to run git cherry-pick")?;
+
+            if !result.success() {
+                eprintln!();
+                eprintln!(
+                    "Cherry-pick of {} failed. Resolve conflicts, then run:",
+                    sha
+                );
+                eprintln!("  git cherry-pick --continue");
+                return Ok(());
+            }
+        }
+        println!("Applied {} commit(s) via cherry-pick.", sha_strings.len());
+    } else {
+        let result = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&target_repo)
+            .args([
+                "merge",
+                "--no-ff",
+                &ref_name,
+                "-m",
+                &format!("Merge agent work from {}", short_name),
+            ])
+            .status()
+            .context("Failed to run git merge")?;
+
+        if !result.success() {
+            eprintln!();
+            eprintln!("Merge conflicts detected. Resolve them, then run:");
+            eprintln!("  git merge --continue");
+            return Ok(());
+        }
+        println!("Merged {} commit(s) from {}.", count, ref_name);
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Repo-level commands: status, push, pr
+// =============================================================================
+
+/// Show a comprehensive overview of agent work for the current repo.
+///
+/// Displays workspace status, harvested branches, push status, and PRs.
+fn cmd_repo_status() -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    if !is_git_repo(&cwd) {
+        bail!("Not a git repo. Run this from your source repository.");
+    }
+
+    let repo_name = detect_repo_name().unwrap_or_else(|_| "(unknown)".to_string());
+    let repo_root = repo_root_path()?;
+    let current_branch = current_branch_name().unwrap_or_else(|_| "(detached)".to_string());
+
+    println!("Repo: {} ({})", repo_name, repo_root.display());
+    println!("Branch: {}", current_branch);
+    println!();
+
+    // 1. Find agent workspaces for this repo
+    let workspaces = find_workspaces_for_repo(&repo_root);
+    if !workspaces.is_empty() {
+        println!("Agent workspaces:");
+        for ws in &workspaces {
+            // Derive a display status: use completion_status if set,
+            // otherwise check if the pod is actually running.
+            let display_status = ws.completion_status.clone().unwrap_or_else(|| {
+                let pod_status = podman_command()
+                    .args(["pod", "inspect", "--format", "{{.State}}", &ws.pod_name])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                match pod_status.as_deref() {
+                    Some("Running") => "running".to_string(),
+                    Some("Exited") | Some("Stopped") => "exited".to_string(),
+                    Some("Created") => "created".to_string(),
+                    _ => "pending".to_string(),
+                }
+            });
+            let status_icon = match display_status.as_str() {
+                "done" => "\u{25c9}",    // ◉
+                "active" => "\u{25cf}",  // ●
+                "running" => "\u{25cf}", // ●
+                _ => "\u{25cb}",         // ○
+            };
+            let commit_info = if ws.commit_count > 0 {
+                format!("{} commits", ws.commit_count)
+            } else {
+                "\u{2014}".to_string() // —
+            };
+            let task = ws
+                .task_summary
+                .as_deref()
+                .map(|t| format!("  \"{}\"", t))
+                .unwrap_or_default();
+            println!(
+                "  {} {:<30} {:<8} {:<12} {}{}",
+                status_icon, ws.short_name, display_status, commit_info, ws.age_display, task,
+            );
+        }
+        println!();
+    }
+
+    // 2. Show harvested branches (devaipod/* remotes)
+    let branches = find_devaipod_branches();
+    if !branches.is_empty() {
+        // Try to get PR info via gh CLI (best effort, single call for all branches)
+        let prs = list_prs_for_repo();
+
+        println!("Harvested branches:");
+        for branch in &branches {
+            println!("  {}", branch.ref_name);
+            if branch.ahead > 0 {
+                println!(
+                    "    {} commit{} ahead of {}",
+                    branch.ahead,
+                    if branch.ahead == 1 { "" } else { "s" },
+                    branch.base_branch,
+                );
+            }
+            match &branch.push_status {
+                RepoPushStatus::NotPushed => println!("    Not pushed"),
+                RepoPushStatus::Pushed(remote_ref) => {
+                    println!("    Pushed to {}", remote_ref)
+                }
+            }
+            if let Some(pr) = match_pr(&branch.ref_name, &prs) {
+                println!(
+                    "    PR #{}: \"{}\" ({})",
+                    pr.number,
+                    pr.title,
+                    pr.state_display()
+                );
+            }
+            println!();
+        }
+    } else if workspaces.is_empty() {
+        println!("No agent workspaces or harvested branches found for this repo.");
+        println!("Run `devaipod up . \"your task\"` to launch an agent.");
+    }
+
+    Ok(())
+}
+
+/// Push agent branch to origin.
+fn cmd_push(pod_name: &str) -> Result<()> {
+    // Ensure we have the latest
+    let target_repo = cmd_fetch(pod_name)?;
+
+    let short_name = strip_pod_prefix(pod_name);
+    let remote_name = format!("devaipod/{}", short_name);
+
+    let full_ref = resolve_remote_default_ref_in(&remote_name, &target_repo)?.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No branches found for remote '{}'. The agent may not have made any commits.",
+            remote_name
+        )
+    })?;
+
+    // Extract the branch name from the full ref for the push target.
+    // e.g., "refs/remotes/devaipod/ws/devaipod/fix-auth" → "devaipod/fix-auth"
+    let push_branch = full_ref
+        .strip_prefix(&format!("refs/remotes/{}/", remote_name))
+        .unwrap_or(&full_ref);
+
+    println!("Pushing {} to origin/{}...", full_ref, push_branch);
+
+    let result = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&target_repo)
+        .args([
+            "push",
+            "origin",
+            &format!("{}:refs/heads/{}", full_ref, push_branch),
+        ])
+        .status()
+        .context("Failed to run git push")?;
+
+    if !result.success() {
+        bail!("Push failed. Check your permissions and try again.");
+    }
+
+    println!("Pushed to origin/{}", push_branch);
+    Ok(())
+}
+
+/// Create a pull request from agent work.
+///
+/// Pushes the branch first, then runs `gh pr create`.
+fn cmd_pr(pod_name: &str, draft: bool, title: Option<&str>) -> Result<()> {
+    // Push first (handles repo resolution + fetch)
+    cmd_push(pod_name)?;
+
+    // Re-resolve the target repo for git log / gh pr commands
+    let target_repo = resolve_target_repo(pod_name)?;
+    let short_name = strip_pod_prefix(pod_name);
+    let remote_name = format!("devaipod/{}", short_name);
+
+    let full_ref = resolve_remote_default_ref_in(&remote_name, &target_repo)?.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "No branches found for remote '{}'. The agent may not have made any commits.",
+            remote_name
+        )
+    })?;
+
+    let push_branch = full_ref
+        .strip_prefix(&format!("refs/remotes/{}/", remote_name))
+        .unwrap_or(&full_ref);
+
+    // Auto-generate title from commit log if not provided
+    let pr_title = if let Some(t) = title {
+        t.to_string()
+    } else {
+        let log_output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&target_repo)
+            .args(["log", "--format=%s", "-1", &full_ref])
+            .output()
+            .context("Failed to get commit message for PR title")?;
+        String::from_utf8_lossy(&log_output.stdout)
+            .trim()
+            .to_string()
+    };
+
+    let mut gh_args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--head".to_string(),
+        push_branch.to_string(),
+        "--title".to_string(),
+        pr_title,
+    ];
+
+    if draft {
+        gh_args.push("--draft".to_string());
+    }
+
+    // Fill the body with the commit log
+    let body_output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&target_repo)
+        .args(["log", "--format=- %s", &format!("HEAD..{}", full_ref)])
+        .output()
+        .ok();
+
+    let body = body_output
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if !body.is_empty() {
+        gh_args.push("--body".to_string());
+        gh_args.push(body);
+    }
+
+    println!("Creating pull request...");
+
+    let result = ProcessCommand::new("gh")
+        .args(&gh_args)
+        .status()
+        .context("Failed to run `gh pr create`. Is the GitHub CLI installed and authenticated?")?;
+
+    if !result.success() {
+        bail!("gh pr create failed. Check the output above for details.");
+    }
+
+    Ok(())
+}
+
+// ── Repo-status helpers ──────────────────────────────────────────────
+
+/// Extract org/repo from the origin remote URL.
+fn detect_repo_name() -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .context("Failed to get origin URL")?;
+    if !output.status.success() {
+        bail!("No 'origin' remote configured");
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Handle https://github.com/org/repo.git and git@github.com:org/repo.git
+    let path = url.strip_suffix(".git").unwrap_or(&url);
+    // Try to find a hosting provider hostname
+    for sep in ["github.com", "gitlab.com", "codeberg.org", "bitbucket.org"] {
+        if let Some(idx) = path.find(sep) {
+            let after = &path[idx + sep.len()..];
+            let clean = after.trim_start_matches('/').trim_start_matches(':');
+            return Ok(clean.to_string());
+        }
+    }
+    Ok(url)
+}
+
+/// Get the current branch name.
+fn current_branch_name() -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .context("Failed to get current branch")?;
+    if !output.status.success() {
+        bail!("HEAD is detached");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Get the repo root path.
+pub(crate) fn repo_root_path() -> Result<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("Failed to get repo root")?;
+    if !output.status.success() {
+        bail!("Not inside a git working tree");
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+/// Summary of a workspace relevant to the current repo.
+struct RepoWorkspaceInfo {
+    /// Full pod name (e.g. `devaipod-myproject-abc123`).
+    pod_name: String,
+    short_name: String,
+    completion_status: Option<String>,
+    commit_count: usize,
+    age_display: String,
+    /// Truncated task description for display in choosers.
+    task_summary: Option<String>,
+}
+
+/// Try to resolve a remote git URL to a local source directory path.
+///
+/// Searches configured `[sources]` for a directory matching the URL's
+/// forge suffix (e.g. `github.com/org/repo` → `~/src/github/org/repo`).
+/// Tries both the full suffix (`github.com/org/repo`) and a TLD-less
+/// variant (`github/org/repo`).
+fn resolve_url_to_local_source(url: &str, config: &config::Config) -> Option<PathBuf> {
+    let suffix = extract_repo_suffix(url)?;
+    // Trim to host/org/repo (drop extra path like /pull/123 or /issues/42)
+    let parts: Vec<&str> = suffix.splitn(4, '/').collect();
+    let suffix = if parts.len() >= 3 {
+        format!("{}/{}/{}", parts[0], parts[1], parts[2])
+    } else {
+        return None; // Need at least host/org/repo
+    };
+
+    // Build candidate suffixes: canonical (github.com/org/repo) and
+    // TLD-less (github/org/repo)
+    let mut suffixes = vec![suffix.clone()];
+    if let Some(pos) = suffix.find('/') {
+        let host_part = &suffix[..pos];
+        if let Some(stripped) = host_part.split('.').next() {
+            let alt = format!("{}{}", stripped, &suffix[pos..]);
+            if alt != suffix {
+                suffixes.push(alt);
+            }
+        }
+    }
+
+    for resolved in config.resolve_sources() {
+        // Check both the host-expanded path and the container mount point
+        // (/mnt/<name>). When running inside the container, the host path
+        // won't exist on disk but the mount point will.
+        let candidates_bases = [
+            resolved.path.clone(),
+            PathBuf::from(format!("/mnt/{}", resolved.name)),
+        ];
+        for base in &candidates_bases {
+            for s in &suffixes {
+                let candidate = base.join(s);
+                if candidate.join(".git").exists() || candidate.join(".git").is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract a forge-style repo suffix from a path or URL.
+///
+/// Given a path like `/var/home/ai/src/github/org/repo` or a URL like
+/// `https://github.com/org/repo`, extracts the trailing `github.com/org/repo`
+/// (or equivalent for other forges). Returns `None` if no forge host is found.
+pub(crate) fn extract_repo_suffix(s: &str) -> Option<String> {
+    // Strip common URL parts first
+    let s = s.strip_suffix(".git").unwrap_or(s).trim_end_matches('/');
+    let hosts = [
+        "github.com",
+        "gitlab.com",
+        "codeberg.org",
+        "bitbucket.org",
+        "sr.ht",
+        "gitea.com",
+    ];
+    for host in &hosts {
+        // Match the host appearing as a path component (preceded by `/` or start)
+        // or as a URL authority (preceded by `://` or `@`).
+        if let Some(idx) = s.find(host) {
+            // Grab "host/org/repo" from the match position onward
+            let suffix = &s[idx..];
+            return Some(suffix.to_string());
+        }
+    }
+    // Also match TLD-less host names as path components (e.g. `/github/org/repo`
+    // from container bind-mount paths like `/mnt/src/github/org/repo`).
+    // Normalize to the canonical `host.tld/org/repo` form.
+    let tld_less = [
+        ("github", "github.com"),
+        ("gitlab", "gitlab.com"),
+        ("codeberg", "codeberg.org"),
+        ("bitbucket", "bitbucket.org"),
+        ("gitea", "gitea.com"),
+    ];
+    for (short, canonical) in &tld_less {
+        // Must appear as a path component: preceded by `/` and followed by `/`
+        let pattern = format!("/{short}/");
+        if let Some(idx) = s.find(&pattern) {
+            let rest = &s[idx + 1 + short.len()..]; // skip "/<short>"
+            return Some(format!("{canonical}{rest}"));
+        }
+    }
+    None
+}
+
+/// Check whether a workspace's source matches the given repo root.
+///
+/// Handles the container-vs-host path mismatch (e.g. `/mnt/src/github/org/repo`
+/// vs `/var/home/ai/src/github/org/repo`) and URL sources by comparing the
+/// forge-qualified repo suffix when direct path comparison fails.
+fn source_matches_repo(source: &str, source_dirs: &[PathBuf], repo_root: &Path) -> bool {
+    let repo_str = repo_root.to_string_lossy();
+
+    // Direct path match
+    if source == repo_str || source_dirs.iter().any(|d| d.to_string_lossy() == repo_str) {
+        return true;
+    }
+
+    // Fall back to forge-suffix comparison
+    let repo_suffix = extract_repo_suffix(&repo_str);
+    if let Some(ref rs) = repo_suffix {
+        if let Some(ref ss) = extract_repo_suffix(source)
+            && rs == ss
+        {
+            return true;
+        }
+
+        // Also check source_dirs suffixes
+        for d in source_dirs {
+            let ds = d.to_string_lossy();
+            if let Some(ref ds_suffix) = extract_repo_suffix(&ds)
+                && rs == ds_suffix
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Scan the workspaces directory for workspaces whose source matches this repo.
+fn find_workspaces_for_repo(repo_root: &Path) -> Vec<RepoWorkspaceInfo> {
+    let workspaces = match agent_dir::list_workspaces() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::debug!("Failed to list workspaces: {e:#}");
+            return Vec::new();
+        }
+    };
+
+    let mut results = Vec::new();
+    for (_dir_name, ws_dir, state) in &workspaces {
+        let Some(state) = state else { continue };
+
+        if !source_matches_repo(&state.source, &state.source_dirs, repo_root) {
+            continue;
+        }
+
+        let short_name = strip_pod_prefix(&state.pod_name).to_string();
+
+        // Count commits in agent workspace
+        let repos = agent_dir::find_git_repos_in_dir(ws_dir);
+        let commit_count: usize = repos
+            .iter()
+            .filter_map(|(_, rp)| {
+                let output = ProcessCommand::new("git")
+                    .arg("-C")
+                    .arg(rp)
+                    .args(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"])
+                    .output()
+                    .ok()?;
+                if output.status.success() {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                } else {
+                    None
+                }
+            })
+            .sum();
+
+        // Format age from created timestamp
+        let age_display = format_relative_time(&state.created);
+
+        // Truncate task to ~60 chars for display
+        let task_summary = state.task.as_ref().map(|t| {
+            let trimmed = t.trim();
+            if trimmed.len() > 60 {
+                format!("{}...", &trimmed[..57])
+            } else {
+                trimmed.to_string()
+            }
+        });
+
+        results.push(RepoWorkspaceInfo {
+            pod_name: state.pod_name.clone(),
+            short_name,
+            completion_status: state.completion_status.clone(),
+            commit_count,
+            age_display,
+            task_summary,
+        });
+    }
+    results
+}
+
+/// Format an RFC 3339 timestamp as a human-readable relative time.
+fn format_relative_time(rfc3339: &str) -> String {
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.to_string();
+    };
+    let now = chrono::Utc::now();
+    let elapsed = now.signed_duration_since(ts);
+
+    if elapsed.num_seconds() < 60 {
+        "just now".to_string()
+    } else if elapsed.num_minutes() < 60 {
+        let m = elapsed.num_minutes();
+        format!("{m} min ago")
+    } else if elapsed.num_hours() < 24 {
+        let h = elapsed.num_hours();
+        format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
+    } else {
+        let d = elapsed.num_days();
+        if d == 1 {
+            "yesterday".to_string()
+        } else {
+            format!("{d} days ago")
+        }
+    }
+}
+
+/// Information about a harvested devaipod branch.
+struct RepoBranchInfo {
+    ref_name: String,
+    ahead: usize,
+    base_branch: String,
+    push_status: RepoPushStatus,
+}
+
+enum RepoPushStatus {
+    NotPushed,
+    Pushed(String),
+}
+
+/// PR metadata from `gh pr list`.
+#[derive(Debug, Clone)]
+struct RepoPrInfo {
+    number: u64,
+    title: String,
+    state: String,
+    draft: bool,
+    head_ref_name: String,
+}
+
+impl RepoPrInfo {
+    fn state_display(&self) -> String {
+        if self.draft {
+            "draft".to_string()
+        } else {
+            self.state.to_lowercase()
+        }
+    }
+}
+
+/// List all `devaipod/*` remote-tracking branches in the current repo.
+fn find_devaipod_branches() -> Vec<RepoBranchInfo> {
+    let output = match ProcessCommand::new("git")
+        .args(["branch", "-r", "--list", "devaipod/*"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let branches_str = String::from_utf8_lossy(&output.stdout);
+    let branch_refs: Vec<String> = branches_str
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.contains("->"))
+        .collect();
+
+    if branch_refs.is_empty() {
+        return Vec::new();
+    }
+
+    let base_branch = detect_default_branch();
+
+    branch_refs
+        .into_iter()
+        .map(|ref_name| {
+            let range = format!("{}..{}", base_branch, ref_name);
+            let ahead: usize = ProcessCommand::new("git")
+                .args(["rev-list", "--count", &range])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+                .unwrap_or(0);
+
+            let push_status = check_push_status(&ref_name);
+
+            RepoBranchInfo {
+                ref_name,
+                ahead,
+                base_branch: base_branch.clone(),
+                push_status,
+            }
+        })
+        .collect()
+}
+
+/// Detect whether the repo uses `main` or `master` as default branch.
+fn detect_default_branch() -> String {
+    for branch in ["main", "master"] {
+        let result = ProcessCommand::new("git")
+            .args(["rev-parse", "--verify", branch])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if result.is_ok_and(|s| s.success()) {
+            return branch.to_string();
+        }
+    }
+    "HEAD".to_string()
+}
+
+/// Check if a devaipod remote-tracking branch has a corresponding `origin/` ref.
+fn check_push_status(devaipod_ref: &str) -> RepoPushStatus {
+    // devaipod_ref looks like "devaipod/<workspace>/<branch>"
+    // We check if origin has a matching ref.
+    let parts: Vec<&str> = devaipod_ref.splitn(3, '/').collect();
+    if parts.len() >= 3 {
+        // Try origin/<workspace>/<branch>
+        let full_branch = format!("{}/{}", parts[1], parts[2]);
+        let origin_ref = format!("origin/{}", full_branch);
+        let result = ProcessCommand::new("git")
+            .args(["rev-parse", "--verify", &origin_ref])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if result.is_ok_and(|s| s.success()) {
+            return RepoPushStatus::Pushed(origin_ref);
+        }
+        // Try just origin/<branch> (the branch part only)
+        let simple_ref = format!("origin/{}", parts[2]);
+        let result = ProcessCommand::new("git")
+            .args(["rev-parse", "--verify", &simple_ref])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if result.is_ok_and(|s| s.success()) {
+            return RepoPushStatus::Pushed(simple_ref);
+        }
+    }
+    RepoPushStatus::NotPushed
+}
+
+/// List open PRs for the current repo via `gh pr list` (best effort).
+fn list_prs_for_repo() -> Vec<RepoPrInfo> {
+    let output = ProcessCommand::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--json",
+            "number,title,state,headRefName,isDraft",
+            "--limit",
+            "50",
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+
+    #[derive(serde::Deserialize)]
+    struct GhPr {
+        number: u64,
+        title: String,
+        state: String,
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+    }
+
+    match serde_json::from_str::<Vec<GhPr>>(&json_str) {
+        Ok(prs) => prs
+            .into_iter()
+            .map(|p| RepoPrInfo {
+                number: p.number,
+                title: p.title,
+                state: p.state,
+                draft: p.is_draft,
+                head_ref_name: p.head_ref_name,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Match a devaipod remote ref to a PR by branch name.
+fn match_pr<'a>(ref_name: &str, prs: &'a [RepoPrInfo]) -> Option<&'a RepoPrInfo> {
+    let parts: Vec<&str> = ref_name.splitn(3, '/').collect();
+    if parts.len() >= 3 {
+        let branch_suffix = parts[2]; // e.g., "devaipod/fix-auth" or "main"
+        for pr in prs {
+            if pr.head_ref_name == branch_suffix
+                || pr.head_ref_name.ends_with(branch_suffix)
+                || branch_suffix.ends_with(&pr.head_ref_name)
+            {
+                return Some(pr);
+            }
+        }
+    }
+    None
 }
 
 /// Get or set the session title for a pod
@@ -3144,8 +5923,8 @@ async fn cmd_prune() -> Result<()> {
 async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Result<()> {
     if list {
         // One-shot mode: list pods and exit
-        // Reuse the existing list logic
-        return cmd_list(json);
+        // Reuse the existing list logic (show all, since controlplane is global)
+        return cmd_list(json, true, true);
     }
 
     if serve {
@@ -3185,7 +5964,7 @@ async fn cmd_controlplane(serve: bool, _port: u16, list: bool, json: bool) -> Re
 
     // For now, fall back to list as a useful default
     tracing::info!("Falling back to pod list:");
-    cmd_list(json)
+    cmd_list(json, true, true)
 }
 
 /// Manage service-gator scopes for a workspace
@@ -3208,15 +5987,49 @@ async fn cmd_gator(action: GatorAction) -> Result<()> {
         .await
         .with_context(|| format!("Pod not found: {}", pod_name))?;
 
-    // Read gator config from the workspace volume
+    // Read gator config from the workspace volume.
+    // The config may be at /workspaces/.devaipod/gator-config.json (older pods)
+    // or /workspaces/<project>/.devaipod/gator-config.json (workspace-v2).
+    // Search for it under /workspaces so we handle both layouts.
     let agent_container = format!("{}-agent", pod_name);
-    let config_path = format!("/workspaces/{}", service_gator::GATOR_CONFIG_PATH);
-
-    let config_content = podman
-        .copy_from_container(&agent_container, &config_path)
-        .await
-        .ok()
-        .flatten();
+    let config_path = {
+        let find_result = podman
+            .exec_output(
+                &agent_container,
+                &[
+                    "find",
+                    "/workspaces",
+                    "-maxdepth",
+                    "3",
+                    "-name",
+                    "gator-config.json",
+                    "-path",
+                    "*/.devaipod/*",
+                    "-print",
+                    "-quit",
+                ],
+            )
+            .await;
+        if let Ok((0, stdout, _)) = find_result {
+            let path = String::from_utf8_lossy(&stdout).trim().to_string();
+            if !path.is_empty() {
+                path
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    };
+    let config_content = if !config_path.is_empty() {
+        podman
+            .copy_from_container(&agent_container, &config_path)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
 
     // Try to parse from volume file first, fall back to pod labels for backwards compat
     let gator_config: Option<service_gator::GatorConfigFile> = if let Some(content) = config_content
@@ -3418,10 +6231,11 @@ async fn cmd_advisor(
     show_status: bool,
     show_proposals: bool,
     name_override: Option<&str>,
+    source_dirs: &[PathBuf],
 ) -> Result<()> {
     let advisor_pod = match name_override {
         Some(n) => normalize_pod_name(n),
-        None => "devaipod-advisor".to_string(),
+        None => advisor_pod_name(),
     };
 
     let existing = check_advisor_pod_state(&advisor_pod);
@@ -3464,7 +6278,7 @@ async fn cmd_advisor(
         }
         AdvisorPodState::NotFound => {
             eprintln!("No advisor pod found. Creating one...");
-            create_advisor_pod(config, task).await?;
+            create_advisor_pod(config, task, source_dirs).await?;
             if no_attach {
                 return Ok(());
             }
@@ -3473,85 +6287,103 @@ async fn cmd_advisor(
     }
 }
 
-/// Default fallback image for the advisor pod (used only when auto-detection fails)
-const ADVISOR_IMAGE_FALLBACK: &str = "ghcr.io/cgwalters/devaipod:latest";
-
-/// Get the container image to use for the advisor pod.
+/// Default system prompt for the advisor agent.
 ///
-/// When running inside the devaipod container, queries podman for the
-/// image of the running `devaipod` container so the advisor uses the
-/// exact same image as the control plane. This avoids pulling a remote
-/// image when a locally-built one is available. Falls back to the
-/// published image if detection fails.
-fn advisor_image() -> String {
-    if is_inside_devaipod_container() {
-        if let Some(image) = detect_own_container_image() {
-            tracing::debug!("Detected own container image: {}", image);
-            return image;
-        }
-        tracing::warn!(
-            "Could not detect own container image, falling back to {}",
-            ADVISOR_IMAGE_FALLBACK
-        );
+/// This prompt instructs the advisor to use its MCP tools to survey the
+/// current state and proactively suggest agent pods to launch.
+const ADVISOR_SYSTEM_PROMPT: &str = "\
+You are the devaipod advisor agent. Your job is to observe the user's development \
+environment and suggest useful agent pods to launch. You have two sets of tools:
+
+- **devaipod MCP tools** for pod/workspace introspection: `list_pods`, `list_workspaces`, \
+  `workspace_diff`, `pod_status`, `pod_logs`, `propose_agent`, `list_proposals`
+- **service-gator MCP tools** for GitHub access: use these to search for PRs where \
+  you are requested as a reviewer, list notifications, browse issues, etc.
+
+Start by surveying the current state:
+
+1. Use service-gator to find open PRs where the user is requested as a reviewer. \
+   For each non-draft PR, consider proposing an agent pod to review it.
+2. Use `list_workspaces` to see what agent pods are already running or completed, \
+   what repos they're working on, and their completion status.
+3. Use service-gator to check GitHub notifications for new issues, mentions, or \
+   CI failures that might warrant an agent.
+4. Use `list_pods` to check pod health. Look for stuck or unhealthy pods.
+
+Based on what you find, use `propose_agent` to create draft proposals for new \
+agent pods. Each proposal should have:
+- A clear title describing the work
+- The target repo (e.g. 'owner/repo')
+- A detailed task description the agent can act on
+- Your rationale for why this is worth doing
+- A priority level (high/medium/low)
+- The source that triggered it (e.g. 'github:owner/repo#123')
+
+Focus on actionable items: PRs waiting for review, issues with clear reproduction \
+steps, dependency updates, CI failures. Skip anything that's already being worked \
+on by an existing agent pod.
+
+If source directories are mounted at /mnt/source/, browse them to understand \
+project structure and cross-repo dependencies. This helps you write better task \
+descriptions.
+
+After your initial survey, summarize what you found and what you proposed.";
+
+/// Detect the host-mapped port for the control plane's web server.
+///
+/// The web server inside the container always listens on 8080, but when the
+/// advisor connects from another container via `host.containers.internal`, it
+/// needs the host-mapped port (e.g. 8081 for a `test-devaipod` instance).
+///
+/// Checks `DEVAIPOD_HOST_PORT` env var first, then falls back to inspecting
+/// our own container's port mappings via `podman port`.
+fn detect_own_host_port() -> u16 {
+    if let Ok(port) = std::env::var("DEVAIPOD_HOST_PORT")
+        && let Ok(p) = port.parse::<u16>()
+    {
+        return p;
     }
-    ADVISOR_IMAGE_FALLBACK.to_string()
-}
-
-/// Detect the image of the running devaipod control plane container.
-///
-/// The control plane container is named `devaipod` (by convention from
-/// `just container-run`). We inspect it via the podman CLI to find
-/// the image name. Returns `None` if detection fails.
-fn detect_own_container_image() -> Option<String> {
-    let output = std::process::Command::new("podman")
-        .args(["inspect", "devaipod", "--format", "{{.ImageName}}"])
+    let container_name =
+        std::env::var(DEVAIPOD_INSTANCE_ENV).unwrap_or_else(|_| "devaipod".to_string());
+    if let Ok(output) = std::process::Command::new("podman")
+        .args(["port", &container_name, "8080/tcp"])
         .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
+        && output.status.success()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        // Output format: "0.0.0.0:8081" or ":::8081"
+        if let Some(port_str) = s.trim().rsplit(':').next()
+            && let Ok(p) = port_str.parse::<u16>()
+        {
+            return p;
+        }
     }
-
-    let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if image.is_empty() {
-        return None;
-    }
-    Some(image)
+    8080
 }
 
-/// Create the advisor pod using cmd_run with advisor-specific settings.
+/// Return the advisor pod name.
 ///
-/// The advisor doesn't work on a specific repo — it's a meta-agent that
-/// observes other pods and suggests actions. We use the dotfiles repo as
-/// the workspace source (same default as `devaipod up` with no args),
-/// and override the image to use our own container which has opencode
-/// installed.
-async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Result<()> {
-    let image = advisor_image();
-    let default_task = task.unwrap_or("You are the devaipod advisor agent. Wait for instructions.");
+/// Always `devaipod-advisor` — instance isolation is handled by the
+/// `io.devaipod.instance` label, not the pod name. All pods share the
+/// `devaipod-` prefix regardless of instance.
+pub(crate) fn advisor_pod_name() -> String {
+    "devaipod-advisor".to_string()
+}
 
-    // The MCP server runs as a route on the devaipod web server.
-    // The advisor agent reaches it via host.containers.internal:8080
-    // (or 127.0.0.1:8080 on the host).
+/// Apply advisor-specific config mutations: insert the devaipod MCP server
+/// entry (with authentication) and force-enable service-gator for GitHub access.
+///
+/// Returns a fresh config loaded from disk with the mutations applied.
+/// We reload rather than cloning because `Config` doesn't derive `Clone`.
+fn apply_advisor_config() -> Result<config::Config> {
+    let host_port = detect_own_host_port();
     let mcp_url = format!(
-        "http://{}:8080/api/devaipod/mcp",
-        crate::podman::host_for_pod_services()
+        "http://{}:{}/api/devaipod/mcp",
+        crate::podman::host_for_pod_services(),
+        host_port
     );
-
-    // Load the MCP token so the advisor can authenticate to the MCP endpoint.
-    // This is a separate shared secret scoped to MCP, not the web API token.
     let mcp_token = crate::web::load_or_generate_mcp_token();
 
-    // Use the dotfiles repo as the advisor's workspace source — same
-    // fallback that `devaipod up` / `devaipod run` use when no source
-    // is given. This satisfies the requirement that every pod has a git
-    // repo to clone, and gives the advisor a familiar dev environment.
-    let source = resolve_source(None, config)?;
-
-    // Build a modified config that includes the MCP server entry with the
-    // Authorization header. We reload the config and insert the entry
-    // directly so it flows through the normal config -> pod.rs pipeline
-    // (which now supports headers on McpServerEntry).
     let mut advisor_config = config::load_config(None)?;
     let mut headers = std::collections::HashMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", mcp_token));
@@ -3564,20 +6396,51 @@ async fn create_advisor_pod(config: &config::Config, task: Option<&str>) -> Resu
         },
     );
 
+    if !advisor_config.service_gator.is_enabled() {
+        advisor_config.service_gator.gh.read = true;
+    }
+
+    Ok(advisor_config)
+}
+
+/// Create the advisor pod using cmd_run with advisor-specific settings.
+///
+/// The advisor doesn't work on a specific repo — it's a meta-agent that
+/// observes other pods and suggests actions. It uses the dotfiles repo as
+/// the workspace source if configured, otherwise creates a scratch workspace.
+/// The image is overridden to use our own container which has opencode
+/// installed.
+async fn create_advisor_pod(
+    config: &config::Config,
+    task: Option<&str>,
+    source_dirs: &[PathBuf],
+) -> Result<()> {
+    let default_task = task.unwrap_or(ADVISOR_SYSTEM_PROMPT);
+
+    // The advisor is a scratch-like workspace — it doesn't need a specific
+    // git repo. Use the dotfiles repo if configured, otherwise None (scratch).
+    let source = resolve_source(None, config);
+
+    // Build a modified config that includes the MCP server entry and
+    // service-gator access for the advisor.
+    let advisor_config = apply_advisor_config()?;
+
     let pod_name = cmd_run(
         &advisor_config,
         source,
         Some(default_task),
-        Some(&image),
+        None,            // Use user's default devcontainer image, not the devaipod image
         Some("advisor"), // Becomes devaipod-advisor via normalize_pod_name
         &[],             // service-gator scopes from config
         None,
-        true,  // read-only service-gator
+        true,                                   // read-only service-gator
         &[],   // no CLI mcp_servers — entry is already in the config
         None,  // no devcontainer override
         false, // don't override project devcontainer
         true,  // auto_approve
         None,  // no title for advisor
+        &canonicalize_source_dirs(source_dirs), // read-only source dirs
+        &[],   // no port forwarding for advisor
     )
     .await?;
 
@@ -4200,9 +7063,8 @@ fn cmd_ssh_config(pod_name: &str, user: Option<&str>) -> Result<()> {
 
 /// Write SSH config with explicit username (used by CLI command)
 ///
-/// Creates SSH config entries for all containers in the pod:
-/// - `<pod>.devaipod` - workspace container (default for development)
-/// - `<pod>-agent.devaipod` - agent/orchestrator container
+/// Creates SSH config entries for the pod's containers:
+/// - `<pod>.devaipod` - agent container (default target)
 /// - `<pod>-worker.devaipod` - worker container
 fn write_ssh_config_with_user(pod_name: &str, username: &str) -> Result<std::path::PathBuf> {
     use cap_std_ext::cap_primitives::fs::PermissionsExt;
@@ -4215,30 +7077,21 @@ fn write_ssh_config_with_user(pod_name: &str, username: &str) -> Result<std::pat
         // Container mode: use podman exec to run devaipod inside the container.
         // Note: This has a known limitation with SSH protocol over nested podman exec.
         // For full SSH support, install devaipod on the host or use `podman exec -it` directly.
-        "podman exec -i devaipod devaipod".to_string()
+        "podman exec -i devaipod devaipod-server".to_string()
     } else {
         // Non-container mode: use the local binary path
         std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "devaipod".to_string())
+            .unwrap_or_else(|_| "devaipod-server".to_string())
     };
 
-    // Create SSH config content for all containers
-    // - workspace: -W flag (primary for development)
-    // - agent: no flag (default target)
+    // Create SSH config content:
+    // - default: agent container (no flag)
     // - worker: --worker flag
     let config_content = format!(
         r#"# Generated by devaipod
-# Workspace container (development environment)
+# Agent container (default target)
 Host {pod}.devaipod
-    ProxyCommand {devaipod} exec -W --stdio {pod}
-    User {user}
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-    LogLevel ERROR
-
-# Agent/orchestrator container
-Host {pod}-agent.devaipod
     ProxyCommand {devaipod} exec --stdio {pod}
     User {user}
     StrictHostKeyChecking no
@@ -4307,8 +7160,12 @@ fn pod_labels_match_instance(labels: Option<&serde_json::Value>) -> bool {
     }
 }
 
-/// List devaipod pods using podman pod ps
-fn cmd_list(json_output: bool) -> Result<()> {
+/// List devaipod pods using podman pod ps.
+///
+/// When `show_all` is false and CWD is inside a git repo, only pods whose
+/// `io.devaipod.repo` label matches the current repo are displayed.
+/// Inactive (stopped/exited) pods are hidden unless `show_inactive` is true.
+fn cmd_list(json_output: bool, show_all: bool, show_inactive: bool) -> Result<()> {
     let name_filter = format!("name={}*", POD_NAME_PREFIX);
     let mut args = vec!["pod", "ps", "--filter", &name_filter];
 
@@ -4341,6 +7198,21 @@ fn cmd_list(json_output: bool) -> Result<()> {
     let pods: Vec<serde_json::Value> =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|_| Vec::new());
 
+    // Compute repo filter suffix once (used by both JSON and tabular paths).
+    let repo_filter_suffix: Option<String> = if !show_all {
+        let cwd = std::env::current_dir().ok();
+        let in_git = cwd.as_deref().is_some_and(is_git_repo);
+        if in_git {
+            repo_root_path()
+                .ok()
+                .and_then(|root| extract_repo_suffix(&root.to_string_lossy()))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if json_output {
         // For JSON output, enrich with labels from pod inspect and filter by instance
         let mut enriched_pods = Vec::new();
@@ -4350,6 +7222,26 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 let labels = get_pod_labels(name);
                 if !pod_labels_match_instance(labels.as_ref()) {
                     continue;
+                }
+                // Skip devcontainer pods (they have their own list command)
+                if labels
+                    .as_ref()
+                    .and_then(|l| l.get("io.devaipod.mode"))
+                    .and_then(|v| v.as_str())
+                    == Some("devcontainer")
+                {
+                    continue;
+                }
+                // Apply repo filter
+                if let Some(ref filter) = repo_filter_suffix {
+                    let repo_label = labels
+                        .as_ref()
+                        .and_then(|l| l.get("io.devaipod.repo"))
+                        .and_then(|v| v.as_str())
+                        .and_then(extract_repo_suffix);
+                    if repo_label.as_ref() != Some(filter) {
+                        continue;
+                    }
                 }
                 if let Some(labels) = labels {
                     enriched["Labels"] = labels;
@@ -4377,7 +7269,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
         pr: Option<String>,
         task: Option<String>,
         mode: Option<String>,
-        #[allow(dead_code)] // Used in JSON output enrichment
+        #[allow(dead_code)] // Populated from labels but not yet shown in tabular output
         title: Option<String>,
         agent_status: Option<bool>,
     }
@@ -4403,9 +7295,17 @@ fn cmd_list(json_output: bool) -> Result<()> {
             .to_string();
 
         // Get labels from pod inspect (use full name for podman commands)
-        // and filter by instance
+        // and filter by instance + skip devcontainer pods (they have their own list command)
         let labels = get_pod_labels(full_name);
         if !pod_labels_match_instance(labels.as_ref()) {
+            continue;
+        }
+        if labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .and_then(|v| v.as_str())
+            == Some("devcontainer")
+        {
             continue;
         }
         let (repo, pr, task, mode, title) = if let Some(labels) = labels {
@@ -4453,6 +7353,223 @@ fn cmd_list(json_output: bool) -> Result<()> {
             title,
             agent_status,
         });
+    }
+
+    // Filter by current repo when not showing all
+    let repo_filter_name = if let Some(ref s) = repo_filter_suffix {
+        let before = pod_infos.len();
+        pod_infos.retain(|p| p.repo.as_deref().and_then(extract_repo_suffix).as_ref() == Some(s));
+        let filtered = before - pod_infos.len();
+        tracing::debug!("Filtered {filtered} pods not matching repo suffix {s}");
+        // Use detect_repo_name for the header, falling back to the directory name
+        let name = detect_repo_name().unwrap_or_else(|_| {
+            repo_root_path()
+                .ok()
+                .and_then(|r| r.file_name().map(|f| f.to_string_lossy().into_owned()))
+                .unwrap_or_default()
+        });
+        Some(name)
+    } else {
+        None
+    };
+
+    // Hide inactive (stopped/exited) pods unless --inactive is passed
+    let hidden_inactive = if !show_inactive {
+        let before = pod_infos.len();
+        pod_infos.retain(|p| {
+            let s = p.status.to_lowercase();
+            s != "stopped" && s != "exited"
+        });
+        before - pod_infos.len()
+    } else {
+        0
+    };
+
+    // Print repo filter header
+    if let Some(ref name) = repo_filter_name {
+        println!("Workspaces for {}:", name);
+        println!();
+    }
+
+    if pod_infos.is_empty() {
+        if repo_filter_name.is_some() {
+            if hidden_inactive > 0 {
+                println!(
+                    "No active workspaces for this repo ({hidden_inactive} inactive hidden, use --inactive to show)."
+                );
+            } else {
+                println!("No workspaces found for this repo.");
+                println!("Use 'devaipod up .' to create one, or -A to show all.");
+            }
+        } else if hidden_inactive > 0 {
+            println!(
+                "No active workspaces ({hidden_inactive} inactive hidden, use --inactive to show)."
+            );
+        } else {
+            println!("No devaipod workspaces found.");
+            println!("Use 'devaipod up <path>' to create one.");
+        }
+        return Ok(());
+    }
+
+    // Group pods by repo for display
+    let mut repo_groups: std::collections::BTreeMap<String, Vec<&PodInfo>> =
+        std::collections::BTreeMap::new();
+    for info in &pod_infos {
+        let key = info.repo.clone().unwrap_or_else(|| "(no repo)".to_string());
+        repo_groups.entry(key).or_default().push(info);
+    }
+
+    // Calculate column widths across all pods
+    let name_width = pod_infos
+        .iter()
+        .map(|p| p.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let has_task_info = pod_infos.iter().any(|p| p.task.is_some());
+    let multiple_repos = repo_groups.len() > 1;
+
+    // Print grouped output
+    for (group_idx, (repo, group)) in repo_groups.iter().enumerate() {
+        // Repo header
+        if multiple_repos {
+            if group_idx > 0 {
+                println!();
+            }
+            let active = group
+                .iter()
+                .filter(|p| p.status.to_lowercase() == "running")
+                .count();
+            if active > 0 {
+                println!("{repo}  ({active} active)");
+            } else {
+                println!("{repo}");
+            }
+        }
+
+        // Column header (only print once when single repo)
+        if group_idx == 0 || multiple_repos {
+            if multiple_repos {
+                // Indented under repo header
+                if has_task_info {
+                    println!(
+                        "  {:<name_width$}  {:<18}  {:<4}  {:<25}  CREATED",
+                        "NAME",
+                        "STATUS",
+                        "MODE",
+                        "TASK",
+                        name_width = name_width
+                    );
+                } else {
+                    println!(
+                        "  {:<name_width$}  {:<18}  CREATED",
+                        "NAME",
+                        "STATUS",
+                        name_width = name_width
+                    );
+                }
+            } else if has_task_info {
+                println!(
+                    "{:<name_width$}  {:<18}  {:<4}  {:<25}  CREATED",
+                    "NAME",
+                    "STATUS",
+                    "MODE",
+                    "TASK",
+                    name_width = name_width
+                );
+            } else {
+                println!(
+                    "{:<name_width$}  {:<18}  CREATED",
+                    "NAME",
+                    "STATUS",
+                    name_width = name_width
+                );
+            }
+        }
+
+        for info in group {
+            let created_display = format_created_time(&info.created);
+            let indent = if multiple_repos { "  " } else { "" };
+
+            // Build status display with agent status suffix for running pods
+            let base_status = match info.status.to_lowercase().as_str() {
+                "running" => "Running",
+                "stopped" => "Stopped",
+                "exited" => "Exited",
+                "degraded" => "Degraded",
+                _ => &info.status,
+            };
+
+            let status_display = if info.status.to_lowercase() == "running" {
+                match info.agent_status {
+                    Some(true) => format!("{} [agent:ok]", base_status),
+                    Some(false) => format!("{} [agent:--]", base_status),
+                    None => base_status.to_string(),
+                }
+            } else {
+                base_status.to_string()
+            };
+
+            let mode_display = info.mode.as_deref().unwrap_or("-");
+
+            let task_display = info
+                .task
+                .as_ref()
+                .map(|t| {
+                    if t.len() > 25 {
+                        format!("{}...", &t[..22])
+                    } else {
+                        t.clone()
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
+
+            if has_task_info {
+                println!(
+                    "{indent}{:<name_width$}  {:<18}  {:<4}  {:<25}  {}",
+                    info.name,
+                    status_display,
+                    mode_display,
+                    task_display,
+                    created_display,
+                    name_width = name_width
+                );
+            } else {
+                println!(
+                    "{indent}{:<name_width$}  {:<18}  {}",
+                    info.name,
+                    status_display,
+                    created_display,
+                    name_width = name_width
+                );
+            }
+        }
+    }
+
+    // Footer hints
+    let mut hints = Vec::new();
+    if repo_filter_name.is_some() {
+        hints.push("-A to show all workspaces");
+    }
+    if hidden_inactive > 0 {
+        hints.push("--inactive to include stopped pods");
+    }
+    if !hints.is_empty() {
+        println!();
+        println!("(use {})", hints.join(", "));
+    }
+
+    if pod_infos.is_empty() {
+        if repo_filter_name.is_some() {
+            println!("No workspaces found for this repo.");
+            println!("Use 'devaipod up .' to create one, or -A to show all.");
+        } else {
+            println!("No devaipod workspaces found.");
+            println!("Use 'devaipod up <path>' to create one.");
+        }
+        return Ok(());
     }
 
     // Calculate column widths
@@ -4615,6 +7732,11 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 name_width = name_width
             );
         }
+    }
+
+    if repo_filter_name.is_some() {
+        println!();
+        println!("(use -A to show all workspaces)");
     }
 
     Ok(())
@@ -4781,6 +7903,11 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
         }
     }
 
+    // Clean up agent directory if it exists
+    if let Err(e) = crate::agent_dir::remove_agent_dir(pod_name) {
+        tracing::warn!("Failed to remove agent directory for {pod_name}: {e}");
+    }
+
     // Clean up SSH config file if it exists
     if let Err(e) = remove_ssh_config(pod_name) {
         tracing::warn!("Failed to remove SSH config: {}", e);
@@ -4798,6 +7925,25 @@ fn cmd_delete(pod_name: &str, force: bool) -> Result<()> {
 ///
 /// This stops and removes the containers but keeps the volumes intact,
 /// then recreates the containers with the new/updated image.
+/// Check if a devcontainer config exists in a repo directory.
+///
+/// Handles PermissionDenied (container subuid ownership) gracefully.
+fn check_devcontainer_exists(repo_dir: &std::path::Path) -> bool {
+    let dc_dir = repo_dir.join(".devcontainer");
+    let dc_file = repo_dir.join("devcontainer.json");
+    match std::fs::metadata(&dc_dir) {
+        Ok(m) if m.is_dir() => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
+        _ => {}
+    }
+    match std::fs::metadata(&dc_file) {
+        Ok(m) if m.is_file() => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
+        _ => {}
+    }
+    false
+}
+
 async fn cmd_rebuild(
     config: &config::Config,
     pod_name: &str,
@@ -4810,18 +7956,28 @@ async fn cmd_rebuild(
     let labels = get_pod_labels(pod_name)
         .ok_or_else(|| color_eyre::eyre::eyre!("Pod '{}' not found", pod_name))?;
 
+    // Check workspace state file first — it knows the original source type
+    let ws_state = agent_dir::WorkspaceState::load(
+        &agent_dir::agent_dir_host_path(pod_name).unwrap_or_default(),
+    )
+    .ok()
+    .flatten();
+
     let repo_url = labels
         .get("io.devaipod.repo")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "Pod '{}' has no repository label. Cannot determine source for rebuild.",
-                pod_name
-            )
-        })?;
+        .unwrap_or("");
 
     // Convert repo label back to URL (github.com/owner/repo -> https://github.com/owner/repo)
-    let remote_url = format!("https://{}", repo_url);
+    let remote_url = if repo_url.is_empty() {
+        // No repo label — check workspace state for the source
+        ws_state
+            .as_ref()
+            .map(|s| s.source.clone())
+            .unwrap_or_default()
+    } else {
+        format!("https://{}", repo_url)
+    };
     tracing::debug!("Repository: {}", remote_url);
 
     // Get task label if present (to preserve it)
@@ -4836,31 +7992,69 @@ async fn cmd_rebuild(
         .await
         .context("Failed to start podman service")?;
 
-    // Read devcontainer.json from the existing workspace volume rather
-    // than cloning the remote again.  This picks up any config changes
-    // the agent (or user) made inside the workspace.
-    let volume_name = format!("{}-workspace", pod_name);
+    // Read devcontainer.json from the agent workspace.
+    //
+    // workspace-v2: the agent workspace is a host bind mount, so we can
+    // read directly from the filesystem instead of running an init container.
+    // This correctly picks up modifications the agent made inside the workspace.
+    // Fall back to the workspace volume for older (pre-v2) pods.
     let repo_name = git::extract_repo_name(&remote_url).unwrap_or_else(|| "workspace".to_string());
     let self_image = pod::detect_self_image();
 
     let workspace_dir = format!("/workspaces/{}", repo_name);
 
-    tracing::info!("Reading devcontainer configuration from workspace volume...");
-    let (exit_code, raw_output) = podman
-        .run_init_container_with_output(
-            &self_image,
-            &volume_name,
-            "/workspaces",
-            &[
-                "devaipod",
-                "internals",
-                "output-devcontainer-state",
-                &workspace_dir,
-            ],
-            &[],
-        )
-        .await
-        .context("Failed to read config from workspace volume")?;
+    // Try reading from agent workspace host directory first (workspace-v2).
+    // Use agent_dir_container_path for existence checks (visible from our
+    // process), but agent_dir_host_path for the podman bind mount source
+    // (podman resolves paths on the host).
+    let (exit_code, raw_output) = {
+        let agent_ws_container = agent_dir::agent_dir_container_path(pod_name)?;
+        let agent_repo_dir = agent_ws_container.join(&repo_name);
+        let has_devcontainer = check_devcontainer_exists(&agent_repo_dir);
+        if has_devcontainer {
+            let agent_ws_host = agent_dir::agent_dir_host_path(pod_name)?;
+            tracing::info!(
+                "Reading devcontainer configuration from agent workspace at {}...",
+                agent_ws_host.display()
+            );
+            let host_path = agent_ws_host.display().to_string();
+            podman
+                .run_init_container_with_output(
+                    &self_image,
+                    &host_path,
+                    "/workspaces",
+                    &[
+                        "devaipod-server",
+                        "internals",
+                        "output-devcontainer-state",
+                        &workspace_dir,
+                    ],
+                    &[],
+                )
+                .await
+                .context("Failed to read config from agent workspace")?
+        } else {
+            // Fall back to workspace volume (pre-v2 or devcontainer
+            // was never in the agent workspace)
+            let volume_name = format!("{}-workspace", pod_name);
+            tracing::info!("Reading devcontainer configuration from workspace volume...");
+            podman
+                .run_init_container_with_output(
+                    &self_image,
+                    &volume_name,
+                    "/workspaces",
+                    &[
+                        "devaipod-server",
+                        "internals",
+                        "output-devcontainer-state",
+                        &workspace_dir,
+                    ],
+                    &[],
+                )
+                .await
+                .context("Failed to read config from workspace volume")?
+        }
+    };
 
     if exit_code != 0 {
         tracing::warn!(
@@ -4924,14 +8118,29 @@ async fn cmd_rebuild(
         None
     };
 
-    // Create remote info for workspace source
-    let remote_info = git::RemoteRepoInfo {
-        remote_url: remote_url.clone(),
-        default_branch,
-        repo_name,
-        fork_url,
+    // Determine workspace source: local path or remote URL.
+    // The workspace state file records the original source string, which is
+    // a local path for `devaipod up .` and a URL for remote repos.
+    let source = if std::path::Path::new(&remote_url).exists() {
+        // Local repository — detect git info from the path
+        let git_info = git::detect_git_info(std::path::Path::new(&remote_url))?;
+        pod::WorkspaceSource::LocalRepo(git_info)
+    } else if !remote_url.is_empty() {
+        let remote_info = git::RemoteRepoInfo {
+            remote_url: remote_url.clone(),
+            default_branch,
+            repo_name,
+            fork_url,
+        };
+        pod::WorkspaceSource::RemoteRepo(remote_info)
+    } else if ws_state.as_ref().is_some_and(|s| s.source == "scratch") {
+        pod::WorkspaceSource::Scratch
+    } else {
+        bail!(
+            "Cannot determine source for rebuild. Pod '{}' has no repo label and no workspace state.",
+            pod_name
+        );
     };
-    let source = pod::WorkspaceSource::RemoteRepo(remote_info);
 
     // Now stop and remove the pod (volumes are preserved)
     tracing::info!("Stopping containers...");
@@ -4958,6 +8167,19 @@ async fn cmd_rebuild(
         bail!("Failed to remove pod: {}", stderr.trim());
     }
 
+    // If rebuilding the advisor pod, re-apply the MCP server entry and
+    // service-gator mutations that create_advisor_pod applies at creation
+    // time. These are ephemeral (in-memory only) and lost on rebuild.
+    let is_advisor = pod_name == advisor_pod_name();
+    let effective_config;
+    let config = if is_advisor {
+        tracing::info!("Rebuilding advisor pod — re-applying MCP server configuration");
+        effective_config = apply_advisor_config()?;
+        &effective_config
+    } else {
+        config
+    };
+
     let enable_gator = config.service_gator.is_enabled();
 
     // Build extra labels (including instance tag if set)
@@ -4980,6 +8202,10 @@ async fn cmd_rebuild(
         .or(dotfiles_image)
         .or_else(|| config.default_image.clone());
 
+    // Create agent backend
+    let (agent_name, agent_profile) = config.agent.resolve_profile(None);
+    let backend = create_agent_backend(&agent_name, agent_profile, &config.agent)?;
+
     let devaipod_pod = pod::DevaipodPod::create(
         &podman,
         temp_path,
@@ -4996,6 +8222,8 @@ async fn cmd_rebuild(
         config.orchestration.is_enabled(),
         config.orchestration.worker.gator.clone(),
         true, // auto_approve: rebuilds keep default behavior
+        &[],  // source_dirs: not supported for rebuild yet
+        backend.as_ref(),
     )
     .await
     .context("Failed to recreate pod")?;
@@ -5270,6 +8498,9 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
     // Check MCP connectivity
     let mcp_info = collect_mcp_debug(pod_name);
 
+    // Collect per-container diagnostics (logs, exit codes, state)
+    let container_diagnostics = collect_container_diagnostics(pod_name);
+
     if json_output {
         let debug_info = json!({
             "pod": {
@@ -5280,6 +8511,7 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
             "gator": gator_info,
             "agent": agent_info,
             "mcp": mcp_info,
+            "containers": container_diagnostics,
         });
         println!("{}", serde_json::to_string_pretty(&debug_info)?);
     } else {
@@ -5359,6 +8591,42 @@ fn cmd_debug(pod_name: &str, json_output: bool) -> Result<()> {
             }
         } else {
             println!("  (unable to check)");
+        }
+        println!();
+
+        // Container logs section
+        println!("--- Container Logs ---");
+        if let Some(containers) = container_diagnostics.as_array() {
+            if containers.is_empty() {
+                println!("  (no containers found)");
+            }
+            for c in containers {
+                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let state = c.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let exit_code = c.get("exit_code").and_then(|v| v.as_i64());
+                let health = c.get("health_status").and_then(|v| v.as_str());
+                let logs = c.get("logs_tail").and_then(|v| v.as_str()).unwrap_or("");
+
+                // Build the status line
+                let status = match (state, exit_code, health) {
+                    ("exited", Some(code), _) => format!("exited (exit code: {})", code),
+                    (s, _, Some(h)) => format!("{} ({})", s, h),
+                    (s, _, None) => s.to_string(),
+                };
+                println!("  {}: {}", name, status);
+
+                if logs.is_empty() {
+                    println!("    (no recent output)");
+                } else {
+                    let lines: Vec<&str> = logs.lines().collect();
+                    println!("    (last {} lines)", lines.len());
+                    for line in &lines {
+                        println!("    {}", line);
+                    }
+                }
+            }
+        } else {
+            println!("  (unable to collect container info)");
         }
     }
 
@@ -5476,6 +8744,129 @@ fn collect_mcp_debug(pod_name: &str) -> Option<serde_json::Value> {
     }))
 }
 
+/// Collect per-container diagnostics: state, exit codes, health, and recent logs.
+fn collect_container_diagnostics(pod_name: &str) -> serde_json::Value {
+    use serde_json::json;
+
+    let containers_output = match podman_command()
+        .args([
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            &format!("pod={}", pod_name),
+            "--format",
+            "json",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return json!([]),
+    };
+
+    let container_list: Vec<serde_json::Value> =
+        match serde_json::from_slice(&containers_output.stdout) {
+            Ok(v) => v,
+            Err(_) => return json!([]),
+        };
+
+    let pod_prefix = format!("{}-", pod_name);
+
+    let mut results = Vec::new();
+    for entry in &container_list {
+        // podman container ls --format json uses "Names" (array) or "Name" (string)
+        let container_name = entry
+            .get("Names")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("Name").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+
+        if container_name.is_empty() {
+            continue;
+        }
+
+        // Strip pod prefix for readability (e.g. "devaipod-myproject-abc-agent" → "agent")
+        let display_name = container_name
+            .strip_prefix(&pod_prefix)
+            .unwrap_or(&container_name)
+            .to_string();
+
+        // Skip the infra container -- it's internal to podman
+        if display_name == "infra" {
+            continue;
+        }
+
+        // Get detailed state/exit_code/health via inspect
+        let (state, exit_code, health_status) = match podman_command()
+            .args(["inspect", "--format", "json", "--", &container_name])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let inspect: Vec<serde_json::Value> =
+                    serde_json::from_slice(&o.stdout).unwrap_or_default();
+                if let Some(info) = inspect.first() {
+                    let state_obj = info.get("State");
+                    let st = state_obj
+                        .and_then(|s| s.get("Status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let ec = state_obj
+                        .and_then(|s| s.get("ExitCode"))
+                        .and_then(|v| v.as_i64());
+                    let hs = state_obj
+                        .and_then(|s| s.get("Health"))
+                        .and_then(|h| h.get("Status"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    (st, ec, hs)
+                } else {
+                    ("unknown".to_string(), None, None)
+                }
+            }
+            _ => ("unknown".to_string(), None, None),
+        };
+
+        // Get last 30 lines of logs
+        let logs_tail = match podman_command()
+            .args(["logs", "--tail", "30", "--", &container_name])
+            .output()
+        {
+            Ok(o) => {
+                // Combine stdout and stderr (many containers log to stderr)
+                let mut combined = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr_str = String::from_utf8_lossy(&o.stderr);
+                if !stderr_str.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&stderr_str);
+                }
+                combined.trim().to_string()
+            }
+            Err(_) => String::new(),
+        };
+
+        let mut entry = json!({
+            "name": display_name,
+            "state": state,
+            "logs_tail": logs_tail,
+        });
+        if let Some(ec) = exit_code {
+            entry["exit_code"] = json!(ec);
+        }
+        if let Some(hs) = &health_status {
+            entry["health_status"] = json!(hs);
+        }
+        results.push(entry);
+    }
+
+    json!(results)
+}
+
 /// Interact with the opencode agent programmatically
 async fn cmd_opencode(pod_name: &str, action: OpencodeAction) -> Result<()> {
     // Verify pod exists and is running
@@ -5559,20 +8950,20 @@ fn opencode_api_get(pod_name: &str, path: &str) -> Result<serde_json::Value> {
     opencode_api_get_port(pod_name, path, None)
 }
 
-/// Execute a curl command in the workspace container with a specific port
+/// Execute a curl command in the agent container with a specific port
 fn opencode_api_get_port(
     pod_name: &str,
     path: &str,
     port: Option<u16>,
 ) -> Result<serde_json::Value> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
     let port = port.unwrap_or(pod::OPENCODE_PORT);
     let url = format!("http://localhost:{}{}", port, path);
 
     let output = podman_command()
-        .args(["exec", &workspace_container, "curl", "-sf", &url])
+        .args(["exec", &agent_container, "curl", "-sf", &url])
         .output()
-        .context("Failed to execute curl in workspace container")?;
+        .context("Failed to execute curl in agent container")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5585,13 +8976,13 @@ fn opencode_api_get_port(
 
 /// Execute a POST request to the opencode API
 fn opencode_api_post(pod_name: &str, path: &str, body: &str) -> Result<serde_json::Value> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
     let url = format!("http://localhost:{}{}", pod::OPENCODE_PORT, path);
 
     let output = podman_command()
         .args([
             "exec",
-            &workspace_container,
+            &agent_container,
             "curl",
             "-sf",
             "-X",
@@ -5603,7 +8994,7 @@ fn opencode_api_post(pod_name: &str, path: &str, body: &str) -> Result<serde_jso
             &url,
         ])
         .output()
-        .context("Failed to execute curl in workspace container")?;
+        .context("Failed to execute curl in agent container")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5820,16 +9211,17 @@ fn cmd_opencode_status(pod_name: &str, json_output: bool) -> Result<()> {
 
 /// Check if the agent is listening on its port
 fn check_agent_health(pod_name: &str) -> Option<bool> {
-    let workspace_container = format!("{}-workspace", pod_name);
+    let agent_container = format!("{}-agent", pod_name);
 
-    // Try nc first (fast port check), fall back to curl (more widely available).
-    // Custom/minimal container images may not have nc installed.
+    // Use bash's built-in /dev/tcp to check if the port is accepting
+    // connections.  This avoids depending on `nc` which may not be
+    // installed (e.g. the devaipod image used for the advisor pod).
     let check_cmd = format!(
-        "nc -z localhost {port} 2>/dev/null || curl -sf -o /dev/null http://localhost:{port}/session 2>/dev/null",
-        port = pod::OPENCODE_PORT,
+        "echo >/dev/tcp/localhost/{} 2>/dev/null",
+        pod::OPENCODE_PORT
     );
     let result = podman_command()
-        .args(["exec", &workspace_container, "/bin/sh", "-c", &check_cmd])
+        .args(["exec", &agent_container, "bash", "-c", &check_cmd])
         .status();
 
     match result {
@@ -5907,7 +9299,7 @@ fn format_container_state(state: &str) -> &str {
 /// Generate shell completions
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
     let mut cmd = HostCli::command();
-    clap_complete::generate(shell, &mut cmd, "devaipod", &mut std::io::stdout());
+    clap_complete::generate(shell, &mut cmd, "devaipod-server", &mut std::io::stdout());
     Ok(())
 }
 
@@ -6229,6 +9621,8 @@ mod tests {
         assert!(subcommands.contains(&"delete"), "Missing 'delete' command");
         assert!(subcommands.contains(&"logs"), "Missing 'logs' command");
         assert!(subcommands.contains(&"status"), "Missing 'status' command");
+        assert!(subcommands.contains(&"fetch"), "Missing 'fetch' command");
+        assert!(subcommands.contains(&"diff"), "Missing 'diff' command");
         assert!(
             subcommands.contains(&"completions"),
             "Missing 'completions' command"
@@ -6336,13 +9730,14 @@ mod tests {
         // When the project name itself is "devaipod", make_pod_name produces
         // "devaipod-devaipod-XXXX". Stripping the prefix yields "devaipod-XXXX"
         // which already starts with "devaipod-", so normalize_pod_name returns
-        // it unchanged instead of re-adding the prefix. This is a known
-        // limitation: the web frontend must pass the full pod name (as returned
-        // by Podman) rather than relying on the strip/normalize roundtrip.
+        // it unchanged instead of re-adding the prefix.
+        //
+        // resolve_workspace() compensates for this by checking pod existence
+        // and trying the double-prefix when the first lookup fails.
         let full_name = "devaipod-devaipod-a47a13";
         let stripped = strip_pod_prefix(full_name);
         assert_eq!(stripped, "devaipod-a47a13");
-        // normalize does NOT recover the original — this is expected:
+        // normalize does NOT recover the original:
         assert_eq!(normalize_pod_name(stripped), "devaipod-a47a13");
         assert_ne!(normalize_pod_name(stripped), full_name);
         // But passing the full name through normalize is fine (idempotent):
@@ -6548,5 +9943,175 @@ mod tests {
             normalize_source("gitea.local:3000/owner/repo", no_extra).as_ref(),
             "gitea.local:3000/owner/repo",
         );
+    }
+
+    #[test]
+    fn test_extract_repo_suffix() {
+        // Host path
+        assert_eq!(
+            extract_repo_suffix("/var/home/ai/src/github.com/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // Container-internal path (different prefix, same suffix)
+        assert_eq!(
+            extract_repo_suffix("/mnt/src/github.com/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // HTTPS URL
+        assert_eq!(
+            extract_repo_suffix("https://github.com/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // HTTPS URL with .git suffix
+        assert_eq!(
+            extract_repo_suffix("https://github.com/org/repo.git"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // GitLab
+        assert_eq!(
+            extract_repo_suffix("/home/user/src/gitlab.com/group/project"),
+            Some("gitlab.com/group/project".to_string()),
+        );
+        // No forge host => None
+        assert_eq!(extract_repo_suffix("/tmp/myrepo"), None);
+        // Path with TLD-less host name (common convention: ~/src/github/org/repo)
+        assert_eq!(
+            extract_repo_suffix("/home/user/github/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // Container path with TLD-less host
+        assert_eq!(
+            extract_repo_suffix("/mnt/src/github/org/repo"),
+            Some("github.com/org/repo".to_string()),
+        );
+        // GitLab without TLD
+        assert_eq!(
+            extract_repo_suffix("/home/user/gitlab/group/project"),
+            Some("gitlab.com/group/project".to_string()),
+        );
+        // No forge host => None
+        assert_eq!(extract_repo_suffix("/tmp/myrepo"), None);
+    }
+
+    #[test]
+    fn test_source_matches_repo_direct_path() {
+        let repo = Path::new("/var/home/ai/src/myproject");
+        assert!(source_matches_repo("/var/home/ai/src/myproject", &[], repo));
+        assert!(!source_matches_repo("/var/home/ai/src/other", &[], repo));
+    }
+
+    #[test]
+    fn test_source_matches_repo_via_source_dirs() {
+        let repo = Path::new("/var/home/ai/src/myproject");
+        assert!(source_matches_repo(
+            "https://github.com/unrelated/url",
+            &[PathBuf::from("/var/home/ai/src/myproject")],
+            repo
+        ));
+    }
+
+    #[test]
+    fn test_source_matches_repo_cross_path_via_suffix() {
+        // Container path vs host path — different prefixes but same forge suffix
+        let repo = Path::new("/var/home/ai/src/github.com/org/repo");
+        assert!(source_matches_repo(
+            "/mnt/src/github.com/org/repo",
+            &[],
+            repo
+        ));
+    }
+
+    #[test]
+    fn test_source_matches_repo_url_vs_path() {
+        // URL source vs local path with forge suffix
+        let repo = Path::new("/home/user/src/github.com/org/repo");
+        assert!(source_matches_repo(
+            "https://github.com/org/repo",
+            &[],
+            repo
+        ));
+        assert!(source_matches_repo(
+            "https://github.com/org/repo.git",
+            &[],
+            repo
+        ));
+    }
+
+    #[test]
+    fn test_source_matches_repo_no_forge_no_match() {
+        // When neither side has a forge host, only direct match works
+        let repo = Path::new("/tmp/myproject");
+        assert!(!source_matches_repo("/other/myproject", &[], repo));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_plain_number() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(&mut config, &["3000".to_string()]);
+        assert_eq!(config.forward_ports.len(), 1);
+        assert_eq!(config.forward_ports[0], serde_json::json!(3000u16));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_host_container() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(&mut config, &["8080:3000".to_string()]);
+        assert_eq!(config.forward_ports.len(), 1);
+        assert_eq!(config.forward_ports[0], serde_json::json!("8080:3000"));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_mixed() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(
+            &mut config,
+            &[
+                "3000".to_string(),
+                "8080:9090".to_string(),
+                "443".to_string(),
+            ],
+        );
+        assert_eq!(config.forward_ports.len(), 3);
+        assert_eq!(config.forward_ports[0], serde_json::json!(3000u16));
+        assert_eq!(config.forward_ports[1], serde_json::json!("8080:9090"));
+        assert_eq!(config.forward_ports[2], serde_json::json!(443u16));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_appends_to_existing() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        config.forward_ports.push(serde_json::json!(5000));
+        merge_cli_ports_into_config(&mut config, &["3000".to_string()]);
+        assert_eq!(config.forward_ports.len(), 2);
+        assert_eq!(config.forward_ports[0], serde_json::json!(5000));
+        assert_eq!(config.forward_ports[1], serde_json::json!(3000u16));
+    }
+
+    #[test]
+    fn test_merge_cli_ports_empty() {
+        let mut config = devcontainer::DevcontainerConfig::default();
+        merge_cli_ports_into_config(&mut config, &[]);
+        assert!(config.forward_ports.is_empty());
+    }
+
+    #[test]
+    fn test_create_agent_backend_any_name_returns_acp() {
+        // All agents use ACP now — name is informational
+        let agent_config = crate::config::AgentConfig::default();
+        let backend = create_agent_backend("anything", None, &agent_config).unwrap();
+        assert_eq!(backend.name(), "acp");
+    }
+
+    #[test]
+    fn test_create_agent_backend_with_profile() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let profile = crate::config::AgentProfile {
+            command: vec!["goose".to_string(), "acp".to_string()],
+            env,
+        };
+        let agent_config = crate::config::AgentConfig::default();
+        let backend = create_agent_backend("goose", Some(&profile), &agent_config).unwrap();
+        assert_eq!(backend.name(), "acp");
     }
 }

@@ -1,17 +1,13 @@
 //! TUI (Text User Interface) for devaipod
 //!
 //! Provides a real-time dashboard for managing devaipod instances using async Rust
-//! with ratatui for rendering and bollard for container API access.
+//! with ratatui for rendering. Data is fetched from the local web REST API
+//! (`/api/devaipod/pods`) rather than accessing the container runtime directly.
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Stdout};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
-use bollard::Docker;
-use bollard::container::ListContainersOptions;
-use bollard::models::ContainerSummary;
 use color_eyre::eyre::{Context, Result};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -26,134 +22,78 @@ use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, TableState, Wrap};
 use tokio::time::interval;
 
-/// State file name for persistent TUI/instance state
-const STATE_FILE_NAME: &str = "state.json";
-
-/// Cache for TUI state, versioned for compatibility
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TuiStateCache {
-    /// Application version for compatibility check
-    version: String,
-    /// Cached state per instance (keyed by instance name)
-    instances: HashMap<String, CachedInstanceState>,
-}
-
-/// Cached state for a single instance
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CachedInstanceState {
-    /// Cached git repository state
-    git_state: Option<GitState>,
-    /// Cached agent activity state
-    agent_state: Option<AgentState>,
-    /// Unix timestamp when this cache entry was last updated
-    updated_at: i64,
-}
-
-/// Get the persistent state file path.
-///
-/// Uses XDG_DATA_HOME (typically ~/.local/share), falling back to ~/.local/share.
-/// Creates the directory if it doesn't exist.
-fn state_file_path() -> std::path::PathBuf {
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-        })
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-        .join("devaipod");
-
-    // Ensure directory exists
-    let _ = std::fs::create_dir_all(&data_dir);
-
-    data_dir.join(STATE_FILE_NAME)
-}
-
-/// Load the TUI state from disk.
-/// Returns None if state doesn't exist, is corrupt, or has a version mismatch.
-fn load_state() -> Option<TuiStateCache> {
-    let path = state_file_path();
-
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let cache: TuiStateCache = serde_json::from_str(&contents).ok()?;
-
-    // Version mismatch - ignore cache
-    if cache.version != env!("CARGO_PKG_VERSION") {
-        return None;
-    }
-
-    Some(cache)
-}
-
-/// Save the TUI state to disk.
-/// Silently ignores any errors (state persistence is best-effort).
-fn save_state(state: &TuiStateCache) {
-    let path = state_file_path();
-
-    // Write atomically via temp file
-    let tmp_path = path.with_extension("tmp");
-    if let Ok(contents) = serde_json::to_string_pretty(state)
-        && std::fs::write(&tmp_path, contents).is_ok()
-    {
-        let _ = std::fs::rename(&tmp_path, &path);
-    }
-}
-
-/// Build a cache from current instance state
-fn build_cache(instances: &[InstanceInfo]) -> TuiStateCache {
-    let now = chrono::Utc::now().timestamp();
-    let entries: HashMap<String, CachedInstanceState> = instances
-        .iter()
-        .filter_map(|i| {
-            // Only cache instances that have some fetched state
-            if i.git_state.is_some() || i.agent_state.activity != AgentActivity::default() {
-                Some((
-                    i.name.clone(),
-                    CachedInstanceState {
-                        git_state: i.git_state.clone(),
-                        agent_state: Some(i.agent_state.clone()),
-                        updated_at: now,
-                    },
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    TuiStateCache {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        instances: entries,
-    }
-}
-
 /// Prefix for all devaipod pod names
 const POD_NAME_PREFIX: &str = "devaipod-";
 
-use crate::{INSTANCE_LABEL_KEY, get_instance_id};
+/// Default state directory (matches web server's default).
+const DEFAULT_STATE_DIR: &str = "/var/lib/devaipod";
 
-/// Check whether a container's labels match the current instance filter.
-fn labels_match_instance(labels: Option<&HashMap<String, String>>) -> bool {
-    let instance_id = get_instance_id();
-    let pod_instance = labels
-        .and_then(|l| l.get(INSTANCE_LABEL_KEY))
-        .map(|s| s.as_str());
+/// Default web API port.
+const DEFAULT_WEB_PORT: u16 = 8080;
 
-    match (instance_id.as_deref(), pod_instance) {
-        (Some(want), Some(have)) => want == have,
-        (Some(_), None) => false,
-        (None, Some(_)) => false,
-        (None, None) => true,
-    }
+/// Response shape for the unified pod list endpoint (`GET /api/devaipod/pods`).
+#[derive(Debug, serde::Deserialize)]
+struct ApiPodInfo {
+    name: String,
+    status: String,
+    created: String,
+    #[serde(default)]
+    labels: Option<HashMap<String, String>>,
+    #[serde(default)]
+    containers: Option<Vec<ApiContainerInfo>>,
+    #[serde(default)]
+    agent_status: Option<ApiAgentStatus>,
+    #[serde(default)]
+    last_active_ts: Option<i64>,
 }
 
-/// Minimum interval between git state refreshes for a single instance.
-/// Prevents excessive git command execution when multiple refresh triggers occur.
-const GIT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(10);
+/// Container entry inside the API response.
+#[derive(Debug, serde::Deserialize)]
+struct ApiContainerInfo {
+    #[serde(rename = "Names")]
+    names: String,
+    #[serde(rename = "Status")]
+    status: String,
+}
+
+/// Agent status from the pod-api sidecar, nested inside `ApiPodInfo`.
+#[derive(Debug, serde::Deserialize)]
+struct ApiAgentStatus {
+    activity: String,
+    #[serde(default)]
+    status_line: Option<String>,
+    #[serde(default)]
+    current_tool: Option<String>,
+    #[serde(default)]
+    recent_output: Vec<String>,
+    #[serde(default)]
+    last_message_ts: Option<i64>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// Read the web auth token from the state directory.
+pub(crate) fn read_api_token() -> Result<String> {
+    let state_dir =
+        std::env::var("DEVAIPOD_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    let token_path = std::path::PathBuf::from(state_dir).join("web-token");
+    std::fs::read_to_string(&token_path)
+        .map(|t| t.trim().to_string())
+        .with_context(|| format!("Failed to read API token from {}", token_path.display()))
+}
+
+/// Determine the web API port from environment or default.
+pub(crate) fn api_port() -> u16 {
+    std::env::var("DEVAIPOD_WEB_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WEB_PORT)
+}
 
 /// Agent activity state (idle, working, etc.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -201,6 +141,7 @@ pub struct GitState {
 
 impl GitState {
     /// Create a summary string for display
+    #[allow(dead_code)]
     fn compute_summary(&mut self) {
         let branch = self.branch.as_deref().unwrap_or("detached");
         let dirty_indicator = if self.dirty { "*" } else { "" };
@@ -221,7 +162,8 @@ impl GitState {
 pub struct InstanceInfo {
     /// Short name (without devaipod- prefix)
     pub name: String,
-    /// Full pod name
+    /// Full pod name (used by subprocess commands via name, kept for completeness)
+    #[allow(dead_code)]
     pub full_name: String,
     /// Pod status (Running, Exited, Degraded)
     pub status: String,
@@ -243,16 +185,21 @@ pub struct InstanceInfo {
     /// Git repository state (fetched async)
     pub git_state: Option<GitState>,
     /// Workspace directory path inside container
+    #[allow(dead_code)]
     pub workspace_path: Option<String>,
     /// Last time git state was refreshed for this instance (for rate-limiting)
+    #[allow(dead_code)]
     pub last_git_refresh: Option<std::time::Instant>,
     /// Agent activity state (fetched async)
     pub agent_state: AgentState,
     /// Last time agent state was refreshed for this instance
+    #[allow(dead_code)]
     pub last_agent_refresh: Option<std::time::Instant>,
-    /// API password for the opencode server (from pod labels)
+    /// API password for the agent backend (from pod labels)
+    #[allow(dead_code)]
     pub api_password: Option<String>,
-    /// Published host port for the opencode API
+    /// Published host port for the agent API
+    #[allow(dead_code)]
     pub api_port: Option<u16>,
     /// Whether service-gator container is running
     pub gator_healthy: Option<bool>,
@@ -281,6 +228,8 @@ pub enum TuiMode {
     Launch,
     /// Container access menu - select which container/shell to access
     ContainerMenu,
+    /// Editing the filter text
+    Filter,
 }
 
 /// Menu item in the container access menu
@@ -310,8 +259,8 @@ impl ContainerMenuItem {
     /// Get description for menu item
     fn description(&self) -> &'static str {
         match self {
-            ContainerMenuItem::OrchestratorAgent => "opencode attach to task owner",
-            ContainerMenuItem::WorkerAgent => "opencode attach to worker",
+            ContainerMenuItem::OrchestratorAgent => "attach to task owner agent",
+            ContainerMenuItem::WorkerAgent => "attach to worker agent",
             ContainerMenuItem::WorkerShell => "bash shell in worker container",
             ContainerMenuItem::WorkspaceShell => "bash shell in workspace container",
         }
@@ -379,12 +328,22 @@ pub enum Action {
     ExecWorker(String),
     /// Launch new instances with URLs and a task
     Launch { urls: Vec<String>, task: String },
+    /// Launch/attach the advisor
+    Advisor,
+    /// Open the review TUI for the specified instance
+    Review(String),
+    /// Rebuild (recreate) the selected instance
+    Rebuild(String),
 }
 
 /// Application state for the TUI
 pub struct App {
-    /// Docker/Podman client
-    docker: Docker,
+    /// Reusable HTTP client for API requests
+    http_client: reqwest::Client,
+    /// Auth token for the web API
+    api_token: String,
+    /// Web API port
+    api_port: u16,
     /// List of instances
     instances: Vec<InstanceInfo>,
     /// Table selection state
@@ -393,8 +352,6 @@ pub struct App {
     last_refresh: std::time::Instant,
     /// Status message
     status_message: Option<String>,
-    /// Cached TUI state (loaded on startup, updated on refreshes)
-    cache: Option<TuiStateCache>,
     /// Current TUI mode (normal, delete select, etc.)
     mode: TuiMode,
     /// Instances selected for deletion (by name)
@@ -403,309 +360,212 @@ pub struct App {
     launch_input: LaunchInput,
     /// Selected item in container menu (0-3)
     container_menu_selection: usize,
+    /// Text filter applied to instance list (matches name, repo, task)
+    filter_text: String,
+    /// Whether we're in a git repo (used for launch dialog defaults)
+    in_git_repo: bool,
+    /// All instances before filtering (so filter edits don't lose data)
+    all_instances: Vec<InstanceInfo>,
+    /// Whether to show inactive (stopped/exited) pods
+    show_inactive: bool,
 }
 
 impl App {
-    /// Create a new App instance
-    pub async fn new() -> Result<Self> {
-        // Connect to container socket - we expect to run inside a container
-        // with the host's podman/docker socket mounted at one of these paths
-        let docker = crate::podman::connect_to_container_socket()
-            .context("Failed to connect to podman/docker socket")?;
+    /// Create a new App instance.
+    ///
+    /// When `show_all` is false and CWD is inside a git repo, instances are
+    /// filtered to only those whose repo label matches the current repo.
+    pub async fn new(show_all: bool) -> Result<Self> {
+        let token = read_api_token()?;
+        let port = api_port();
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("Failed to create HTTP client")?;
 
-        // Load cached state for instant display
-        let cache = load_state();
+        // Initialize default filter from CWD repo
+        let in_git_repo = crate::repo_root_path().is_ok();
+        let default_filter = if !show_all && in_git_repo {
+            crate::repo_root_path()
+                .ok()
+                .and_then(|root| crate::extract_repo_suffix(&root.to_string_lossy()))
+                .and_then(|s| {
+                    // Use org/repo portion after the host
+                    s.split_once('/').map(|(_, rest)| rest.to_string())
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         let mut app = Self {
-            docker,
+            http_client,
+            api_token: token,
+            api_port: port,
             instances: Vec::new(),
             table_state: TableState::default(),
             last_refresh: std::time::Instant::now(),
             status_message: None,
-            cache,
             mode: TuiMode::Normal,
             selected_for_delete: std::collections::HashSet::new(),
-            launch_input: LaunchInput::default(),
+            launch_input: LaunchInput {
+                urls: if in_git_repo {
+                    ".".to_string()
+                } else {
+                    String::new()
+                },
+                ..LaunchInput::default()
+            },
             container_menu_selection: 0,
+            filter_text: default_filter,
+            in_git_repo,
+            all_instances: Vec::new(),
+            show_inactive: false,
         };
 
         // Initial data fetch
-        app.refresh_instances().await?;
+        app.refresh_from_api().await?;
 
         Ok(app)
     }
 
-    /// Refresh the list of instances from podman
-    pub async fn refresh_instances(&mut self) -> Result<()> {
-        // Preserve git state and rate-limit timestamps from existing instances
-        let old_git_data: HashMap<String, (Option<GitState>, Option<std::time::Instant>)> = self
-            .instances
-            .iter()
-            .map(|i| (i.name.clone(), (i.git_state.clone(), i.last_git_refresh)))
-            .collect();
+    /// Refresh the list of instances from the web REST API.
+    async fn refresh_from_api(&mut self) -> Result<()> {
+        let url = format!("http://127.0.0.1:{}/api/devaipod/pods", self.api_port);
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .send()
+            .await
+            .context("Failed to reach web API")?;
 
-        // Preserve agent state and rate-limit timestamps
-        let old_agent_data: HashMap<String, (AgentState, Option<std::time::Instant>)> = self
-            .instances
-            .iter()
-            .map(|i| {
-                (
-                    i.name.clone(),
-                    (i.agent_state.clone(), i.last_agent_refresh),
-                )
+        if !resp.status().is_success() {
+            color_eyre::eyre::bail!("API returned {}", resp.status());
+        }
+
+        let pods: Vec<ApiPodInfo> = resp.json().await.context("Failed to parse API response")?;
+
+        let mut instances: Vec<InstanceInfo> = pods
+            .into_iter()
+            .map(|api| {
+                let labels = api.labels.as_ref();
+
+                let short_name = api
+                    .name
+                    .strip_prefix(POD_NAME_PREFIX)
+                    .unwrap_or(&api.name)
+                    .to_string();
+
+                let repo = labels.and_then(|l| l.get("io.devaipod.repo")).cloned();
+                let task = labels.and_then(|l| l.get("io.devaipod.task")).cloned();
+                let mode = labels.and_then(|l| l.get("io.devaipod.mode")).cloned();
+
+                // Title: prefer agent_status title, fall back to label
+                let title = api
+                    .agent_status
+                    .as_ref()
+                    .and_then(|s| s.title.clone())
+                    .or_else(|| labels.and_then(|l| l.get("io.devaipod.title")).cloned());
+
+                let is_running = api.status.eq_ignore_ascii_case("running");
+
+                // Agent health: running status + agent_status present
+                let agent_healthy = if is_running {
+                    Some(api.agent_status.is_some())
+                } else {
+                    Some(false)
+                };
+
+                // Map agent_status to AgentState
+                let agent_state = match &api.agent_status {
+                    Some(status) => {
+                        let activity = match status.activity.as_str() {
+                            "Working" => AgentActivity::Working,
+                            "Idle" => AgentActivity::Idle,
+                            "Stopped" => AgentActivity::Stopped,
+                            _ => AgentActivity::Unknown,
+                        };
+                        AgentState {
+                            activity,
+                            recent_output: status.recent_output.clone(),
+                            current_tool: status.current_tool.clone(),
+                            status_line: status.status_line.clone(),
+                            last_message_ts: status.last_message_ts,
+                        }
+                    }
+                    None => AgentState {
+                        activity: if is_running {
+                            AgentActivity::Unknown
+                        } else {
+                            AgentActivity::Stopped
+                        },
+                        ..Default::default()
+                    },
+                };
+
+                // Gator health: check containers list for a container with
+                // "-gator" in name that has "Up" in status
+                let gator_healthy = api.containers.as_ref().map(|cs| {
+                    cs.iter()
+                        .any(|c| c.names.contains("-gator") && c.status.contains("Up"))
+                });
+
+                let gator_scopes = labels
+                    .and_then(|l| l.get("io.devaipod.service-gator"))
+                    .cloned();
+
+                // Worker health
+                let worker_healthy = api.containers.as_ref().map(|cs| {
+                    cs.iter()
+                        .any(|c| c.names.contains("-worker") && c.status.contains("Up"))
+                });
+
+                // Degraded containers: those without "Up" in status
+                let degraded_containers: Vec<String> = api
+                    .containers
+                    .as_ref()
+                    .map(|cs| {
+                        cs.iter()
+                            .filter(|c| !c.status.contains("Up") && !c.names.contains("-infra"))
+                            .map(|c| {
+                                c.names
+                                    .strip_prefix(&format!("{}-", api.name))
+                                    .unwrap_or(&c.names)
+                                    .to_string()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                InstanceInfo {
+                    name: short_name,
+                    full_name: api.name,
+                    status: api.status,
+                    repo,
+                    task,
+                    title,
+                    mode,
+                    agent_healthy,
+                    created: Some(api.created),
+                    created_ts: None,
+                    git_state: None,
+                    workspace_path: None,
+                    last_git_refresh: None,
+                    agent_state,
+                    last_agent_refresh: None,
+                    api_password: None,
+                    api_port: None,
+                    gator_healthy,
+                    gator_scopes,
+                    last_activity_ts: api.last_active_ts,
+                    worker_healthy,
+                    degraded_containers,
+                }
             })
             .collect();
 
-        let filter = format!("{}*", POD_NAME_PREFIX);
-        let mut filters = HashMap::new();
-        filters.insert("name", vec![filter.as_str()]);
-
-        let options = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
-
-        let containers = self
-            .docker
-            .list_containers(Some(options))
-            .await
-            .context("Failed to list containers")?;
-
-        // Group containers by pod (using the pod label or name prefix)
-        let mut pod_containers: HashMap<String, Vec<ContainerSummary>> = HashMap::new();
-
-        for container in containers {
-            // Extract pod name from container name
-            // Container names look like: /devaipod-foo-workspace, /devaipod-foo-agent
-            if let Some(names) = &container.names {
-                for name in names {
-                    let name = name.trim_start_matches('/');
-                    if name.starts_with(POD_NAME_PREFIX) {
-                        // Extract the pod name (everything before -workspace, -agent, -infra)
-                        let pod_name = extract_pod_name(name);
-                        pod_containers
-                            .entry(pod_name.to_string())
-                            .or_default()
-                            .push(container.clone());
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Build instance info from grouped containers
-        let mut instances: Vec<InstanceInfo> = Vec::new();
-
-        for (full_name, containers) in pod_containers {
-            // Skip if this doesn't have a workspace container (e.g., orphaned gator containers)
-            if !is_valid_instance(&containers) {
-                continue;
-            }
-
-            let short_name = full_name
-                .strip_prefix(POD_NAME_PREFIX)
-                .unwrap_or(&full_name)
-                .to_string();
-
-            // Find the workspace container to extract labels
-            let workspace = containers.iter().find(|c| {
-                c.names
-                    .as_ref()
-                    .is_some_and(|n| n.iter().any(|name| name.ends_with("-workspace")))
-            });
-
-            // Extract labels from workspace container
-            let labels = workspace.and_then(|w| w.labels.as_ref());
-
-            // Filter by instance: skip pods that don't belong to this instance
-            if !labels_match_instance(labels) {
-                continue;
-            }
-
-            let repo = labels.and_then(|l| l.get("io.devaipod.repo")).cloned();
-            let task = labels.and_then(|l| l.get("io.devaipod.task")).cloned();
-            let title = labels.and_then(|l| l.get("io.devaipod.title")).cloned();
-            let mode = labels.and_then(|l| l.get("io.devaipod.mode")).cloned();
-
-            // Determine overall status
-            let running_count = containers
-                .iter()
-                .filter(|c| c.state.as_deref() == Some("running"))
-                .count();
-            let total = containers.len();
-
-            let status = if running_count == total && total > 0 {
-                "Running".to_string()
-            } else if running_count == 0 {
-                "Exited".to_string()
-            } else {
-                "Degraded".to_string()
-            };
-
-            // Check agent health (simplified - just check if agent container is running)
-            let agent_healthy = containers.iter().any(|c| {
-                c.names
-                    .as_ref()
-                    .is_some_and(|n| n.iter().any(|name| name.contains("-agent")))
-                    && c.state.as_deref() == Some("running")
-            });
-
-            // Get created time from workspace container
-            let created_ts = workspace.and_then(|w| w.created);
-            let created = created_ts.map(|ts| {
-                chrono::DateTime::from_timestamp(ts, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            });
-
-            // Extract workspace path from labels
-            let workspace_path = labels.and_then(|l| l.get("io.devaipod.workspace")).cloned();
-
-            // Restore git state and rate-limit timestamp from previous instance data
-            // Fall back to cache if no in-memory state exists
-            let (git_state, last_git_refresh) = old_git_data
-                .get(&short_name)
-                .cloned()
-                .or_else(|| {
-                    // Try loading from cache
-                    self.cache
-                        .as_ref()
-                        .and_then(|c| c.instances.get(&short_name))
-                        .map(|cached| (cached.git_state.clone(), None))
-                })
-                .unwrap_or((None, None));
-
-            // Restore agent state and rate-limit timestamp from previous instance data
-            // Default to Stopped if agent is not running, otherwise preserve or set Unknown
-            // Fall back to cache if no in-memory state exists
-            let (agent_state, last_agent_refresh) = if agent_healthy {
-                old_agent_data
-                    .get(&short_name)
-                    .cloned()
-                    .or_else(|| {
-                        // Try loading from cache
-                        self.cache
-                            .as_ref()
-                            .and_then(|c| c.instances.get(&short_name))
-                            .and_then(|cached| cached.agent_state.clone().map(|s| (s, None)))
-                    })
-                    .unwrap_or((
-                        AgentState {
-                            activity: AgentActivity::Unknown,
-                            ..Default::default()
-                        },
-                        None,
-                    ))
-            } else {
-                (
-                    AgentState {
-                        activity: AgentActivity::Stopped,
-                        ..Default::default()
-                    },
-                    None,
-                )
-            };
-
-            // Extract API password from labels (stored on workspace container)
-            let api_password = labels
-                .and_then(|l| l.get("io.devaipod.api-password"))
-                .cloned();
-
-            // Get published port from agent container's port mappings
-            let agent_container = containers.iter().find(|c| {
-                c.names
-                    .as_ref()
-                    .is_some_and(|n| n.iter().any(|name| name.ends_with("-agent")))
-            });
-            let api_port = agent_container.and_then(|c| {
-                c.ports.as_ref().and_then(|ports| {
-                    ports.iter().find_map(|p| {
-                        // Looking for the opencode port which is published to host
-                        if p.private_port == crate::pod::OPENCODE_PORT {
-                            p.public_port
-                        } else {
-                            None
-                        }
-                    })
-                })
-            });
-
-            // Check service-gator health
-            let gator_healthy = containers.iter().any(|c| {
-                c.names.as_ref().is_some_and(|n| {
-                    n.iter()
-                        .any(|name| name.ends_with("-gator") || name.ends_with("-service-gator"))
-                }) && c.state.as_deref() == Some("running")
-            });
-
-            // Get service-gator scopes from labels
-            let gator_scopes = labels
-                .and_then(|l| l.get("io.devaipod.service-gator"))
-                .cloned();
-
-            // Check worker container health (if orchestration is enabled)
-            let worker_healthy = containers.iter().any(|c| {
-                c.names
-                    .as_ref()
-                    .is_some_and(|n| n.iter().any(|name| name.ends_with("-worker")))
-                    && c.state.as_deref() == Some("running")
-            });
-
-            // Collect names of non-running containers (for degraded status display)
-            let degraded_containers: Vec<String> = containers
-                .iter()
-                .filter(|c| {
-                    c.state.as_deref() != Some("running")
-                        && !c
-                            .names
-                            .as_ref()
-                            .is_some_and(|n| n.iter().any(|name| name.ends_with("-infra")))
-                })
-                .filter_map(|c| {
-                    c.names.as_ref().and_then(|n| {
-                        n.first().map(|name| {
-                            let name = name.trim_start_matches('/');
-                            name.strip_prefix(&format!("{}-", full_name))
-                                .unwrap_or(name)
-                                .to_string()
-                        })
-                    })
-                })
-                .collect();
-
-            // Initialize last_activity_ts from agent state if available, otherwise from created_ts
-            let last_activity_ts = agent_state
-                .last_message_ts
-                .or(created_ts.map(|ts| ts * 1000)); // Convert created_ts (seconds) to milliseconds
-
-            instances.push(InstanceInfo {
-                name: short_name,
-                full_name,
-                status,
-                repo,
-                task,
-                title,
-                mode,
-                agent_healthy: Some(agent_healthy),
-                created,
-                created_ts,
-                git_state,
-                workspace_path,
-                last_git_refresh,
-                agent_state,
-                last_agent_refresh,
-                api_password,
-                api_port,
-                gator_healthy: Some(gator_healthy),
-                gator_scopes,
-                last_activity_ts,
-                worker_healthy: Some(worker_healthy),
-                degraded_containers,
-            });
-        }
-
-        // Sort by last activity time (most recently active first), with fallback to name for ties
+        // Sort by last activity time (most recently active first)
         instances.sort_by(|a, b| match (b.last_activity_ts, a.last_activity_ts) {
             (Some(b_ts), Some(a_ts)) => b_ts.cmp(&a_ts).then_with(|| a.name.cmp(&b.name)),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -713,11 +573,9 @@ impl App {
             (None, None) => a.name.cmp(&b.name),
         });
 
-        self.instances = instances;
+        self.all_instances = instances;
+        self.apply_filter();
         self.last_refresh = std::time::Instant::now();
-
-        // NOTE: Git state is fetched separately via refresh_git_states_background()
-        // to avoid blocking the initial display
 
         // Ensure selection is valid and within bounds
         if let Some(selected) = self.table_state.selected() {
@@ -733,6 +591,73 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Apply the current filter_text and inactive filter to all_instances.
+    fn apply_filter(&mut self) {
+        let candidates: Box<dyn Iterator<Item = &InstanceInfo>> = if self.filter_text.is_empty() {
+            Box::new(self.all_instances.iter())
+        } else {
+            let filter = self.filter_text.to_lowercase();
+            Box::new(self.all_instances.iter().filter(move |inst| {
+                inst.name.to_lowercase().contains(&filter)
+                    || inst
+                        .repo
+                        .as_deref()
+                        .is_some_and(|r| r.to_lowercase().contains(&filter))
+                    || inst
+                        .task
+                        .as_deref()
+                        .is_some_and(|t| t.to_lowercase().contains(&filter))
+            }))
+        };
+
+        self.instances = candidates
+            .filter(|inst| {
+                if self.show_inactive {
+                    true
+                } else {
+                    let s = inst.status.to_lowercase();
+                    s != "stopped" && s != "exited"
+                }
+            })
+            .cloned()
+            .collect();
+
+        // Re-order instances to match the grouped-by-repo display order so that
+        // up/down navigation walks the visual order instead of the underlying
+        // activity-time order.  Within each repo group the original (activity)
+        // order is preserved.
+        {
+            let mut repo_order: Vec<String> = Vec::new();
+            let mut groups: std::collections::HashMap<String, Vec<InstanceInfo>> =
+                std::collections::HashMap::new();
+            for inst in self.instances.drain(..) {
+                let key = inst.repo.clone().unwrap_or_default();
+                if !groups.contains_key(&key) {
+                    repo_order.push(key.clone());
+                }
+                groups.entry(key).or_default().push(inst);
+            }
+            for key in repo_order {
+                if let Some(group) = groups.remove(&key) {
+                    self.instances.extend(group);
+                }
+            }
+        }
+
+        // Keep selection in bounds
+        if let Some(selected) = self.table_state.selected() {
+            if selected >= self.instances.len() {
+                self.table_state.select(if self.instances.is_empty() {
+                    None
+                } else {
+                    Some(self.instances.len() - 1)
+                });
+            }
+        } else if !self.instances.is_empty() {
+            self.table_state.select(Some(0));
+        }
     }
 
     /// Move selection up
@@ -777,451 +702,13 @@ impl App {
             .selected()
             .and_then(|i| self.instances.get(i))
     }
-
-    /// Update and persist the cache with current instance state
-    fn update_cache(&mut self) {
-        let new_cache = build_cache(&self.instances);
-        save_state(&new_cache);
-        self.cache = Some(new_cache);
-    }
-}
-
-/// Fetch git state from a container by exec'ing git commands
-async fn fetch_git_state(
-    docker: &Docker,
-    container_name: &str,
-    workspace_path: &str,
-) -> Option<GitState> {
-    use bollard::exec::{CreateExecOptions, StartExecResults};
-    use futures_util::TryStreamExt;
-
-    // Helper to run a git command and get stdout
-    async fn git_exec(
-        docker: &Docker,
-        container: &str,
-        workdir: &str,
-        args: &[&str],
-    ) -> Option<String> {
-        let mut cmd = vec!["git", "-C", workdir];
-        cmd.extend(args);
-
-        let exec = docker
-            .create_exec(
-                container,
-                CreateExecOptions {
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    cmd: Some(cmd.iter().map(|s| s.to_string()).collect()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()?;
-
-        let output = docker.start_exec(&exec.id, None).await.ok()?;
-
-        if let StartExecResults::Attached { mut output, .. } = output {
-            let mut stdout = String::new();
-            while let Ok(Some(msg)) = output.try_next().await {
-                stdout.push_str(&msg.to_string());
-            }
-            Some(stdout.trim().to_string())
-        } else {
-            None
-        }
-    }
-
-    // Find the actual repo directory
-    // First, try to find directories in /workspaces
-    let repo_dir = {
-        // List directories in /workspaces
-        let ls_exec = docker
-            .create_exec(
-                container_name,
-                CreateExecOptions {
-                    attach_stdout: Some(true),
-                    cmd: Some(vec![
-                        "ls".to_string(),
-                        "-1".to_string(),
-                        "/workspaces".to_string(),
-                    ]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok();
-
-        let dirs: Vec<String> = if let Some(exec) = ls_exec {
-            match docker.start_exec(&exec.id, None).await {
-                Ok(StartExecResults::Attached { mut output, .. }) => {
-                    let mut stdout = String::new();
-                    while let Ok(Some(msg)) = output.try_next().await {
-                        stdout.push_str(&msg.to_string());
-                    }
-                    stdout
-                        .lines()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .collect()
-                }
-                _ => vec![],
-            }
-        } else {
-            vec![]
-        };
-
-        // Use the first directory found, or fall back to workspace_path
-        if let Some(first_dir) = dirs.first() {
-            format!("/workspaces/{}", first_dir)
-        } else if workspace_path != "/workspaces" {
-            workspace_path.to_string()
-        } else {
-            return None; // No workspace found
-        }
-    };
-
-    // Get current branch
-    let branch = git_exec(
-        docker,
-        container_name,
-        &repo_dir,
-        &["rev-parse", "--abbrev-ref", "HEAD"],
-    )
-    .await
-    .filter(|s| !s.is_empty() && s != "HEAD");
-
-    // Check for uncommitted changes (dirty state)
-    let status_output = git_exec(
-        docker,
-        container_name,
-        &repo_dir,
-        &["status", "--porcelain"],
-    )
-    .await;
-    let dirty = status_output.as_ref().is_some_and(|s| !s.is_empty());
-
-    // Get ahead/behind counts - use tracking branch or fall back to origin/main
-    let (ahead, behind) = if let Some(ref branch_name) = branch {
-        // Use @{upstream} which git resolves to the tracking branch, or try origin/main
-        let rev_list = git_exec(
-            docker,
-            container_name,
-            &repo_dir,
-            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-        )
-        .await
-        .filter(|s| !s.contains("fatal") && !s.contains("error"));
-
-        // Fall back to origin/main if no upstream configured
-        let counts = if rev_list.is_some() {
-            rev_list
-        } else {
-            git_exec(
-                docker,
-                container_name,
-                &repo_dir,
-                &[
-                    "rev-list",
-                    "--left-right",
-                    "--count",
-                    &format!("{}...origin/main", branch_name),
-                ],
-            )
-            .await
-            .filter(|s| !s.contains("fatal") && !s.contains("error"))
-        };
-
-        if let Some(counts) = counts {
-            let parts: Vec<&str> = counts.split_whitespace().collect();
-            if parts.len() == 2 {
-                let a = parts[0].parse().unwrap_or(0);
-                let b = parts[1].parse().unwrap_or(0);
-                (a, b)
-            } else {
-                (0, 0)
-            }
-        } else {
-            (0, 0)
-        }
-    } else {
-        (0, 0)
-    };
-
-    let mut state = GitState {
-        branch,
-        dirty,
-        ahead,
-        behind,
-        summary: String::new(),
-    };
-    state.compute_summary();
-
-    Some(state)
-}
-
-/// Minimum interval between agent state refreshes for a single instance.
-const AGENT_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(3);
-
-/// Maximum number of output lines to keep per instance
-const MAX_OUTPUT_LINES: usize = 3;
-
-/// Extract text content from message parts, truncating long lines
-fn extract_text_from_parts(parts: &[serde_json::Value], max_lines: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    for part in parts {
-        let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        match part_type {
-            "text" => {
-                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                    // Take last few lines of text, truncate each line
-                    for line in text.lines().rev().take(max_lines) {
-                        let truncated = if line.len() > 80 {
-                            format!("{}...", &line[..77])
-                        } else {
-                            line.to_string()
-                        };
-                        if !truncated.trim().is_empty() {
-                            lines.push(truncated);
-                        }
-                        if lines.len() >= max_lines {
-                            break;
-                        }
-                    }
-                }
-            }
-            "tool" => {
-                // Extract tool name and status
-                if let Some(tool_name) = part.get("name").and_then(|n| n.as_str()) {
-                    let status = part
-                        .get("state")
-                        .and_then(|s| s.get("status"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("running");
-                    lines.push(format!("→ {}: {}", tool_name, status));
-                }
-            }
-            _ => {}
-        }
-
-        if lines.len() >= max_lines {
-            break;
-        }
-    }
-
-    lines.reverse(); // Put in chronological order
-    lines
-}
-
-/// Derive agent status (busy/idle) from session messages.
-///
-/// This mirrors the logic from workspace_monitor.py's derive_status_from_messages().
-/// We check the last assistant message for:
-/// - time.completed: if absent, agent is still processing
-/// - finish: if "tool-calls", agent will continue (but may be between calls)
-/// - parts with type="tool" and state.status != "completed": tool in progress
-fn derive_agent_state_from_messages(messages: &[serde_json::Value]) -> AgentState {
-    if messages.is_empty() {
-        return AgentState {
-            activity: AgentActivity::Unknown,
-            ..Default::default()
-        };
-    }
-
-    // Find the last assistant message
-    let last_assistant = messages.iter().rev().find(|msg| {
-        msg.get("info")
-            .and_then(|i| i.get("role"))
-            .and_then(|r| r.as_str())
-            == Some("assistant")
-    });
-
-    let Some(last_assistant) = last_assistant else {
-        return AgentState {
-            activity: AgentActivity::Unknown,
-            ..Default::default()
-        };
-    };
-
-    let info = match last_assistant.get("info") {
-        Some(i) => i,
-        None => {
-            return AgentState {
-                activity: AgentActivity::Unknown,
-                ..Default::default()
-            };
-        }
-    };
-
-    // Extract recent output from parts
-    let parts = last_assistant
-        .get("parts")
-        .and_then(|p| p.as_array())
-        .map(|arr| arr.as_slice())
-        .unwrap_or(&[]);
-    let recent_output = extract_text_from_parts(parts, MAX_OUTPUT_LINES);
-
-    // Extract current tool if any is running
-    let current_tool = parts.iter().find_map(|part| {
-        if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
-            let status = part
-                .get("state")
-                .and_then(|s| s.get("status"))
-                .and_then(|s| s.as_str());
-            if status != Some("completed") && status != Some("error") {
-                return part.get("name").and_then(|n| n.as_str()).map(String::from);
-            }
-        }
-        None
-    });
-
-    // Build status line from first text part
-    let status_line = parts.iter().find_map(|part| {
-        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-            part.get("text").and_then(|t| t.as_str()).map(|text| {
-                let first_line = text.lines().next().unwrap_or("");
-                truncate_with_ellipsis(first_line, 60)
-            })
-        } else {
-            None
-        }
-    });
-
-    // Determine activity level
-    let activity = if info.get("time").and_then(|t| t.get("completed")).is_none() {
-        AgentActivity::Working
-    } else {
-        // Check if there are any incomplete tool calls
-        let has_incomplete_tool = parts.iter().any(|part| {
-            if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
-                let status = part
-                    .get("state")
-                    .and_then(|s| s.get("status"))
-                    .and_then(|s| s.as_str());
-                status != Some("completed") && status != Some("error")
-            } else {
-                false
-            }
-        });
-
-        if has_incomplete_tool {
-            AgentActivity::Working
-        } else {
-            let finish = info.get("finish").and_then(|f| f.as_str()).unwrap_or("");
-            if finish == "tool-calls" {
-                AgentActivity::Working
-            } else {
-                AgentActivity::Idle
-            }
-        }
-    };
-
-    // Extract the most recent message timestamp from all messages
-    // We look for the latest time.completed or time.created across all messages
-    let last_message_ts = messages
-        .iter()
-        .filter_map(|msg| {
-            msg.get("info").and_then(|info| {
-                info.get("time").and_then(|time| {
-                    // Prefer completed time, fall back to created time
-                    time.get("completed")
-                        .or_else(|| time.get("created"))
-                        .and_then(|t| t.as_i64())
-                })
-            })
-        })
-        .max();
-
-    AgentState {
-        activity,
-        recent_output,
-        current_tool,
-        status_line,
-        last_message_ts,
-    }
-}
-
-/// Fetch agent state by querying the opencode API
-async fn fetch_agent_state(api_port: u16, api_password: &str) -> AgentState {
-    let unknown = AgentState {
-        activity: AgentActivity::Unknown,
-        ..Default::default()
-    };
-
-    // Build HTTP client with timeout
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return unknown,
-    };
-
-    let base_url = format!("http://127.0.0.1:{}", api_port);
-
-    // First, get the list of sessions
-    let sessions_url = format!("{}/session", base_url);
-    let sessions_resp = match client
-        .get(&sessions_url)
-        .basic_auth("opencode", Some(api_password))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return unknown,
-    };
-
-    let sessions: Vec<serde_json::Value> = match sessions_resp.json().await {
-        Ok(s) => s,
-        Err(_) => return unknown,
-    };
-
-    if sessions.is_empty() {
-        // No sessions yet - agent is idle/waiting for input
-        return AgentState {
-            activity: AgentActivity::Idle,
-            status_line: Some("Waiting for input...".to_string()),
-            ..Default::default()
-        };
-    }
-
-    // Find the root session (no parent)
-    let root_session = sessions.iter().find(|s| crate::session_is_root(s));
-
-    let Some(root_session) = root_session else {
-        return unknown;
-    };
-
-    let session_id = match root_session.get("id").and_then(|id| id.as_str()) {
-        Some(id) => id,
-        None => return unknown,
-    };
-
-    // Fetch recent messages from the session (more messages for richer output)
-    let messages_url = format!("{}/session/{}/message?limit=5", base_url, session_id);
-    let messages_resp = match client
-        .get(&messages_url)
-        .basic_auth("opencode", Some(api_password))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return unknown,
-    };
-
-    let messages: Vec<serde_json::Value> = match messages_resp.json().await {
-        Ok(m) => m,
-        Err(_) => return unknown,
-    };
-
-    derive_agent_state_from_messages(&messages)
 }
 
 /// Truncate a string to a maximum number of characters, adding "..." if truncated.
 ///
 /// This correctly handles multi-byte UTF-8 characters by counting characters,
 /// not bytes.
+#[cfg(test)]
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -1229,35 +716,6 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
         format!("{truncated}...")
     }
-}
-
-/// Extract the pod name from a container name
-/// e.g., "devaipod-foo-workspace" -> "devaipod-foo"
-fn extract_pod_name(container_name: &str) -> &str {
-    // Order matters - check longer suffixes first
-    for suffix in &[
-        "-service-gator",
-        "-workspace",
-        "-worker",
-        "-agent",
-        "-infra",
-        "-gator",
-        "-proxy",
-    ] {
-        if let Some(prefix) = container_name.strip_suffix(suffix) {
-            return prefix;
-        }
-    }
-    container_name
-}
-
-/// Check if this is a valid devaipod instance (has workspace container)
-fn is_valid_instance(containers: &[ContainerSummary]) -> bool {
-    containers.iter().any(|c| {
-        c.names
-            .as_ref()
-            .is_some_and(|n| n.iter().any(|name| name.ends_with("-workspace")))
-    })
 }
 
 /// Setup terminal for TUI mode with optional keyboard enhancement.
@@ -1298,7 +756,7 @@ fn restore_terminal(
 }
 
 /// Run the TUI application
-pub async fn run() -> Result<()> {
+pub async fn run(show_all: bool) -> Result<()> {
     // Check if we're running in a terminal
     if !std::io::stdout().is_terminal() {
         color_eyre::eyre::bail!(
@@ -1309,7 +767,7 @@ pub async fn run() -> Result<()> {
     let (mut terminal, keyboard_enhancement) = setup_terminal()?;
 
     // Create app and run
-    let app = App::new().await?;
+    let app = App::new(show_all).await?;
     let result = run_app(&mut terminal, app).await;
 
     // Restore terminal
@@ -1636,181 +1094,22 @@ fn render_launch_prompt(frame: &mut ratatui::Frame, app: &LaunchPromptApp) {
     frame.render_widget(footer, chunks[4]);
 }
 
-/// Message for git state updates from background task
-struct GitStateUpdate {
-    instance_name: String,
-    git_state: Option<GitState>,
-}
-
-/// Spawn background tasks to fetch git state for all running instances.
-/// Rate-limited per instance: only spawns a refresh if >GIT_REFRESH_RATE_LIMIT
-/// has passed since the last successful refresh for that instance.
-fn spawn_git_refresh(
-    docker: &Docker,
-    instances: &[InstanceInfo],
-    tx: mpsc::Sender<GitStateUpdate>,
-) {
-    let now = std::time::Instant::now();
-
-    for instance in instances {
-        if instance.status != "Running" {
-            continue;
-        }
-
-        // Rate-limit: skip if we refreshed this instance recently
-        if let Some(last_refresh) = instance.last_git_refresh
-            && now.duration_since(last_refresh) < GIT_REFRESH_RATE_LIMIT
-        {
-            continue;
-        }
-
-        let docker = docker.clone();
-        let tx = tx.clone();
-        let instance_name = instance.name.clone();
-        let full_name = instance.full_name.clone();
-        let workspace_path = instance
-            .workspace_path
-            .clone()
-            .unwrap_or_else(|| "/workspaces".to_string());
-
-        tokio::spawn(async move {
-            let container_name = format!("{}-workspace", full_name);
-            let git_state = fetch_git_state(&docker, &container_name, &workspace_path).await;
-            let _ = tx
-                .send(GitStateUpdate {
-                    instance_name,
-                    git_state,
-                })
-                .await;
-        });
-    }
-}
-
-/// Message for agent state updates from background task
-struct AgentStateUpdate {
-    instance_name: String,
-    agent_state: AgentState,
-}
-
-/// Spawn background tasks to fetch agent state for all running instances.
-/// Rate-limited per instance: only spawns a refresh if >AGENT_REFRESH_RATE_LIMIT
-/// has passed since the last successful refresh for that instance.
-fn spawn_agent_refresh(instances: &[InstanceInfo], tx: mpsc::Sender<AgentStateUpdate>) {
-    let now = std::time::Instant::now();
-
-    for instance in instances {
-        // Only fetch for running instances with valid API credentials
-        if instance.status != "Running" {
-            continue;
-        }
-
-        // Skip if agent is not healthy (not running)
-        if instance.agent_healthy != Some(true) {
-            continue;
-        }
-
-        // Need both port and password to query the API
-        let (Some(api_port), Some(api_password)) = (instance.api_port, &instance.api_password)
-        else {
-            continue;
-        };
-
-        // Rate-limit: skip if we refreshed this instance recently
-        if let Some(last_refresh) = instance.last_agent_refresh
-            && now.duration_since(last_refresh) < AGENT_REFRESH_RATE_LIMIT
-        {
-            continue;
-        }
-
-        let tx = tx.clone();
-        let instance_name = instance.name.clone();
-        let api_password = api_password.clone();
-
-        tokio::spawn(async move {
-            let agent_state = fetch_agent_state(api_port, &api_password).await;
-            let _ = tx
-                .send(AgentStateUpdate {
-                    instance_name,
-                    agent_state,
-                })
-                .await;
-        });
-    }
-}
-
 /// Main event loop
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
-    let mut refresh_interval = interval(Duration::from_secs(10));
+    // Refresh every 5 seconds, matching the web frontend's POD_POLL_MS
+    let mut refresh_interval = interval(Duration::from_secs(5));
 
-    // Channel for receiving git state updates from background tasks
-    let (git_tx, mut git_rx) = mpsc::channel::<GitStateUpdate>(32);
-
-    // Channel for receiving agent state updates from background tasks
-    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentStateUpdate>(32);
-
-    // Spawn initial git state fetch
-    spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-
-    // Spawn initial agent state fetch
-    spawn_agent_refresh(&app.instances, agent_tx.clone());
-
-    // Use async event stream instead of blocking poll
     let mut event_stream = EventStream::new();
 
-    // Agent state refresh runs more frequently than git state
-    let mut agent_refresh_interval = interval(Duration::from_secs(3));
-
     loop {
-        // Draw the UI
         terminal.draw(|f| ui(f, &mut app))?;
 
-        // Handle events with proper async - no blocking!
         tokio::select! {
-            // Receive git state updates from background
-            Some(update) = git_rx.recv() => {
-                if let Some(instance) = app.instances.iter_mut().find(|i| i.name == update.instance_name) {
-                    instance.git_state = update.git_state;
-                    // Update timestamp to enforce rate-limiting on subsequent refresh attempts
-                    instance.last_git_refresh = Some(std::time::Instant::now());
-                }
-                // Persist updated state to cache
-                app.update_cache();
-            }
-            // Receive agent state updates from background
-            Some(update) = agent_rx.recv() => {
-                if let Some(instance) = app.instances.iter_mut().find(|i| i.name == update.instance_name) {
-                    // Update last_activity_ts from agent's last message timestamp
-                    if let Some(ts) = update.agent_state.last_message_ts {
-                        instance.last_activity_ts = Some(ts);
-                    }
-                    instance.agent_state = update.agent_state;
-                    // Update timestamp to enforce rate-limiting on subsequent refresh attempts
-                    instance.last_agent_refresh = Some(std::time::Instant::now());
-                }
-                // Persist updated state to cache
-                app.update_cache();
-                // Note: We intentionally don't re-sort here. Re-sorting on every agent
-                // update would cause items to jump around constantly as agents work,
-                // which is jarring UX. The periodic full refresh handles re-sorting.
-            }
-            // Periodic agent state refresh (more frequent)
-            _ = agent_refresh_interval.tick() => {
-                spawn_agent_refresh(&app.instances, agent_tx.clone());
-            }
             _ = refresh_interval.tick() => {
-                match app.refresh_instances().await {
-                    Err(e) => {
-                        app.status_message = Some(format!("Refresh error: {}", e));
-                    }
-                    Ok(()) => {
-                        // Spawn background git refresh after instance refresh
-                        spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                        // Also refresh agent state
-                        spawn_agent_refresh(&app.instances, agent_tx.clone());
-                    }
+                if let Err(e) = app.refresh_from_api().await {
+                    app.status_message = Some(format!("Refresh error: {}", e));
                 }
             }
-            // Async event stream - truly non-blocking
             maybe_event = event_stream.next() => {
                 if let Some(Ok(event)) = maybe_event
                     && let Some(action) = handle_event(&mut app, event) {
@@ -1818,31 +1117,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                             Action::Quit => return Ok(()),
                             Action::Refresh => {
                                 app.status_message = Some("Refreshing...".to_string());
-                                match app.refresh_instances().await {
+                                match app.refresh_from_api().await {
                                     Err(e) => {
                                         app.status_message = Some(format!("Refresh error: {}", e));
                                     }
                                     Ok(()) => {
-                                        spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                        spawn_agent_refresh(&app.instances, agent_tx.clone());
                                         app.status_message = Some("Refreshed".to_string());
                                     }
                                 }
                             }
                             Action::Attach(name) => {
-                                // Run attach in subprocess (opens tmux with agent + shell)
-                                // Use -- to prevent names starting with - being parsed as options
                                 run_subprocess(terminal, &["attach", "--", &name]).await?;
-                                // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after returning from subprocess
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                let _ = app.refresh_from_api().await;
                             }
                             Action::Delete(names) => {
-                                // Delete instances synchronously for now
                                 let count = names.len();
                                 app.status_message = Some(format!(
                                     "Deleting {} instance{}...",
@@ -1853,19 +1142,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
 
                                 let mut errors = Vec::new();
                                 for name in &names {
-                                    // Use -- to prevent names starting with - being parsed as options
                                     if let Err(e) = run_subprocess_silent(&["delete", "--force", "--", name]).await {
                                         errors.push(format!("{}: {}", name, e));
                                     }
                                 }
 
-                                // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after deletions
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                let _ = app.refresh_from_api().await;
 
                                 if errors.is_empty() {
                                     app.status_message = Some(format!(
@@ -1878,7 +1161,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 }
                             }
                             Action::ToggleStartStop(name) => {
-                                // Check instance status to determine whether to start or stop
                                 let is_running = app
                                     .instances
                                     .iter()
@@ -1888,8 +1170,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 if is_running {
                                     app.status_message = Some(format!("Stopping {}...", name));
                                     terminal.draw(|f| ui(f, &mut app))?;
-
-                                    // Use -- to prevent names starting with - being parsed as options
                                     match run_subprocess_silent(&["stop", "--", &name]).await {
                                         Ok(()) => {
                                             app.status_message = Some(format!("Stopped {}", name));
@@ -1902,8 +1182,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                 } else {
                                     app.status_message = Some(format!("Starting {}...", name));
                                     terminal.draw(|f| ui(f, &mut app))?;
-
-                                    // Use -- to prevent names starting with - being parsed as options
                                     match run_subprocess_silent(&["start", "--", &name]).await {
                                         Ok(()) => {
                                             app.status_message = Some(format!("Started {}", name));
@@ -1915,96 +1193,108 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App
                                     }
                                 }
 
-                                // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after start/stop
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                let _ = app.refresh_from_api().await;
                             }
                             Action::ExecAgent(name) => {
-                                // Exec into agent container
-                                // Use -- to prevent names starting with - being parsed as options
                                 run_subprocess(terminal, &["exec", "--", &name]).await?;
-                                // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after returning from subprocess
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                let _ = app.refresh_from_api().await;
                             }
                             Action::ExecWorkspace(name) => {
-                                // Exec into workspace container
-                                // Use -- to prevent names starting with - being parsed as options
                                 run_subprocess(terminal, &["exec", "-W", "--", &name]).await?;
-                                // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after returning from subprocess
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                let _ = app.refresh_from_api().await;
                             }
                             Action::AttachWorker(name) => {
-                                // Attach to worker agent
-                                // Use -- to prevent names starting with - being parsed as options
                                 run_subprocess(terminal, &["attach", "--worker", "--", &name]).await?;
-                                // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after returning from subprocess
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                let _ = app.refresh_from_api().await;
                             }
                             Action::ExecWorker(name) => {
-                                // Exec into worker container
-                                // Use -- to prevent names starting with - being parsed as options
                                 run_subprocess(terminal, &["exec", "--worker", "--", &name]).await?;
-                                // Reset intervals to prevent accumulated ticks from firing
                                 refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after returning from subprocess
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
+                                let _ = app.refresh_from_api().await;
                             }
                             Action::Launch { urls, task } => {
-                                // Launch instances for each URL in parallel
-                                let count = urls.len();
-                                app.status_message = Some(format!(
-                                    "Launching {} instance{}...",
-                                    count,
-                                    if count == 1 { "" } else { "s" }
-                                ));
-                                terminal.draw(|f| ui(f, &mut app))?;
+                                if urls.is_empty() {
+                                    // Scratch workspace — no source URL
+                                    app.status_message =
+                                        Some("Launching scratch workspace...".to_string());
+                                    terminal.draw(|f| ui(f, &mut app))?;
 
-                                let mut errors = Vec::new();
-                                for url in &urls {
-                                    if let Err(e) = run_subprocess_silent(&["run", url, "-c", &task]).await {
-                                        errors.push(format!("{}: {}", url, e));
+                                    if let Err(e) =
+                                        run_subprocess_silent(&["run", "-c", &task]).await
+                                    {
+                                        app.status_message =
+                                            Some(format!("Error: {}", e));
+                                    } else {
+                                        app.status_message =
+                                            Some("Launched scratch workspace".to_string());
                                     }
-                                }
-
-                                // Reset intervals to prevent accumulated ticks from firing
-                                refresh_interval.reset();
-                                agent_refresh_interval.reset();
-                                // Refresh after launches
-                                let _ = app.refresh_instances().await;
-                                spawn_git_refresh(&app.docker, &app.instances, git_tx.clone());
-                                spawn_agent_refresh(&app.instances, agent_tx.clone());
-
-                                if errors.is_empty() {
+                                } else {
+                                    let count = urls.len();
                                     app.status_message = Some(format!(
-                                        "Launched {} instance{}",
+                                        "Launching {} instance{}...",
                                         count,
                                         if count == 1 { "" } else { "s" }
                                     ));
-                                } else {
-                                    app.status_message = Some(format!("Errors: {}", errors.join(", ")));
+                                    terminal.draw(|f| ui(f, &mut app))?;
+
+                                    let mut errors = Vec::new();
+                                    for url in &urls {
+                                        if let Err(e) =
+                                            run_subprocess_silent(&["run", url, "-c", &task]).await
+                                        {
+                                            errors.push(format!("{}: {}", url, e));
+                                        }
+                                    }
+
+                                    if errors.is_empty() {
+                                        app.status_message = Some(format!(
+                                            "Launched {} instance{}",
+                                            count,
+                                            if count == 1 { "" } else { "s" }
+                                        ));
+                                    } else {
+                                        app.status_message =
+                                            Some(format!("Errors: {}", errors.join(", ")));
+                                    }
                                 }
+
+                                refresh_interval.reset();
+                                let _ = app.refresh_from_api().await;
+                            }
+                            Action::Advisor => {
+                                run_subprocess(terminal, &["advisor"]).await?;
+                                refresh_interval.reset();
+                                let _ = app.refresh_from_api().await;
+                            }
+                            Action::Review(name) => {
+                                run_subprocess(terminal, &["review", &name]).await?;
+                                refresh_interval.reset();
+                                let _ = app.refresh_from_api().await;
+                            }
+                            Action::Rebuild(name) => {
+                                app.status_message =
+                                    Some(format!("Rebuilding {}...", name));
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                match run_subprocess_silent(&["rebuild", "--", &name])
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        app.status_message =
+                                            Some(format!("Rebuilt {}", name));
+                                    }
+                                    Err(e) => {
+                                        app.status_message = Some(format!(
+                                            "Failed to rebuild {}: {}",
+                                            name, e
+                                        ));
+                                    }
+                                }
+                                refresh_interval.reset();
+                                let _ = app.refresh_from_api().await;
                             }
                         }
                     }
@@ -2022,6 +1312,7 @@ fn handle_event(app: &mut App, event: Event) -> Option<Action> {
             TuiMode::DeleteConfirm => handle_delete_confirm_mode(app, key.code),
             TuiMode::Launch => handle_launch_mode(app, key),
             TuiMode::ContainerMenu => handle_container_menu_mode(app, key.code),
+            TuiMode::Filter => handle_filter_mode(app, key.code),
         },
         _ => None,
     }
@@ -2094,11 +1385,40 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
             }
         }
         KeyCode::Char('L') => {
-            // Enter launch mode
+            // Enter launch mode, pre-filling source with "." when in a git repo
             app.mode = TuiMode::Launch;
-            app.launch_input = LaunchInput::default();
+            app.launch_input = LaunchInput {
+                urls: if app.in_git_repo {
+                    ".".to_string()
+                } else {
+                    String::new()
+                },
+                ..LaunchInput::default()
+            };
             app.status_message = None;
             None
+        }
+        KeyCode::Char('A') => {
+            // Launch/attach the advisor
+            Some(Action::Advisor)
+        }
+        KeyCode::Char('R') => {
+            // Open review TUI for selected instance
+            if let Some(instance) = app.selected_instance() {
+                Some(Action::Review(instance.name.clone()))
+            } else {
+                app.status_message = Some("No instance selected".to_string());
+                None
+            }
+        }
+        KeyCode::Char('B') => {
+            // Rebuild (recreate) selected instance
+            if let Some(instance) = app.selected_instance() {
+                Some(Action::Rebuild(instance.name.clone()))
+            } else {
+                app.status_message = Some("No instance selected".to_string());
+                None
+            }
         }
         KeyCode::Right | KeyCode::Char('l') => {
             // Open container access menu
@@ -2113,6 +1433,48 @@ fn handle_normal_mode(app: &mut App, code: KeyCode) -> Option<Action> {
             } else {
                 app.status_message = Some("No instance selected".to_string());
             }
+            None
+        }
+        KeyCode::Char('i') => {
+            // Toggle inactive pod visibility
+            app.show_inactive = !app.show_inactive;
+            app.apply_filter();
+            app.status_message = Some(if app.show_inactive {
+                "Showing all pods (including inactive)".to_string()
+            } else {
+                "Hiding inactive pods".to_string()
+            });
+            None
+        }
+        KeyCode::Char('/') => {
+            // Enter filter mode
+            app.mode = TuiMode::Filter;
+            app.status_message = None;
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Handle key events in filter mode
+fn handle_filter_mode(app: &mut App, code: KeyCode) -> Option<Action> {
+    match code {
+        KeyCode::Esc => {
+            app.mode = TuiMode::Normal;
+            None
+        }
+        KeyCode::Enter => {
+            app.mode = TuiMode::Normal;
+            None
+        }
+        KeyCode::Backspace => {
+            app.filter_text.pop();
+            app.apply_filter();
+            None
+        }
+        KeyCode::Char(c) => {
+            app.filter_text.push(c);
+            app.apply_filter();
             None
         }
         _ => None,
@@ -2281,15 +1643,12 @@ fn try_submit_launch(app: &mut App) -> Option<Action> {
 
     let task = app.launch_input.task.trim().to_string();
 
-    if urls.is_empty() {
-        app.status_message = Some("Enter at least one URL".to_string());
-        app.launch_input.active_field = LaunchField::Urls;
-        None
-    } else if task.is_empty() {
+    if task.is_empty() {
         app.status_message = Some("Enter a task".to_string());
         app.launch_input.active_field = LaunchField::Task;
         None
     } else {
+        // URLs are optional — an empty list creates a scratch workspace
         app.mode = TuiMode::Normal;
         app.launch_input = LaunchInput::default();
         Some(Action::Launch { urls, task })
@@ -2456,20 +1815,34 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     .split(area);
 
     // Header
-    let header = Paragraph::new(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(" devaipod ", Style::default().fg(Color::Cyan).bold()),
         Span::raw("│ "),
         Span::styled(
             format!("{} instances", app.instances.len()),
             Style::default().fg(Color::Green),
         ),
-        Span::raw(" │ Last refresh: "),
-        Span::styled(
-            format!("{}s ago", app.last_refresh.elapsed().as_secs()),
-            Style::default().fg(Color::Yellow),
-        ),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title(" Dashboard "));
+    ];
+    if !app.filter_text.is_empty() {
+        header_spans.push(Span::raw(" │ /"));
+        header_spans.push(Span::styled(
+            app.filter_text.clone(),
+            Style::default().fg(Color::Magenta),
+        ));
+        if app.mode == TuiMode::Filter {
+            header_spans.push(Span::styled("█", Style::default().fg(Color::Magenta)));
+        }
+    } else if app.mode == TuiMode::Filter {
+        header_spans.push(Span::raw(" │ /"));
+        header_spans.push(Span::styled("█", Style::default().fg(Color::Magenta)));
+    }
+    header_spans.push(Span::raw(" │ Last refresh: "));
+    header_spans.push(Span::styled(
+        format!("{}s ago", app.last_refresh.elapsed().as_secs()),
+        Style::default().fg(Color::Yellow),
+    ));
+    let header = Paragraph::new(Line::from(header_spans))
+        .block(Block::default().borders(Borders::ALL).title(" Dashboard "));
     frame.render_widget(header, chunks[0]);
 
     // Instance table
@@ -2485,7 +1858,7 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     // Footer with help and status (mode-dependent)
     let (help_base, footer_style) = match app.mode {
         TuiMode::Normal => (
-            " q: Quit │ j/k: Nav │ a/Enter: Attach │ →/l: Menu │ e: Exec │ S: Start/Stop │ d: Del │ L: Launch │ r: Refresh",
+            " q: Quit │ j/k: Nav │ /: Filter │ i: Inactive │ a: Attach │ →: Menu │ e: Exec │ S: Stop │ B: Rebuild │ d: Del │ L: Launch │ A: Advisor │ r: Refresh",
             Style::default().fg(Color::DarkGray),
         ),
         TuiMode::DeleteSelect => (
@@ -2503,6 +1876,10 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
         TuiMode::ContainerMenu => (
             " j/k: Navigate │ 1-4: Quick select │ Enter: Confirm │ Esc/←: Cancel",
             Style::default().fg(Color::Cyan),
+        ),
+        TuiMode::Filter => (
+            " Type to filter │ Enter: Apply │ Esc: Cancel",
+            Style::default().fg(Color::Magenta),
         ),
     };
     let help_text = format!("{}{}", help_base, status);
@@ -3023,50 +2400,104 @@ fn render_instance_card(
     lines
 }
 
-/// Render instances as cards (multi-line per instance)
+/// Render instances as cards grouped by repository
 fn render_table(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let in_delete_mode = matches!(app.mode, TuiMode::DeleteSelect | TuiMode::DeleteConfirm);
     let selected_idx = app.table_state.selected();
     let selected_for_delete = &app.selected_for_delete;
 
-    // Build card content for all instances
+    // Group instances by repo, preserving instance order within each group
+    let mut repo_order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, inst) in app.instances.iter().enumerate() {
+        let key = inst.repo.clone().unwrap_or_default();
+        if !groups.contains_key(&key) {
+            repo_order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(idx);
+    }
+    let multiple_repos = repo_order.len() > 1 || repo_order.first().is_some_and(|k| !k.is_empty());
+
+    // Build lines with repo group headers and instance cards.
+    // Track which line range corresponds to the selected card for scrolling.
     let mut all_lines: Vec<Line> = Vec::new();
+    let mut selected_line_start: usize = 0;
+    let mut card_count: usize = 0;
 
-    for (idx, instance) in app.instances.iter().enumerate() {
-        let is_selected = selected_idx == Some(idx);
-        let is_marked = selected_for_delete.contains(&instance.name);
+    for (group_idx, repo_key) in repo_order.iter().enumerate() {
+        let indices = &groups[repo_key];
 
-        let card_lines =
-            render_instance_card(instance, is_selected, is_marked, in_delete_mode, area.width);
-
-        // Add separator before card (except first)
-        if idx > 0 {
+        // Repo header line
+        if multiple_repos {
+            if group_idx > 0 {
+                all_lines.push(Line::from(""));
+            }
+            let active = indices
+                .iter()
+                .filter(|&&i| app.instances[i].status.to_lowercase() == "running")
+                .count();
+            let label = if repo_key.is_empty() {
+                "(no repo)".to_string()
+            } else {
+                repo_key.clone()
+            };
+            let header = if active > 0 {
+                format!(" {} ({} active)", label, active)
+            } else {
+                format!(" {}", label)
+            };
             all_lines.push(Line::from(Span::styled(
-                "─".repeat(area.width.saturating_sub(2) as usize),
-                Style::default().fg(Color::DarkGray),
+                header,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
         }
 
-        all_lines.extend(card_lines);
+        for &idx in indices {
+            let instance = &app.instances[idx];
+            let is_selected = selected_idx == Some(idx);
+            let is_marked = selected_for_delete.contains(&instance.name);
+
+            // Record start line for scroll calculation
+            if is_selected {
+                selected_line_start = all_lines.len();
+            }
+
+            // Separator before card (thin line between cards within a group)
+            if card_count > 0 {
+                all_lines.push(Line::from(Span::styled(
+                    "─".repeat(area.width.saturating_sub(2) as usize),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            let card_lines =
+                render_instance_card(instance, is_selected, is_marked, in_delete_mode, area.width);
+            all_lines.extend(card_lines);
+            card_count += 1;
+        }
     }
 
     // Calculate scroll offset to keep selected item visible
-    let visible_height = area.height.saturating_sub(2) as usize; // Account for borders
-    let lines_per_card = CARD_HEIGHT as usize + 1; // +1 for separator
-    let selected_card_start = selected_idx.unwrap_or(0) * lines_per_card;
-
-    // Simple scroll: show from selected card if it would be off-screen
-    let scroll_offset = if selected_card_start >= visible_height {
-        selected_card_start.saturating_sub(visible_height / 2)
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let scroll_offset = if selected_line_start >= visible_height {
+        selected_line_start.saturating_sub(visible_height / 2)
     } else {
         0
     };
 
-    // Apply scroll offset
     let visible_lines: Vec<Line> = all_lines.into_iter().skip(scroll_offset).collect();
 
-    let paragraph = Paragraph::new(visible_lines)
-        .block(Block::default().borders(Borders::ALL).title(" Instances "));
+    let inactive_indicator = if app.show_inactive {
+        " [+inactive]"
+    } else {
+        ""
+    };
+    let title = format!(" Instances{} ", inactive_indicator);
+    let paragraph =
+        Paragraph::new(visible_lines).block(Block::default().borders(Borders::ALL).title(title));
 
     frame.render_widget(paragraph, area);
 }
@@ -3322,21 +2753,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_pod_name() {
-        assert_eq!(extract_pod_name("devaipod-foo-workspace"), "devaipod-foo");
-        assert_eq!(extract_pod_name("devaipod-foo-agent"), "devaipod-foo");
-        assert_eq!(
-            extract_pod_name("devaipod-foo-bar-workspace"),
-            "devaipod-foo-bar"
-        );
-        assert_eq!(
-            extract_pod_name("devaipod-foo-service-gator"),
-            "devaipod-foo"
-        );
-        assert_eq!(extract_pod_name("unknown-container"), "unknown-container");
-    }
-
-    #[test]
     fn test_navigation_next() {
         let mut app = create_test_app_for_ui();
         app.instances = sample_instances();
@@ -3436,112 +2852,5 @@ mod tests {
         app.table_state.select(Some(1));
         let selected = app.selected_instance().unwrap();
         assert_eq!(selected.name, "otherrepo-def456");
-    }
-
-    #[test]
-    fn test_derive_agent_state_empty_messages() {
-        let messages: Vec<serde_json::Value> = vec![];
-        let state = derive_agent_state_from_messages(&messages);
-        assert_eq!(state.activity, AgentActivity::Unknown);
-    }
-
-    #[test]
-    fn test_derive_agent_state_no_assistant_message() {
-        let messages = vec![serde_json::json!({
-            "info": {"role": "user"},
-            "parts": [{"type": "text", "text": "Hello"}]
-        })];
-        let state = derive_agent_state_from_messages(&messages);
-        assert_eq!(state.activity, AgentActivity::Unknown);
-    }
-
-    #[test]
-    fn test_derive_agent_state_working_no_completed_time() {
-        // Message without completed time indicates agent is still working
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890}
-            },
-            "parts": [{"type": "text", "text": "Working on it..."}]
-        })];
-        let state = derive_agent_state_from_messages(&messages);
-        assert_eq!(state.activity, AgentActivity::Working);
-        assert!(state.status_line.is_some());
-    }
-
-    #[test]
-    fn test_derive_agent_state_idle_with_stop_finish() {
-        // Completed message with finish=stop indicates idle
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891},
-                "finish": "stop"
-            },
-            "parts": [{"type": "text", "text": "Done!"}]
-        })];
-        let state = derive_agent_state_from_messages(&messages);
-        assert_eq!(state.activity, AgentActivity::Idle);
-    }
-
-    #[test]
-    fn test_derive_agent_state_working_with_tool_calls_finish() {
-        // Completed message with finish=tool-calls indicates still working
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891},
-                "finish": "tool-calls"
-            },
-            "parts": [{"type": "text", "text": "Making tool call..."}]
-        })];
-        let state = derive_agent_state_from_messages(&messages);
-        assert_eq!(state.activity, AgentActivity::Working);
-    }
-
-    #[test]
-    fn test_derive_agent_state_working_with_incomplete_tool() {
-        // Message with tool part that's not completed
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891}
-            },
-            "parts": [
-                {"type": "text", "text": "Running a tool..."},
-                {"type": "tool", "name": "bash", "state": {"status": "running"}}
-            ]
-        })];
-        let state = derive_agent_state_from_messages(&messages);
-        assert_eq!(state.activity, AgentActivity::Working);
-        assert_eq!(state.current_tool, Some("bash".to_string()));
-    }
-
-    #[test]
-    fn test_derive_agent_state_idle_with_completed_tool() {
-        // Message with completed tool part
-        let messages = vec![serde_json::json!({
-            "info": {
-                "role": "assistant",
-                "time": {"created": 1234567890, "completed": 1234567891}
-            },
-            "parts": [
-                {"type": "text", "text": "Tool result..."},
-                {"type": "tool", "state": {"status": "completed"}}
-            ]
-        })];
-        let state = derive_agent_state_from_messages(&messages);
-        assert_eq!(state.activity, AgentActivity::Idle);
-    }
-
-    #[test]
-    fn test_extract_text_from_parts() {
-        let parts = vec![
-            serde_json::json!({"type": "text", "text": "Hello world\nSecond line"}),
-            serde_json::json!({"type": "tool", "name": "bash", "state": {"status": "running"}}),
-        ];
-        let lines = extract_text_from_parts(&parts, 3);
-        assert!(!lines.is_empty());
     }
 }

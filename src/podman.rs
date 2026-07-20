@@ -387,6 +387,48 @@ pub fn get_host_socket_path() -> Result<PathBuf> {
     Ok(container_path)
 }
 
+/// Get the host-side base path for agent workspaces.
+///
+/// When creating agent containers, bind mount sources are resolved on the
+/// **host** filesystem. The launcher sets `DEVAIPOD_HOST_WORKDIR` to the
+/// host-side directory where agent workspaces are stored.
+///
+/// If unset, falls back to `$XDG_DATA_HOME/devaipod/workspaces` (typically
+/// `~/.local/share/devaipod/workspaces`), or `/var/lib/devaipod/workspaces`
+/// as a last resort.
+pub fn get_host_workdir_path() -> Result<PathBuf> {
+    if let Ok(val) = std::env::var("DEVAIPOD_HOST_WORKDIR") {
+        let path = PathBuf::from(&val);
+        tracing::debug!(
+            "Using host workdir path from DEVAIPOD_HOST_WORKDIR: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    // XDG_DATA_HOME fallback (typically ~/.local/share)
+    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+        let path = PathBuf::from(xdg_data).join("devaipod/workspaces");
+        tracing::debug!(
+            "Using host workdir path from XDG_DATA_HOME: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    // HOME-based fallback
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(home).join(".local/share/devaipod/workspaces");
+        tracing::debug!("Using host workdir path under HOME: {}", path.display());
+        return Ok(path);
+    }
+
+    // Absolute fallback
+    let path = PathBuf::from("/var/lib/devaipod/workspaces");
+    tracing::debug!("Using fallback host workdir path: {}", path.display());
+    Ok(path)
+}
+
 /// Connect to the container socket and return a bollard Docker client
 pub fn connect_to_container_socket() -> Result<Docker> {
     let socket_path = get_container_socket()?;
@@ -946,7 +988,6 @@ impl PodmanService {
     }
 
     /// Remove a volume
-    #[allow(dead_code)] // Part of public API
     pub async fn remove_volume(&self, name: &str, force: bool) -> Result<()> {
         let mut args = vec!["volume", "rm"];
         if force {
@@ -1012,7 +1053,14 @@ impl PodmanService {
         extra_binds: &[String],
         user: Option<&str>,
     ) -> Result<i32> {
-        let container_name = format!("{}-init", volume_name);
+        // Sanitize the container name: when volume_name is a host path
+        // (e.g. for HostDir bind mounts), replace slashes and use only
+        // the last path component so the name is valid for podman.
+        let base = std::path::Path::new(volume_name)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| volume_name.replace('/', "-"));
+        let container_name = format!("{}-init", base);
 
         // Remove any existing init container
         let _ = self
@@ -1022,14 +1070,24 @@ impl PodmanService {
             .await;
 
         // Run the init container
+        let is_host_path = volume_name.starts_with('/');
         let mut args = vec![
             "run".to_string(),
             "--rm".to_string(),
             "--name".to_string(),
             container_name.clone(),
-            "-v".to_string(),
-            format!("{}:{}", volume_name, mount_path),
         ];
+
+        // When the "volume" is actually a host directory bind mount, the
+        // files inside may be owned by a subuid-mapped UID that rootless
+        // podman's container root cannot write to. Use --privileged so the
+        // init container bypasses user namespace restrictions.
+        if is_host_path {
+            args.push("--privileged".to_string());
+        }
+
+        args.push("-v".to_string());
+        args.push(format!("{}:{}", volume_name, mount_path));
 
         // Add explicit user if specified
         if let Some(u) = user {
@@ -1040,8 +1098,10 @@ impl PodmanService {
         // Add extra bind mounts (with SELinux label disable and root user if any are present)
         // Root is needed because bind mounts from the host may have different UID mappings
         if !extra_binds.is_empty() {
-            args.push("--security-opt".to_string());
-            args.push("label=disable".to_string());
+            if !is_host_path {
+                args.push("--security-opt".to_string());
+                args.push("label=disable".to_string());
+            }
             if user.is_none() {
                 args.push("--user".to_string());
                 args.push("0".to_string());
@@ -1090,7 +1150,14 @@ impl PodmanService {
         command: &[&str],
         extra_binds: &[String],
     ) -> Result<(i32, String)> {
-        let container_name = format!("{}-init", volume_name);
+        // Derive a safe container name. When volume_name is a host path
+        // (e.g. /home/user/.local/share/devaipod/workspaces/pod-name), use
+        // only the last path component to avoid slashes in the container name.
+        let safe_name = std::path::Path::new(volume_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(volume_name);
+        let container_name = format!("{}-init", safe_name);
 
         // Remove any existing init container
         let _ = self
@@ -1109,8 +1176,10 @@ impl PodmanService {
             format!("{}:{}", volume_name, mount_path),
         ];
 
-        // Add extra bind mounts (with SELinux label disable and root user if any are present)
-        if !extra_binds.is_empty() {
+        // When using bind mounts (host paths or extra binds), disable SELinux
+        // labels and run as root so the container can access host-owned files.
+        let is_bind_mount = volume_name.contains('/');
+        if is_bind_mount || !extra_binds.is_empty() {
             args.push("--security-opt".to_string());
             args.push("label=disable".to_string());
             args.push("--user".to_string());
@@ -1497,7 +1566,6 @@ impl PodmanService {
     /// Execute a command and return its output
     ///
     /// Returns (exit_code, stdout, stderr)
-    #[allow(dead_code)] // Useful API method for future use
     pub async fn exec_output(
         &self,
         container: &str,

@@ -69,12 +69,44 @@ export const test = base.extend<DevaipodFixtures>({
 
   gotoAgent: async ({ page, devaipodUrl, devaipodToken }, use) => {
     await use(async (podShortName: string) => {
-      // Login to set auth cookie
+      // Capture JS errors and network activity from the start
+      const jsErrors: string[] = []
+      const networkLog: string[] = []
+      page.on("pageerror", (err) => jsErrors.push(err.message))
+      page.on("console", (msg) => {
+        if (msg.type() === "error") jsErrors.push(`console.error: ${msg.text()}`)
+      })
+      page.on("response", (r) => networkLog.push(`${r.status()} ${r.url()}`))
+      page.on("requestfailed", (r) => networkLog.push(`FAILED ${r.url()} ${r.failure()?.errorText}`))
+
+      // Login: set cookie via login endpoint AND pass token as query param
       await page.goto(`${devaipodUrl}/_devaipod/login?token=${devaipodToken}`)
-      // Navigate to agent iframe
-      await page.goto(`${devaipodUrl}/_devaipod/agent/${podShortName}/`)
-      // Wait for the top bar to render
-      await page.waitForSelector("#dbar", { timeout: 10_000 })
+      // Navigate to SPA agent page with token in query string
+      await page.goto(`${devaipodUrl}/agent/${podShortName}?token=${devaipodToken}`)
+      // Wait for the top bar to render (SPA renders it reactively)
+
+      try {
+        await page.waitForSelector('[data-testid="agent-topbar"]', { timeout: 30_000 })
+      } catch (e) {
+        const url = page.url()
+        const title = await page.title()
+        const rootHtml = await page.evaluate(() => {
+          const root = document.getElementById("root")
+          return root?.innerHTML?.substring(0, 2000) || "no #root content"
+        })
+        const bodyHtml = await page.evaluate(() => document.body?.innerHTML?.substring(0, 2000) || "no body")
+        console.error(`gotoAgent failed for ${podShortName}:`)
+        console.error(`  URL: ${url}`)
+        console.error(`  Title: ${title}`)
+        console.error(`  #root innerHTML: ${rootHtml}`)
+        console.error(`  body innerHTML: ${bodyHtml}`)
+        console.error(`  JS errors (${jsErrors.length}): ${jsErrors.join("\n    ")}`)
+        console.error(`  Network log (${networkLog.length}):`)
+        for (const entry of networkLog) {
+          console.error(`    ${entry}`)
+        }
+        throw e
+      }
     })
   },
 

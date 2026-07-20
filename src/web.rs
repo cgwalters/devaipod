@@ -8,7 +8,7 @@
 //! - Opencode-info and agent-status endpoints for the pods page
 //! - Static file serving for web UI
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,6 +33,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::advisor;
+use crate::config::SourceAccess;
 use crate::podman::{get_container_socket, host_for_pod_services};
 
 /// Path to the token file when using podman/Kubernetes secrets (highest priority).
@@ -72,7 +73,7 @@ fn self_exe() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "devaipod".to_string())
+        .unwrap_or_else(|| "devaipod-server".to_string())
 }
 
 fn mcp_state_token_path() -> std::path::PathBuf {
@@ -195,6 +196,11 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
                     .then(|| pair[prefix.len()..].to_string())
             })
         })
+}
+
+/// Strip the `devaipod-` prefix from a pod name to get the short workspace name.
+fn strip_pod_prefix(name: &str) -> &str {
+    name.strip_prefix("devaipod-").unwrap_or(name)
 }
 
 /// Normalize pod name: ensure it has the "devaipod-" prefix.
@@ -1500,7 +1506,7 @@ fn compute_pod_name(req: &RunRequest) -> String {
             .and_then(|s| s.rsplit('/').next())
             .map(|s| s.trim_end_matches(".git"))
             .filter(|s| !s.is_empty())
-            .unwrap_or("workspace");
+            .unwrap_or("scratch");
         crate::make_pod_name(project)
     }
 }
@@ -1515,10 +1521,7 @@ async fn run_workspace(
     Json(req): Json<RunRequest>,
 ) -> Result<Json<RunResponse>, StatusCode> {
     let pod_name = compute_pod_name(&req);
-    let short_name = pod_name
-        .strip_prefix("devaipod-")
-        .unwrap_or(&pod_name)
-        .to_string();
+    let short_name = strip_pod_prefix(&pod_name).to_string();
 
     let mut cmd = tokio::process::Command::new(self_exe());
     cmd.arg("run");
@@ -1528,9 +1531,9 @@ async fn run_workspace(
         cmd.arg(source);
     }
 
-    // Add task if provided (as positional argument after source)
+    // Add task if provided (use -c flag so it works with or without source)
     if let Some(ref task) = req.task {
-        cmd.arg(task);
+        cmd.args(["-c", task]);
     }
 
     // Always pass --name so the pod name matches what we told the UI.
@@ -1672,14 +1675,9 @@ async fn launch_advisor(
     Json(req): Json<AdvisorLaunchRequest>,
 ) -> Result<Json<RunResponse>, StatusCode> {
     // Check if advisor pod already exists
+    let advisor_name = crate::advisor_pod_name();
     let check = std::process::Command::new("podman")
-        .args([
-            "pod",
-            "inspect",
-            "devaipod-advisor",
-            "--format",
-            "{{.State}}",
-        ])
+        .args(["pod", "inspect", &advisor_name, "--format", "{{.State}}"])
         .output();
 
     if let Ok(output) = check
@@ -1705,7 +1703,7 @@ async fn launch_advisor(
         } else {
             // Advisor exists but stopped — start it
             let start = tokio::process::Command::new("podman")
-                .args(["pod", "start", "devaipod-advisor"])
+                .args(["pod", "start", &advisor_name])
                 .output()
                 .await;
             if let Ok(o) = start
@@ -1774,14 +1772,9 @@ struct AdvisorStatusResponse {
 }
 
 async fn advisor_status() -> Result<Json<AdvisorStatusResponse>, StatusCode> {
+    let advisor_name = crate::advisor_pod_name();
     let check = std::process::Command::new("podman")
-        .args([
-            "pod",
-            "inspect",
-            "devaipod-advisor",
-            "--format",
-            "{{.State}}",
-        ])
+        .args(["pod", "inspect", &advisor_name, "--format", "{{.State}}"])
         .output();
 
     match check {
@@ -1884,7 +1877,7 @@ async fn recreate_workspace(
         ));
     }
 
-    let short_name = pod_name.strip_prefix("devaipod-").unwrap_or(&pod_name);
+    let short_name = strip_pod_prefix(&pod_name);
     Ok(Json(RunResponse {
         success: true,
         workspace: short_name.to_string(),
@@ -2116,6 +2109,17 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
     let mut tasks = Vec::with_capacity(cached_pods.len());
 
     for pod in cached_pods {
+        // Skip devcontainer pods (they have their own management path)
+        if pod
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .map(|m| m == "devcontainer")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
         let is_running = pod.status.eq_ignore_ascii_case("running");
         let host = host.clone();
         let client = client.clone();
@@ -2148,6 +2152,7 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
 
     let mut result = Vec::with_capacity(tasks.len());
     let mut cache_changed = false;
+    let mut newly_done_pods: Vec<String> = Vec::new();
 
     {
         let mut psc = state.pod_state_cache.write().await;
@@ -2171,6 +2176,13 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
                     let old = psc.insert(pod.name.clone(), new_cached.clone());
                     if old.as_ref() != Some(&new_cached) {
                         cache_changed = true;
+                    }
+                    // Detect completion_status transition to "done"
+                    let was_done =
+                        old.as_ref().and_then(|o| o.completion_status.as_deref()) == Some("done");
+                    let is_done = new_cached.completion_status.as_deref() == Some("done");
+                    if is_done && !was_done {
+                        newly_done_pods.push(pod.name.clone());
                     }
                     (Some(status), ts)
                 } else {
@@ -2220,6 +2232,34 @@ async fn list_pods_unified(State(state): State<Arc<AppState>>) -> Json<Vec<Unifi
         let cache = state.pod_state_cache.clone();
         tokio::spawn(async move {
             save_pod_state_cache(&cache).await;
+        });
+    }
+
+    // Auto-harvest: when a pod transitions to "done", fetch its commits
+    // into the source repo in the background. Each pod is harvested at most
+    // once per completion (we only fire when the cached status changes).
+    //
+    // TODO: Add periodic harvest while agents are still active. Track a
+    // `last_harvest_check: HashMap<String, Instant>` in AppState and, on
+    // each poll cycle, harvest from pods whose status is "active", whose
+    // source is a local path, and where >5 minutes have elapsed since the
+    // last harvest. This would surface incremental progress before the
+    // agent marks itself done.
+    for pod_name in newly_done_pods {
+        tokio::task::spawn_blocking(move || match harvest_agent_commits(&pod_name) {
+            Ok(result) => {
+                for repo in &result.repos {
+                    tracing::info!(
+                        "Auto-harvested {} branch(es) from {} into {}",
+                        repo.branches.len(),
+                        repo.repo_name,
+                        repo.target_repo
+                    );
+                }
+            }
+            Err((_, msg)) => {
+                tracing::debug!("Auto-harvest skipped for {pod_name}: {msg}");
+            }
         });
     }
 
@@ -2324,6 +2364,26 @@ async fn refresh_pod_cache(
     let mut pods: Vec<CachedPodInfo> = all_pods
         .into_iter()
         .filter(|p| p.name.starts_with("devaipod-"))
+        .filter(|p| {
+            // Filter by DEVAIPOD_INSTANCE if set
+            match crate::get_instance_id() {
+                Some(ref instance_id) => {
+                    // When instance is set, only show pods with matching label
+                    p.labels
+                        .as_ref()
+                        .and_then(|l| l.get(crate::INSTANCE_LABEL_KEY))
+                        == Some(instance_id)
+                }
+                None => {
+                    // When no instance is set (production), exclude pods that carry
+                    // any instance label (they belong to test/isolated instances)
+                    p.labels
+                        .as_ref()
+                        .and_then(|l| l.get(crate::INSTANCE_LABEL_KEY))
+                        .is_none()
+                }
+            }
+        })
         .map(|pod| {
             let needs_update = enrichment_map.get(&pod.name).copied().unwrap_or(false);
             let containers = pod.containers.as_ref().map(|cs| {
@@ -2387,9 +2447,10 @@ async fn refresh_pod_cache(
     }
 
     // Sort: advisor first, then running pods, then by creation date descending
+    let advisor_name = crate::advisor_pod_name();
     pods.sort_by(|a, b| {
-        let a_advisor = u8::from(a.name == "devaipod-advisor");
-        let b_advisor = u8::from(b.name == "devaipod-advisor");
+        let a_advisor = u8::from(a.name == advisor_name);
+        let b_advisor = u8::from(b.name == advisor_name);
         if b_advisor != a_advisor {
             return b_advisor.cmp(&a_advisor);
         }
@@ -2619,12 +2680,7 @@ fn extract_workspace_name(output: &str) -> Option<String> {
                 .unwrap_or(rest.len());
             let pod_name = &rest[..end];
             // Strip the prefix and return
-            return Some(
-                pod_name
-                    .strip_prefix("devaipod-")
-                    .unwrap_or(pod_name)
-                    .to_string(),
-            );
+            return Some(strip_pod_prefix(pod_name).to_string());
         }
     }
     None
@@ -2730,10 +2786,704 @@ async fn agent_status(Path(name): Path<String>) -> Json<AgentStatusResponse> {
     }
 }
 
+// =============================================================================
+// Pod diagnostics endpoint — returns structured debug info for a pod
+// =============================================================================
+
+/// Top-level response from `GET /api/devaipod/pods/{name}/diagnostics`.
+#[derive(Debug, Serialize)]
+struct PodDiagnosticsResponse {
+    pod: DiagnosticsPodInfo,
+    containers: Vec<DiagnosticsContainerInfo>,
+}
+
+/// Pod-level info in the diagnostics response.
+#[derive(Debug, Serialize)]
+struct DiagnosticsPodInfo {
+    name: String,
+    state: String,
+    id: String,
+}
+
+/// Per-container info in the diagnostics response.
+#[derive(Debug, Serialize)]
+struct DiagnosticsContainerInfo {
+    name: String,
+    state: String,
+    exit_code: Option<i64>,
+    health_status: Option<String>,
+    logs_tail: String,
+}
+
+/// Collect diagnostic information for a pod.
+///
+/// Shells out to `podman pod inspect` and `podman inspect`/`podman logs` for
+/// each container in the pod.  Used by the CLI and integration tests to debug
+/// pod startup failures.
+async fn pod_diagnostics(
+    Path(name): Path<String>,
+) -> Result<Json<PodDiagnosticsResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+
+    // All podman commands are blocking I/O; run on the blocking pool.
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<PodDiagnosticsResponse, (StatusCode, String)> {
+            // --- Pod-level info via `podman pod inspect` ---
+            let pod_inspect_output = std::process::Command::new("podman")
+                .args(["pod", "inspect", "--format", "json", "--"])
+                .arg(&pod_name)
+                .output()
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to run podman: {e}"),
+                    )
+                })?;
+
+            if !pod_inspect_output.status.success() {
+                let stderr = String::from_utf8_lossy(&pod_inspect_output.stderr);
+                if stderr.contains("no such pod") || stderr.contains("not found") {
+                    return Err((StatusCode::NOT_FOUND, format!("Pod '{pod_name}' not found")));
+                }
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("podman pod inspect failed: {stderr}"),
+                ));
+            }
+
+            let pod_json: serde_json::Value = serde_json::from_slice(&pod_inspect_output.stdout)
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to parse pod inspect output: {e}"),
+                    )
+                })?;
+
+            let pod_info = DiagnosticsPodInfo {
+                name: pod_json["Name"].as_str().unwrap_or(&pod_name).to_string(),
+                state: pod_json["State"].as_str().unwrap_or("Unknown").to_string(),
+                id: pod_json["Id"].as_str().unwrap_or("").to_string(),
+            };
+
+            // Collect container IDs/names from the pod inspect output.
+            let container_ids: Vec<String> = pod_json["Containers"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| {
+                            // Use Name if available, otherwise Id
+                            c["Name"]
+                                .as_str()
+                                .or_else(|| c["Id"].as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // --- Per-container info ---
+            let mut containers = Vec::new();
+            for ctr_id in &container_ids {
+                // `podman inspect` for state/exit_code/health
+                let inspect_output = std::process::Command::new("podman")
+                    .args(["inspect", "--format", "json", "--"])
+                    .arg(ctr_id)
+                    .output();
+
+                let (state, exit_code, health_status, ctr_name) = match inspect_output {
+                    Ok(out) if out.status.success() => {
+                        // podman inspect returns a JSON array with one element
+                        let arr: Vec<serde_json::Value> =
+                            serde_json::from_slice(&out.stdout).unwrap_or_default();
+                        let ctr = arr.first().cloned().unwrap_or_default();
+
+                        let name = ctr["Name"].as_str().unwrap_or(ctr_id).to_string();
+                        let st = ctr["State"]["Status"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let ec = ctr["State"]["ExitCode"].as_i64();
+                        let hs = ctr["State"]["Health"]["Status"]
+                            .as_str()
+                            .map(|s| s.to_string());
+
+                        (st, ec, hs, name)
+                    }
+                    _ => ("unknown".to_string(), None, None, ctr_id.clone()),
+                };
+
+                // `podman logs --tail 50` for recent output (combined stdout+stderr)
+                let logs_tail = match std::process::Command::new("podman")
+                    .args(["logs", "--tail", "50", "--"])
+                    .arg(ctr_id)
+                    .output()
+                {
+                    Ok(out) => {
+                        // Combine stdout and stderr
+                        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+                        let stderr_str = String::from_utf8_lossy(&out.stderr);
+                        if !stderr_str.is_empty() {
+                            if !combined.is_empty() {
+                                combined.push('\n');
+                            }
+                            combined.push_str(&stderr_str);
+                        }
+                        combined
+                    }
+                    Err(e) => format!("(failed to collect logs: {e})"),
+                };
+
+                containers.push(DiagnosticsContainerInfo {
+                    name: ctr_name,
+                    state,
+                    exit_code,
+                    health_status,
+                    logs_tail,
+                });
+            }
+
+            Ok(PodDiagnosticsResponse {
+                pod: pod_info,
+                containers,
+            })
+        },
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("spawn_blocking panicked: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                error: "Internal error".to_string(),
+            }),
+        )
+    })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
+}
+
 // Git endpoints (git_status, git_diff, git_commits, git_log, git_diff_range,
 // git_fetch_agent, git_push) and exec_in_container have been removed.
 // The pod-api sidecar now handles all git operations directly, and the frontend
 // routes git requests through the pod-api proxy.
+
+// =============================================================================
+// Agent diff endpoint — shows changes the agent made vs the starting point
+// =============================================================================
+
+/// Query parameters for the agent diff endpoint.
+#[derive(Debug, Deserialize)]
+struct DiffQueryParams {
+    /// If true, return `--stat` output instead of full diff.
+    stat: Option<bool>,
+}
+
+/// A single commit summary in the diff response.
+#[derive(Debug, Serialize)]
+struct CommitSummary {
+    sha: String,
+    message: String,
+    author: String,
+    timestamp: String,
+}
+
+/// Response for `GET /api/devaipod/pods/{name}/diff`.
+#[derive(Debug, Serialize)]
+struct AgentDiffResponse {
+    /// The branch the agent is on.
+    branch: String,
+    /// Number of commits ahead of the starting point.
+    commit_count: usize,
+    /// Commit summaries (newest first).
+    commits: Vec<CommitSummary>,
+    /// The diff output (full diff or stat).
+    diff: String,
+    /// Whether this is a stat-only response.
+    is_stat: bool,
+}
+
+/// Per-repo diff data for multi-repo workspaces.
+#[derive(Debug, Serialize)]
+struct RepoDiffResponse {
+    /// Repository name (directory name, e.g. "devaipod" or "service-gator")
+    repo_name: String,
+    /// The diff data for this repo
+    #[serde(flatten)]
+    diff: AgentDiffResponse,
+}
+
+/// Response for multi-repo diff endpoint.
+#[derive(Debug, Serialize)]
+struct MultiRepoDiffResponse {
+    /// Diff data for each git repo in the workspace
+    repos: Vec<RepoDiffResponse>,
+}
+
+/// Convenience wrapper: find a single git repo inside `dir`.
+///
+/// Returns the first repo found by [`crate::agent_dir::find_git_repos_in_dir`],
+/// or `None` if no repos exist.
+fn find_git_repo_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    crate::agent_dir::find_git_repos_in_dir(dir)
+        .into_iter()
+        .next()
+        .map(|(_, p)| p)
+}
+
+/// Run a git command in `repo` and return stdout, or `None` on failure
+/// or empty output.
+fn run_git(repo: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    } else {
+        None
+    }
+}
+
+/// Resolve the base ref to diff against. Tries `origin/HEAD`, then
+/// `origin/main`, `origin/master`, then the first `origin/*` branch.
+fn resolve_origin_ref(repo: &std::path::Path) -> Option<String> {
+    // Try origin/HEAD (symbolic)
+    if run_git(repo, &["rev-parse", "--verify", "origin/HEAD"]).is_some() {
+        return Some("origin/HEAD".to_string());
+    }
+    for branch in ["main", "master"] {
+        let refname = format!("origin/{branch}");
+        if run_git(repo, &["rev-parse", "--verify", &refname]).is_some() {
+            return Some(refname);
+        }
+    }
+    // Fall back to the first origin/* branch
+    let branches = run_git(repo, &["branch", "-r", "--list", "origin/*"])?;
+    branches
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.contains("->"))
+        .map(|s| s.to_string())
+}
+
+/// Parse null-byte delimited git log output into commit summaries.
+fn parse_commit_log(log_output: &str) -> Vec<CommitSummary> {
+    if log_output.is_empty() {
+        return vec![];
+    }
+    log_output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\0').collect();
+            if fields.len() >= 4 {
+                Some(CommitSummary {
+                    sha: fields[0].to_string(),
+                    message: fields[1].to_string(),
+                    author: fields[2].to_string(),
+                    timestamp: fields[3].to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Build an `AgentDiffResponse` from a locally accessible git repo.
+fn diff_from_local_repo(
+    repo_path: &std::path::Path,
+    use_stat: bool,
+) -> Result<AgentDiffResponse, (StatusCode, String)> {
+    let branch = run_git(repo_path, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let origin_ref = match resolve_origin_ref(repo_path) {
+        Some(r) => r,
+        None => {
+            return Ok(AgentDiffResponse {
+                branch,
+                commit_count: 0,
+                commits: vec![],
+                diff: String::new(),
+                is_stat: use_stat,
+            });
+        }
+    };
+
+    let range = format!("{origin_ref}..HEAD");
+    let commit_count: usize = run_git(repo_path, &["rev-list", "--count", &range])
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let format_str = "%H%x00%s%x00%an%x00%aI";
+    let log_output = run_git(
+        repo_path,
+        &["log", &format!("--format={format_str}"), &range],
+    )
+    .unwrap_or_default();
+    let commits = parse_commit_log(&log_output);
+
+    let diff = if use_stat {
+        run_git(repo_path, &["diff", "--stat", &range])
+    } else {
+        run_git(repo_path, &["diff", &range])
+    }
+    .unwrap_or_default();
+
+    Ok(AgentDiffResponse {
+        branch,
+        commit_count,
+        commits,
+        diff,
+        is_stat: use_stat,
+    })
+}
+
+/// `GET /api/devaipod/pods/{name}/diff`
+///
+/// Returns the agent's git diff compared to the origin ref, plus commit
+/// metadata. Reads the agent's git repo from the host filesystem.
+async fn agent_diff(
+    Path(name): Path<String>,
+    Query(params): Query<DiffQueryParams>,
+) -> Result<Json<AgentDiffResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+    let use_stat = params.stat.unwrap_or(false);
+
+    // All git operations are blocking I/O; run on the blocking pool.
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<AgentDiffResponse, (StatusCode, String)> {
+            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).map_err(|e| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Failed to resolve agent directory for pod '{pod_name}': {e}"),
+                )
+            })?;
+            let repo_path = find_git_repo_in_dir(&agent_dir).ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "No git workspace found in agent directory '{}'",
+                        agent_dir.display()
+                    ),
+                )
+            })?;
+            diff_from_local_repo(&repo_path, use_stat)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("spawn_blocking panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: "Internal error".to_string(),
+                }),
+            )
+        })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
+}
+
+/// `GET /api/devaipod/pods/{name}/diffs`
+///
+/// Returns diffs for ALL git repos in the agent's workspace. For single-repo
+/// workspaces this returns a single entry; for multi-repo workspaces (created
+/// with `--source-dir`) each repo gets its own entry.
+async fn agent_diffs(
+    Path(name): Path<String>,
+    Query(params): Query<DiffQueryParams>,
+) -> Result<Json<MultiRepoDiffResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+    let use_stat = params.stat.unwrap_or(false);
+
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<MultiRepoDiffResponse, (StatusCode, String)> {
+            let agent_dir = crate::agent_dir::agent_dir_container_path(&pod_name).map_err(|e| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Failed to resolve agent directory for pod '{pod_name}': {e}"),
+                )
+            })?;
+            let repos = crate::agent_dir::find_git_repos_in_dir(&agent_dir);
+            if repos.is_empty() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "No git repos found in agent directory '{}'",
+                        agent_dir.display()
+                    ),
+                ));
+            }
+            let mut repo_diffs = Vec::new();
+            for (repo_name, repo_path) in repos {
+                match diff_from_local_repo(&repo_path, use_stat) {
+                    Ok(diff) => repo_diffs.push(RepoDiffResponse { repo_name, diff }),
+                    Err((code, msg)) => {
+                        tracing::warn!(
+                            "Failed to get diff for repo {}: {} {}",
+                            repo_name,
+                            code,
+                            msg
+                        );
+                        // Skip repos that fail (e.g., no commits yet)
+                    }
+                }
+            }
+            Ok(MultiRepoDiffResponse { repos: repo_diffs })
+        },
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("spawn_blocking panicked: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                error: "Internal error".to_string(),
+            }),
+        )
+    })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
+}
+
+// =============================================================================
+// Review endpoint — send diff feedback to the agent
+// =============================================================================
+
+/// A single inline comment on a file/line in the diff.
+#[derive(Debug, Deserialize)]
+struct ReviewComment {
+    /// File path the comment refers to.
+    file: String,
+    /// Optional line number in the diff.
+    line: Option<usize>,
+    /// The review comment body.
+    body: String,
+}
+
+/// Request body for `POST /api/devaipod/pods/{name}/review`.
+#[derive(Debug, Deserialize)]
+struct ReviewRequest {
+    /// Overall review message (e.g. "Please fix the error handling").
+    #[serde(default)]
+    message: Option<String>,
+    /// Inline comments on specific files/lines.
+    #[serde(default)]
+    comments: Vec<ReviewComment>,
+}
+
+/// Response for the review endpoint.
+#[derive(Debug, Serialize)]
+struct ReviewResponse {
+    success: bool,
+    message: String,
+}
+
+/// Format review comments into a structured message the agent can act on.
+fn format_review_message(req: &ReviewRequest) -> String {
+    let mut parts = Vec::new();
+
+    parts.push("## Code Review Feedback\n".to_string());
+    parts.push(
+        "The following review comments have been left on your changes. \
+         Please address each one and commit the fixes.\n"
+            .to_string(),
+    );
+
+    if let Some(ref msg) = req.message {
+        parts.push(format!("### Overall\n\n{msg}\n"));
+    }
+
+    if !req.comments.is_empty() {
+        parts.push("### Inline Comments\n".to_string());
+        for (i, comment) in req.comments.iter().enumerate() {
+            let location = match comment.line {
+                Some(line) => format!("`{}:{}`", comment.file, line),
+                None => format!("`{}`", comment.file),
+            };
+            parts.push(format!("{}. **{}**: {}\n", i + 1, location, comment.body));
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// `POST /api/devaipod/pods/{name}/review`
+///
+/// Sends code review feedback to a running agent. Formats the review
+/// comments into a structured message, sends it to the agent's opencode
+/// session via the pod-api proxy, and resets completion_status to "active"
+/// so the agent resumes work.
+async fn submit_review(
+    Path(name): Path<String>,
+    Json(req): Json<ReviewRequest>,
+) -> Result<Json<ReviewResponse>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+
+    // Validate: must have at least a message or comments.
+    if req.message.is_none() && req.comments.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorBody {
+                error: "Review must contain a message or at least one comment".to_string(),
+            }),
+        ));
+    }
+
+    let review_text = format_review_message(&req);
+
+    // Get the pod-api port and admin token.
+    let port = get_pod_api_port(&pod_name).await.map_err(|code| {
+        (
+            code,
+            Json(ApiErrorBody {
+                error: format!("Pod '{pod_name}' not reachable"),
+            }),
+        )
+    })?;
+    let admin_token = get_pod_api_admin_token(&pod_name).await.map_err(|code| {
+        (
+            code,
+            Json(ApiErrorBody {
+                error: "Failed to get pod admin token".to_string(),
+            }),
+        )
+    })?;
+    let host = host_for_pod_services();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: "HTTP client error".to_string(),
+                }),
+            )
+        })?;
+
+    // Find the root session ID by listing sessions.
+    let sessions_resp = client
+        .get(format!("http://{host}:{port}/session"))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to list sessions for {pod_name}: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiErrorBody {
+                    error: "Failed to reach agent".to_string(),
+                }),
+            )
+        })?;
+
+    let sessions: Vec<serde_json::Value> = sessions_resp.json().await.map_err(|e| {
+        tracing::error!("Failed to parse sessions for {pod_name}: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorBody {
+                error: "Failed to parse agent sessions".to_string(),
+            }),
+        )
+    })?;
+
+    let session_id = sessions
+        .iter()
+        .find(|s| crate::session_is_root(s))
+        .and_then(|s| s.get("id"))
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiErrorBody {
+                    error: "No active agent session found".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+
+    // Send the review as a message using the async prompt endpoint
+    // (fire-and-forget so we don't block on the LLM response).
+    let message_body = serde_json::json!({
+        "parts": [{"type": "text", "text": review_text}]
+    });
+
+    let send_resp = client
+        .post(format!(
+            "http://{host}:{port}/session/{session_id}/prompt_async"
+        ))
+        .json(&message_body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to send review to {pod_name}: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiErrorBody {
+                    error: "Failed to send review to agent".to_string(),
+                }),
+            )
+        })?;
+
+    if !send_resp.status().is_success() {
+        let status = send_resp.status();
+        let body = send_resp.text().await.unwrap_or_default();
+        tracing::error!("Agent rejected review message ({}): {}", status, body);
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiErrorBody {
+                error: format!("Agent rejected review message: {status}"),
+            }),
+        ));
+    }
+
+    // Reset completion_status to Active so the agent shows as working again.
+    let reset_body = serde_json::json!({"status": "active"});
+    let reset_resp = client
+        .put(format!("http://{host}:{port}/completion-status"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {admin_token}"))
+        .json(&reset_body)
+        .send()
+        .await;
+
+    match reset_resp {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!("Reset completion status to active for {pod_name}");
+        }
+        Ok(r) => {
+            tracing::warn!(
+                "Failed to reset completion status for {pod_name}: {}",
+                r.status()
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to reset completion status for {pod_name}: {e}");
+        }
+    }
+
+    let comment_count = req.comments.len();
+    let summary = if comment_count > 0 {
+        format!("Sent review with {comment_count} inline comment(s) to agent")
+    } else {
+        "Sent review feedback to agent".to_string()
+    };
+
+    Ok(Json(ReviewResponse {
+        success: true,
+        message: summary,
+    }))
+}
 
 // =============================================================================
 // Service-gator scope management (proxy to pod-api)
@@ -3012,6 +3762,630 @@ async fn prune_done_pods() -> Result<Json<PruneResponse>, StatusCode> {
     }))
 }
 
+// ── Workspace-centric endpoints ──────────────────────────────────────
+
+/// A workspace entry in the workspace list response.
+///
+/// Merges on-disk workspace state with podman pod status.
+#[derive(Debug, Serialize)]
+struct WorkspaceInfo {
+    /// Directory name (doubles as pod name for host-dir workspaces).
+    name: String,
+    /// Source identifier (local path or remote URL).
+    source: String,
+    /// RFC 3339 creation timestamp.
+    created: String,
+    /// RFC 3339 timestamp of last known activity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_active: Option<String>,
+    /// Task description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    /// Human-readable title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Completion status: "active" or "done".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_status: Option<String>,
+    /// Whether a matching podman pod is currently running.
+    pod_running: bool,
+    /// Podman pod status string (e.g. "Running", "Exited"), if a pod exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_status: Option<String>,
+}
+
+/// `GET /api/devaipod/workspaces` — list all workspaces (running + stopped).
+///
+/// Scans the workspaces base directory for state files and cross-references
+/// with the cached podman pod list to determine which workspaces have
+/// running pods.
+async fn list_workspaces_api(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::Json<Vec<WorkspaceInfo>>, StatusCode> {
+    let workspaces = crate::agent_dir::list_workspaces().map_err(|e| {
+        tracing::warn!("Failed to list workspaces: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Build a set of running pod names from the cache for fast lookup.
+    let pod_cache = state.pod_cache.read().await;
+    let pod_status_map: HashMap<&str, &str> = pod_cache
+        .iter()
+        .map(|p| (p.name.as_str(), p.status.as_str()))
+        .collect();
+
+    let mut results: Vec<WorkspaceInfo> = workspaces
+        .into_iter()
+        .map(|(dir_name, _path, state)| {
+            let pod_status = pod_status_map.get(dir_name.as_str()).copied();
+            let pod_running = pod_status
+                .map(|s| s.eq_ignore_ascii_case("running"))
+                .unwrap_or(false);
+
+            match state {
+                Some(ws) => WorkspaceInfo {
+                    name: ws.pod_name,
+                    source: ws.source,
+                    created: ws.created,
+                    last_active: ws.last_active,
+                    task: ws.task,
+                    title: ws.title,
+                    completion_status: ws.completion_status,
+                    pod_running,
+                    pod_status: pod_status.map(|s| s.to_string()),
+                },
+                None => WorkspaceInfo {
+                    name: dir_name.clone(),
+                    source: String::new(),
+                    created: String::new(),
+                    last_active: None,
+                    task: None,
+                    title: None,
+                    completion_status: None,
+                    pod_running,
+                    pod_status: pod_status.map(|s| s.to_string()),
+                },
+            }
+        })
+        .collect();
+
+    // Sort: running first, then by created descending.
+    results.sort_by(|a, b| {
+        b.pod_running
+            .cmp(&a.pod_running)
+            .then_with(|| b.created.cmp(&a.created))
+    });
+
+    Ok(axum::Json(results))
+}
+
+/// `GET /api/devaipod/recent-sources` — list recently-used sources for the launcher.
+async fn list_recent_sources() -> axum::Json<Vec<crate::agent_dir::RecentSource>> {
+    axum::Json(crate::agent_dir::load_recent_sources())
+}
+
+// ── Devcontainer endpoints ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct DevcontainerRunRequest {
+    source: Option<String>,
+    name: Option<String>,
+    image: Option<String>,
+    devcontainer_json: Option<String>,
+    #[serde(default)]
+    use_default_devcontainer: bool,
+}
+
+fn compute_devcontainer_pod_name(req: &DevcontainerRunRequest) -> String {
+    if let Some(ref name) = req.name {
+        normalize_pod_name(name)
+    } else {
+        let project = req
+            .source
+            .as_deref()
+            .and_then(|s| s.rsplit('/').next())
+            .map(|s| s.trim_end_matches(".git"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("devcontainer");
+        crate::make_pod_name(project)
+    }
+}
+
+async fn run_devcontainer(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DevcontainerRunRequest>,
+) -> Result<Json<RunResponse>, StatusCode> {
+    let pod_name = compute_devcontainer_pod_name(&req);
+    let short_name = strip_pod_prefix(&pod_name).to_string();
+
+    let mut cmd = tokio::process::Command::new(self_exe());
+    cmd.args(["devcontainer", "run"]);
+
+    if let Some(ref source) = req.source {
+        cmd.arg(source);
+    }
+
+    cmd.args(["--name", &pod_name]);
+
+    if let Some(ref image) = req.image {
+        cmd.args(["--image", image]);
+    }
+
+    if let Some(ref json) = req.devcontainer_json {
+        cmd.args(["--devcontainer-json", json]);
+    }
+
+    if req.use_default_devcontainer {
+        cmd.arg("--use-default-devcontainer");
+    }
+
+    cmd.stdin(std::process::Stdio::null());
+
+    tracing::info!("Running devcontainer (async): {:?}", cmd);
+
+    {
+        let mut launches = state.launches.lock().await;
+        if launches.contains_key(&pod_name) {
+            tracing::warn!("Duplicate devcontainer launch rejected for {}", pod_name);
+            return Err(StatusCode::CONFLICT);
+        }
+        launches.insert(pod_name.clone(), LaunchState::Launching);
+    }
+
+    let launches = state.launches.clone();
+    let pod_name_bg = pod_name.clone();
+    tokio::spawn(async move {
+        let result = cmd.output().await;
+        let mut map = launches.lock().await;
+        match result {
+            Ok(output) if output.status.success() => {
+                tracing::info!("devcontainer run completed for {}", pod_name_bg);
+                map.remove(&pod_name_bg);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let msg = stderr.trim().to_string();
+                tracing::error!("devcontainer run failed for {}: {}", pod_name_bg, msg);
+                map.insert(
+                    pod_name_bg.clone(),
+                    LaunchState::Failed {
+                        error: if msg.is_empty() {
+                            format!("Process exited with {}", output.status)
+                        } else {
+                            msg
+                        },
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to execute devcontainer run for {}: {}",
+                    pod_name_bg,
+                    e
+                );
+                map.insert(
+                    pod_name_bg.clone(),
+                    LaunchState::Failed {
+                        error: format!("Failed to execute: {}", e),
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(Json(RunResponse {
+        success: true,
+        workspace: short_name,
+        message: "Launching devcontainer in background".to_string(),
+        status: Some("launching".to_string()),
+        pod_name: Some(pod_name),
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct DevcontainerPodInfo {
+    name: String,
+    status: String,
+    created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containers: Option<Vec<UnifiedContainerInfo>>,
+}
+
+async fn list_devcontainers(State(state): State<Arc<AppState>>) -> Json<Vec<DevcontainerPodInfo>> {
+    let cached_pods = state.pod_cache.read().await;
+
+    let result: Vec<DevcontainerPodInfo> = cached_pods
+        .iter()
+        .filter(|p| {
+            p.labels
+                .as_ref()
+                .and_then(|l| l.get("io.devaipod.mode"))
+                .map(|m| m == "devcontainer")
+                .unwrap_or(false)
+        })
+        .map(|p| DevcontainerPodInfo {
+            name: p.name.clone(),
+            status: p.status.clone(),
+            created: p.created.clone(),
+            labels: p.labels.clone(),
+            containers: p.containers.clone(),
+        })
+        .collect();
+
+    Json(result)
+}
+
+async fn delete_devcontainer(Path(name): Path<String>) -> Result<StatusCode, StatusCode> {
+    let pod_name = normalize_pod_name(&name);
+
+    tracing::info!("Deleting devcontainer pod: {}", pod_name);
+
+    let output = tokio::process::Command::new("podman")
+        .args(["pod", "rm", "-f", &pod_name])
+        .output()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to execute podman pod rm: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("podman pod rm failed for {}: {}", pod_name, stderr.trim());
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Control plane overview endpoint ───────────────────────────────────
+
+/// Top-level response for the control plane overview.
+#[derive(Debug, Serialize)]
+struct ControlPlaneResponse {
+    repos: Vec<RepoGroup>,
+}
+
+/// Pods grouped by repository.
+#[derive(Debug, Serialize)]
+struct RepoGroup {
+    /// Repository identifier (e.g. "cgwalters/devaipod").
+    repo: String,
+    /// Number of running, non-done agents in this repo.
+    active_count: usize,
+    /// Agent pods for this repo.
+    agents: Vec<ControlPlaneAgent>,
+    /// Devcontainer pods for this repo.
+    devcontainers: Vec<ControlPlaneDevcontainer>,
+}
+
+/// An agent pod in the control plane overview.
+#[derive(Debug, Serialize)]
+struct ControlPlaneAgent {
+    /// Full pod name.
+    name: String,
+    /// Short name (without `devaipod-` prefix).
+    short_name: String,
+    /// Pod status ("Running", "Stopped", etc.).
+    status: String,
+    /// Task description from labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    /// Title (from agent status or labels).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Completion status ("active", "done").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_status: Option<String>,
+    /// Last active timestamp (RFC 3339 from pod state cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_active: Option<String>,
+    /// Whether the pod is currently running.
+    is_running: bool,
+    /// Created timestamp.
+    created: String,
+}
+
+/// A devcontainer pod in the control plane overview.
+#[derive(Debug, Serialize)]
+struct ControlPlaneDevcontainer {
+    name: String,
+    short_name: String,
+    status: String,
+    created: String,
+    is_running: bool,
+}
+
+/// `GET /api/devaipod/control-plane` — pods grouped by git repository.
+///
+/// Reads the cached pod list and pod state cache to produce a view of all
+/// pods organised by their `io.devaipod.repo` label. No new data sources
+/// are consulted; this is purely a grouping/projection of existing data.
+async fn control_plane(State(state): State<Arc<AppState>>) -> Json<ControlPlaneResponse> {
+    let cached_pods = state.pod_cache.read().await;
+    let pod_state_cache = state.pod_state_cache.read().await;
+
+    let mut repo_map: BTreeMap<String, RepoGroup> = BTreeMap::new();
+
+    for pod in cached_pods.iter() {
+        let labels = pod.labels.as_ref();
+        let mode = labels
+            .and_then(|l| l.get("io.devaipod.mode"))
+            .map(|s| s.as_str());
+        let repo = labels
+            .and_then(|l| l.get("io.devaipod.repo"))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let is_running = pod.status.eq_ignore_ascii_case("running");
+        let short_name = strip_pod_prefix(&pod.name).to_string();
+
+        let group = repo_map.entry(repo.clone()).or_insert_with(|| RepoGroup {
+            repo: repo.clone(),
+            active_count: 0,
+            agents: Vec::new(),
+            devcontainers: Vec::new(),
+        });
+
+        match mode {
+            Some("devcontainer") => {
+                group.devcontainers.push(ControlPlaneDevcontainer {
+                    name: pod.name.clone(),
+                    short_name,
+                    status: pod.status.clone(),
+                    created: pod.created.clone(),
+                    is_running,
+                });
+            }
+            _ => {
+                // Agent pod (mode "up", "run", or absent)
+                let cached_state = pod_state_cache.get(&pod.name);
+
+                let task = labels.and_then(|l| l.get("io.devaipod.task")).cloned();
+                let title = cached_state
+                    .and_then(|s| s.title.clone())
+                    .or_else(|| labels.and_then(|l| l.get("io.devaipod.title")).cloned());
+                let completion_status = cached_state.and_then(|s| s.completion_status.clone());
+                let last_active = cached_state.and_then(|s| s.last_active_ts).map(|ts| {
+                    chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| ts.to_string())
+                });
+
+                let is_done = completion_status.as_deref() == Some("done");
+                if is_running && !is_done {
+                    group.active_count += 1;
+                }
+
+                group.agents.push(ControlPlaneAgent {
+                    name: pod.name.clone(),
+                    short_name,
+                    status: pod.status.clone(),
+                    task,
+                    title,
+                    completion_status,
+                    last_active,
+                    is_running,
+                    created: pod.created.clone(),
+                });
+            }
+        }
+    }
+
+    // Sort: repos with active agents first, then alphabetically.
+    let mut repos: Vec<RepoGroup> = repo_map.into_values().collect();
+    repos.sort_by(|a, b| {
+        b.active_count
+            .cmp(&a.active_count)
+            .then_with(|| a.repo.cmp(&b.repo))
+    });
+
+    Json(ControlPlaneResponse { repos })
+}
+
+// =============================================================================
+// Harvest endpoint — fetch agent commits into the source repo
+// =============================================================================
+
+/// A single repo that was harvested.
+#[derive(Debug, Serialize)]
+struct HarvestedRepo {
+    repo_name: String,
+    target_repo: String,
+    remote_name: String,
+    branches: Vec<String>,
+}
+
+/// Result of a harvest operation.
+#[derive(Debug, Serialize)]
+struct HarvestResult {
+    repos: Vec<HarvestedRepo>,
+}
+
+/// Harvest agent commits by fetching them into the source repo.
+///
+/// Reads the workspace state to find the source repo path, then adds/updates
+/// a git remote named `devaipod/<short_name>` in the source repo and runs
+/// `git fetch` to bring agent branches into the user's repo.
+fn harvest_agent_commits(pod_name: &str) -> Result<HarvestResult, (StatusCode, String)> {
+    let agent_dir = crate::agent_dir::agent_dir_container_path(pod_name)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Agent dir not found: {e}")))?;
+
+    // Load workspace state to find source path
+    let state = crate::agent_dir::WorkspaceState::load(&agent_dir)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load workspace state: {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "No workspace state file found".to_string(),
+            )
+        })?;
+
+    // Only harvest when source is a local path (not a URL)
+    let source_path = PathBuf::from(&state.source);
+    if !source_path.exists() || !source_path.join(".git").exists() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Source '{}' is not a local git repo (remote sources can't be auto-harvested)",
+                state.source
+            ),
+        ));
+    }
+
+    // Find agent git repos
+    let repos = crate::agent_dir::find_git_repos_in_dir(&agent_dir);
+    if repos.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "No git repos in agent workspace".to_string(),
+        ));
+    }
+
+    let short_name = strip_pod_prefix(pod_name);
+    let mut harvested = Vec::new();
+
+    // Check once whether the agent container is running (avoid per-repo overhead).
+    let agent_container = format!("{pod_name}-agent");
+    let container_running = crate::agent_dir::is_container_running(&agent_container);
+
+    for (repo_name, repo_path) in &repos {
+        // Check if HEAD has advanced since last harvest
+        let current_head = run_git(repo_path, &["rev-parse", "HEAD"]);
+        if let Some(ref head) = current_head
+            && let Some(last) = state.last_harvested.get(repo_name)
+            && last == head
+        {
+            tracing::debug!("Skipping harvest for {repo_name}: HEAD unchanged at {head}");
+            continue;
+        }
+
+        // Determine which source repo to fetch into.
+        // For single-repo: use state.source directly.
+        // For multi-repo: try to find a matching source_dirs entry.
+        let target_repo = if repos.len() == 1 {
+            source_path.clone()
+        } else {
+            state
+                .source_dirs
+                .iter()
+                .find(|d| {
+                    d.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n == repo_name)
+                })
+                .cloned()
+                .unwrap_or_else(|| source_path.clone())
+        };
+
+        if !target_repo.join(".git").exists() {
+            tracing::debug!(
+                "Skipping harvest for {repo_name}: target {:?} is not a git repo",
+                target_repo
+            );
+            continue;
+        }
+
+        let remote_name = if repos.len() == 1 {
+            format!("devaipod/{short_name}")
+        } else {
+            format!("devaipod/{short_name}/{repo_name}")
+        };
+
+        // Use ext:: transport to handle workspace-v2 repos with container-
+        // internal alternates. When the agent is running, use podman exec;
+        // otherwise spawn a transient container mounting the workspace volume.
+        let workspace_path = format!("/workspaces/{repo_name}");
+        let harvest_result = if container_running {
+            crate::agent_dir::harvest_one_repo_via_exec(
+                &target_repo,
+                &agent_container,
+                &workspace_path,
+                &remote_name,
+            )
+        } else {
+            let image = crate::pod::detect_self_image();
+            crate::agent_dir::harvest_one_repo_via_transient(
+                &target_repo,
+                pod_name,
+                &workspace_path,
+                &remote_name,
+                &image,
+            )
+        };
+
+        match harvest_result {
+            Ok(result) => {
+                harvested.push(HarvestedRepo {
+                    repo_name: repo_name.to_string(),
+                    target_repo: target_repo.display().to_string(),
+                    remote_name: result.remote_name,
+                    branches: result.branches,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to harvest {repo_name} into {}: {e}",
+                    target_repo.display(),
+                );
+            }
+        }
+    }
+
+    // Update workspace state with the harvested HEAD SHAs
+    if !harvested.is_empty()
+        && let Ok(Some(mut ws_state)) = crate::agent_dir::WorkspaceState::load(&agent_dir)
+    {
+        for repo in &harvested {
+            // Read HEAD from the agent repo
+            for (name, agent_path) in &repos {
+                if name == &repo.repo_name
+                    && let Some(sha) = run_git(agent_path, &["rev-parse", "HEAD"])
+                {
+                    ws_state.last_harvested.insert(repo.repo_name.clone(), sha);
+                }
+            }
+        }
+        if let Err(e) = ws_state.save(&agent_dir) {
+            tracing::warn!("Failed to update workspace state after harvest: {e}");
+        }
+    }
+
+    Ok(HarvestResult { repos: harvested })
+}
+
+/// `POST /api/devaipod/pods/{name}/fetch`
+///
+/// Harvest agent commits by fetching them into the source repo.
+async fn harvest_commits(
+    Path(name): Path<String>,
+) -> Result<Json<HarvestResult>, (StatusCode, Json<ApiErrorBody>)> {
+    let pod_name = normalize_pod_name(&name);
+
+    let result = tokio::task::spawn_blocking(move || harvest_agent_commits(&pod_name))
+        .await
+        .map_err(|e| {
+            tracing::error!("spawn_blocking panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: "Internal error".to_string(),
+                }),
+            )
+        })?;
+
+    result
+        .map(Json)
+        .map_err(|(code, msg)| (code, Json(ApiErrorBody { error: msg })))
+}
+
 /// Run the web server
 ///
 /// Starts an HTTP server on the specified port with:
@@ -3107,6 +4481,7 @@ fn build_app_with_cache(
         .route("/devaipod/proposals", get(list_proposals_api))
         .route("/devaipod/proposals/{id}/dismiss", post(dismiss_proposal))
         .route("/devaipod/pods/{name}/recreate", post(recreate_workspace))
+        .route("/devaipod/pods/{name}/diagnostics", get(pod_diagnostics))
         .route(
             "/devaipod/pods/{name}/gator-scopes",
             get(get_gator_scopes).put(update_gator_scopes),
@@ -3115,6 +4490,11 @@ fn build_app_with_cache(
             "/devaipod/pods/{name}/completion-status",
             get(get_pod_completion_status).put(update_pod_completion_status),
         )
+        .route("/devaipod/pods/{name}/diff", get(agent_diff))
+        .route("/devaipod/pods/{name}/diffs", get(agent_diffs))
+        .route("/devaipod/pods/{name}/review", post(submit_review))
+        // Harvest agent commits into the source repo
+        .route("/devaipod/pods/{name}/fetch", post(harvest_commits))
         // Lightweight endpoint for frontend cookie refresh (every 4h).
         // The auth_middleware already re-issues the cookie on every
         // authenticated request, so this handler is a no-op — its only
@@ -3124,6 +4504,18 @@ fn build_app_with_cache(
         .route("/devaipod/pods/enrichment", get(pod_enrichment))
         // Unified pod list: pods + agent status + enrichment in one response
         .route("/devaipod/pods", get(list_pods_unified))
+        // Control plane overview: pods grouped by repository
+        .route("/devaipod/control-plane", get(control_plane))
+        // Workspace-centric endpoints
+        .route("/devaipod/workspaces", get(list_workspaces_api))
+        .route("/devaipod/recent-sources", get(list_recent_sources))
+        // Devcontainer endpoints
+        .route("/devaipod/devcontainer/run", post(run_devcontainer))
+        .route("/devaipod/devcontainer/list", get(list_devcontainers))
+        .route(
+            "/devaipod/devcontainer/{name}",
+            axum::routing::delete(delete_devcontainer),
+        )
         // PTY: proxy to the pod-api sidecar (direct PTY, no exec overhead)
         .route(
             "/devaipod/pods/{name}/pty",
@@ -3188,7 +4580,230 @@ fn build_app_with_cache(
         .with_state(state)
 }
 
+/// Check if this process is a launcher container and, if so, create the real
+/// server container with source bind mounts and exit.
+///
+/// The launcher pattern works as follows:
+/// 1. The Justfile creates a `$NAME-launcher` container with the config file mounted
+/// 2. This function reads `~/.config/devaipod.toml`, resolves `[sources]`
+/// 3. It inspects its own container to copy mounts/env/network settings
+/// 4. It creates the real `$NAME` container with additional `-v` mounts for sources
+/// 5. The launcher exits; the real server container runs `devaipod web`
+///
+/// If `DEVAIPOD_CONTAINER_NAME` is not set or the container name does not end
+/// with `-launcher`, this is a no-op and the current process continues as the
+/// server. The server container is always created (even with zero sources).
+fn maybe_launch_server_with_sources() -> Result<()> {
+    // Step (a): only act when running as a launcher container
+    let container_name = match std::env::var("DEVAIPOD_CONTAINER_NAME") {
+        Ok(name) => name,
+        Err(_) => return Ok(()), // not in launcher pattern
+    };
+
+    // Must end with -launcher to be a launcher
+    let server_name = match container_name.strip_suffix("-launcher") {
+        Some(name) => name.to_string(),
+        None => return Ok(()), // already the server container
+    };
+
+    // Step (b): load config and resolve sources (may be empty)
+    let config = crate::config::load_config(None)?;
+    let sources = config.resolve_sources();
+
+    tracing::info!(
+        "Launcher: creating server container '{}' with {} source mount(s)",
+        server_name,
+        sources.len()
+    );
+
+    // Step (c): inspect our own container to get image, mounts, env, etc.
+    let socket_path = get_container_socket()?;
+    let inspect_output = std::process::Command::new("podman")
+        .args([
+            "--url",
+            &format!("unix://{}", socket_path.display()),
+            "inspect",
+            &container_name,
+        ])
+        .output()
+        .context("Failed to run podman inspect on launcher container")?;
+
+    if !inspect_output.status.success() {
+        let stderr = String::from_utf8_lossy(&inspect_output.stderr);
+        color_eyre::eyre::bail!(
+            "podman inspect {} failed: {}",
+            container_name,
+            stderr.trim()
+        );
+    }
+
+    let inspect_json: serde_json::Value =
+        serde_json::from_slice(&inspect_output.stdout).context("Failed to parse podman inspect")?;
+
+    // podman inspect returns an array; take the first element
+    let info = inspect_json
+        .as_array()
+        .and_then(|a| a.first())
+        .unwrap_or(&inspect_json);
+
+    // Extract image
+    let image = info
+        .pointer("/ImageName")
+        .or_else(|| info.pointer("/Image"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("localhost/devaipod:latest")
+        .to_string();
+
+    // Extract existing mounts (bind mounts and volumes)
+    let mut existing_mounts: Vec<String> = Vec::new();
+    if let Some(mounts) = info.pointer("/Mounts").and_then(|v| v.as_array()) {
+        for mount in mounts {
+            let source = mount.get("Source").and_then(|v| v.as_str()).unwrap_or("");
+            let destination = mount
+                .get("Destination")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if source.is_empty() || destination.is_empty() {
+                continue;
+            }
+            let options = mount.get("Options").and_then(|v| v.as_array());
+            let is_ro = options
+                .map(|opts| opts.iter().any(|o| o.as_str() == Some("ro")))
+                .unwrap_or(false);
+            let mount_type = mount.get("Type").and_then(|v| v.as_str()).unwrap_or("");
+            // For named volumes, use the volume name as source
+            let source_str = if mount_type == "volume" {
+                mount.get("Name").and_then(|v| v.as_str()).unwrap_or(source)
+            } else {
+                source
+            };
+            if is_ro {
+                existing_mounts.push(format!("{}:{}:ro", source_str, destination));
+            } else {
+                existing_mounts.push(format!("{}:{}", source_str, destination));
+            }
+        }
+    }
+
+    // Extract existing environment variables
+    let mut existing_env: Vec<String> = Vec::new();
+    if let Some(env_arr) = info.pointer("/Config/Env").and_then(|v| v.as_array()) {
+        for env_val in env_arr {
+            if let Some(env_str) = env_val.as_str() {
+                // Skip internal vars that we'll set ourselves
+                if env_str.starts_with("DEVAIPOD_CONTAINER_NAME=") {
+                    continue;
+                }
+                existing_env.push(env_str.to_string());
+            }
+        }
+    }
+
+    // Check if privileged
+    let is_privileged = info
+        .pointer("/HostConfig/Privileged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Get host port from env var
+    let host_port = std::env::var("DEVAIPOD_HOST_PORT").unwrap_or_else(|_| "8080".to_string());
+
+    // Step (d) + (e): build the podman run command for the server container
+    let mut cmd = std::process::Command::new("podman");
+    cmd.args([
+        "--url",
+        &format!("unix://{}", socket_path.display()),
+        "run",
+        "-d",
+        "--name",
+        &server_name,
+        "--replace",
+    ]);
+
+    if is_privileged {
+        cmd.arg("--privileged");
+    }
+
+    // Re-add existing mounts
+    for mount in &existing_mounts {
+        cmd.args(["-v", mount]);
+    }
+
+    // Re-add existing env vars
+    for env_str in &existing_env {
+        cmd.args(["-e", env_str]);
+    }
+
+    // Set the server container name
+    cmd.args(["-e", &format!("DEVAIPOD_CONTAINER_NAME={}", server_name)]);
+
+    // Publish the host port
+    cmd.args(["-p", &format!("{}:8080", host_port)]);
+
+    // Check for --add-host from extra hosts
+    if let Some(extra_hosts) = info
+        .pointer("/HostConfig/ExtraHosts")
+        .and_then(|v| v.as_array())
+    {
+        for host in extra_hosts {
+            if let Some(h) = host.as_str() {
+                cmd.args(["--add-host", h]);
+            }
+        }
+    }
+
+    // Step (e): add source bind mounts
+    for source in &sources {
+        let mount_target = format!("/mnt/{}", source.name);
+        let mount_str = match source.access {
+            SourceAccess::Readonly => format!("{}:{}:ro", source.path.display(), mount_target),
+            SourceAccess::Controlplane | SourceAccess::Agent => {
+                format!("{}:{}", source.path.display(), mount_target)
+            }
+        };
+        tracing::info!(
+            "Source mount: {} -> {} ({:?})",
+            source.path.display(),
+            mount_target,
+            source.access
+        );
+        cmd.args(["-v", &mount_str]);
+    }
+
+    // Step (e2): add generic bind mounts
+    for bind in config.resolve_binds() {
+        let arg = bind.to_podman_arg();
+        tracing::info!("Bind mount: {}", arg);
+        cmd.args(["-v", &arg]);
+    }
+
+    // Image and command
+    cmd.arg(&image);
+    cmd.args(["devaipod-server", "web", "--port", "8080"]);
+
+    tracing::info!("Creating server container: {:?}", cmd);
+
+    // Step (f): run the command
+    let output = cmd.output().context("Failed to create server container")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        color_eyre::eyre::bail!("Failed to create server container: {}", stderr.trim());
+    }
+
+    tracing::info!(
+        "Server container '{}' created successfully, launcher exiting",
+        server_name
+    );
+    std::process::exit(0);
+}
+
 pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Result<()> {
+    // Check if we should act as a launcher (inspect config, create server container with
+    // source mounts, then exit). This is a no-op if DEVAIPOD_CONTAINER_NAME is not set
+    // or if no [sources] are configured.
+    maybe_launch_server_with_sources()?;
+
     // Try to get the podman socket path, but don't fail if not found
     // (allows server to start for static file serving even without podman)
     let socket_path = get_container_socket().ok();
@@ -3247,8 +4862,17 @@ pub async fn run_web_server(port: u16, token: String, mcp_token: String) -> Resu
         .await
         .with_context(|| format!("Failed to bind to {}", addr))?;
 
-    // Print startup message with URL including token
-    let url = format!("http://127.0.0.1:{}/_devaipod/login?token={}", port, token);
+    // Print startup message with URL including token.
+    // Use DEVAIPOD_HOST_PORT if set (the host-mapped port may differ from the
+    // internal listen port when running inside a container, e.g. -p 8081:8080).
+    let display_port = std::env::var("DEVAIPOD_HOST_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(port);
+    let url = format!(
+        "http://127.0.0.1:{}/_devaipod/login?token={}",
+        display_port, token
+    );
     tracing::info!("Web server started at {}", url);
     println!("Control plane URL: {}", url);
 
@@ -4037,6 +5661,154 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Control plane endpoint must require authentication.
+    #[tokio::test]
+    async fn test_control_plane_requires_auth() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/control-plane")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "control-plane must return 401 without auth"
+        );
+    }
+
+    /// Control plane endpoint returns empty repos for an empty pod cache.
+    #[tokio::test]
+    async fn test_control_plane_empty_cache() {
+        let app = build_app("test-token".into(), "mcp".into(), None, None);
+
+        let req = Request::builder()
+            .uri("/api/devaipod/control-plane")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["repos"], serde_json::json!([]),);
+    }
+
+    /// Control plane groups pods by repo label.
+    #[tokio::test]
+    async fn test_control_plane_groups_by_repo() {
+        let pod_cache: PodCache = Arc::new(tokio::sync::RwLock::new(vec![
+            CachedPodInfo {
+                name: "devaipod-foo-abc".to_string(),
+                status: "Running".to_string(),
+                created: "2025-01-01T00:00:00Z".to_string(),
+                labels: Some(HashMap::from([
+                    ("io.devaipod.repo".into(), "owner/repo-a".into()),
+                    ("io.devaipod.task".into(), "Fix the bug".into()),
+                ])),
+                containers: None,
+                needs_update: false,
+                diagnostics: None,
+            },
+            CachedPodInfo {
+                name: "devaipod-bar-def".to_string(),
+                status: "Exited".to_string(),
+                created: "2025-01-02T00:00:00Z".to_string(),
+                labels: Some(HashMap::from([(
+                    "io.devaipod.repo".into(),
+                    "owner/repo-a".into(),
+                )])),
+                containers: None,
+                needs_update: false,
+                diagnostics: None,
+            },
+            CachedPodInfo {
+                name: "devaipod-baz-ghi".to_string(),
+                status: "Running".to_string(),
+                created: "2025-01-03T00:00:00Z".to_string(),
+                labels: Some(HashMap::from([
+                    ("io.devaipod.repo".into(), "owner/repo-b".into()),
+                    ("io.devaipod.mode".into(), "devcontainer".into()),
+                ])),
+                containers: None,
+                needs_update: false,
+                diagnostics: None,
+            },
+            CachedPodInfo {
+                name: "devaipod-unlabeled-xyz".to_string(),
+                status: "Running".to_string(),
+                created: "2025-01-04T00:00:00Z".to_string(),
+                labels: None,
+                containers: None,
+                needs_update: false,
+                diagnostics: None,
+            },
+        ]));
+        let pod_state_cache: PodStateCache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let app = build_app_with_cache(
+            "test-token".into(),
+            "mcp".into(),
+            None,
+            None,
+            pod_cache,
+            pod_state_cache,
+            8080,
+        );
+
+        let req = Request::builder()
+            .uri("/api/devaipod/control-plane")
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let repos = json["repos"].as_array().unwrap();
+
+        // Three groups: owner/repo-a, owner/repo-b, unknown
+        assert_eq!(repos.len(), 3, "expected 3 repo groups: {json:#}");
+
+        // Repos with active agents first: owner/repo-a (1 running), unknown (1 running),
+        // then owner/repo-b (0 agents, only devcontainer — active_count=0).
+        // Among groups with active_count=1, alphabetical order applies.
+        let repo_names: Vec<&str> = repos.iter().map(|r| r["repo"].as_str().unwrap()).collect();
+        assert_eq!(repo_names, &["owner/repo-a", "unknown", "owner/repo-b"]);
+
+        // repo-a should have 1 active, 2 agents, 0 devcontainers
+        let repo_a = &repos[0];
+        assert_eq!(repo_a["active_count"], 1);
+        assert_eq!(repo_a["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(repo_a["devcontainers"].as_array().unwrap().len(), 0);
+        // First agent should have the task label
+        let agent0 = &repo_a["agents"][0];
+        assert_eq!(agent0["task"], "Fix the bug");
+        assert_eq!(agent0["short_name"], "foo-abc");
+        assert!(agent0["is_running"].as_bool().unwrap());
+
+        // repo-b should have 0 agents, 1 devcontainer
+        let repo_b = &repos[2];
+        assert_eq!(repo_b["active_count"], 0);
+        assert_eq!(repo_b["agents"].as_array().unwrap().len(), 0);
+        assert_eq!(repo_b["devcontainers"].as_array().unwrap().len(), 1);
+        let dc0 = &repo_b["devcontainers"][0];
+        assert_eq!(dc0["short_name"], "baz-ghi");
+        assert!(dc0["is_running"].as_bool().unwrap());
+
+        // "unknown" should have 1 active, 1 agent
+        let unknown = &repos[1];
+        assert_eq!(unknown["repo"], "unknown");
+        assert_eq!(unknown["active_count"], 1);
+        assert_eq!(unknown["agents"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn test_pod_state_cache_ignores_unknown_fields() {
         // Forward-compatible: extra fields in the JSON should be ignored
@@ -4059,5 +5831,101 @@ mod tests {
         let json = r#"{"source":"https://github.com/org/repo"}"#;
         let req: RunRequest = serde_json::from_str(json).unwrap();
         assert!(req.title.is_none());
+    }
+
+    #[test]
+    fn test_parse_commit_log_normal() {
+        let input = "abc123\0Fix the bug\0Alice\02026-01-01T00:00:00Z\n\
+                      def456\0Add feature\0Bob\02026-01-02T00:00:00Z";
+        let commits = super::parse_commit_log(input);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "abc123");
+        assert_eq!(commits[0].message, "Fix the bug");
+        assert_eq!(commits[0].author, "Alice");
+        assert_eq!(commits[1].sha, "def456");
+        assert_eq!(commits[1].author, "Bob");
+    }
+
+    #[test]
+    fn test_parse_commit_log_empty() {
+        assert!(super::parse_commit_log("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_commit_log_malformed_lines_skipped() {
+        let input = "abc123\0Fix\n\
+                      bad-line-no-nulls\n\
+                      def456\0Add\0Bob\02026-01-01T00:00:00Z";
+        let commits = super::parse_commit_log(input);
+        // Only the last line has 4 fields
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].sha, "def456");
+    }
+
+    #[test]
+    fn test_format_review_message_with_comments() {
+        let req = super::ReviewRequest {
+            message: Some("Please fix the tests".to_string()),
+            comments: vec![
+                super::ReviewComment {
+                    file: "src/main.rs".to_string(),
+                    line: Some(42),
+                    body: "This is wrong".to_string(),
+                },
+                super::ReviewComment {
+                    file: "src/lib.rs".to_string(),
+                    line: None,
+                    body: "Missing docs".to_string(),
+                },
+            ],
+        };
+        let msg = super::format_review_message(&req);
+        assert!(msg.contains("Code Review Feedback"));
+        assert!(msg.contains("Please fix the tests"));
+        assert!(msg.contains("`src/main.rs:42`"));
+        assert!(msg.contains("`src/lib.rs`"));
+        assert!(msg.contains("This is wrong"));
+        assert!(msg.contains("Missing docs"));
+    }
+
+    #[test]
+    fn test_format_review_message_no_comments() {
+        let req = super::ReviewRequest {
+            message: Some("Looks good overall".to_string()),
+            comments: vec![],
+        };
+        let msg = super::format_review_message(&req);
+        assert!(msg.contains("Looks good overall"));
+        assert!(!msg.contains("Inline Comments"));
+    }
+
+    #[test]
+    fn test_harvest_result_serialization() {
+        let result = HarvestResult {
+            repos: vec![HarvestedRepo {
+                repo_name: "devaipod".to_string(),
+                target_repo: "/home/user/src/devaipod".to_string(),
+                remote_name: "devaipod/my-workspace".to_string(),
+                branches: vec!["devaipod/my-workspace/devaipod/fix-auth".to_string()],
+            }],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("devaipod"));
+        assert!(json.contains("fix-auth"));
+
+        // Verify field names
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["repos"][0]["repo_name"].is_string());
+        assert!(parsed["repos"][0]["target_repo"].is_string());
+        assert!(parsed["repos"][0]["remote_name"].is_string());
+        assert!(parsed["repos"][0]["branches"].is_array());
+    }
+
+    #[test]
+    fn test_harvest_result_empty() {
+        let result = HarvestResult { repos: vec![] };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["repos"].as_array().unwrap().len(), 0);
     }
 }

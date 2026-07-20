@@ -192,9 +192,11 @@ fn test_readonly_pod_exists(fixture: &SharedFixture) -> Result<()> {
     // Verify instance is running (podman uses .State, not .Status)
     let format_state = "{{.State}}";
     let state = cmd!(sh, "podman pod inspect {pod_name} --format {format_state}").read()?;
+    // Accept "Running" or "Degraded" — the latter is expected when the
+    // service-gator container exits (test repos use fake remote URLs).
     assert!(
-        state.contains("Running"),
-        "Shared instance should be running, got: {}",
+        state.contains("Running") || state.contains("Degraded"),
+        "Shared instance should be running or degraded, got: {}",
         state
     );
 
@@ -207,8 +209,8 @@ fn test_readonly_can_exec(fixture: &SharedFixture) -> Result<()> {
     // Use short_name() for devaipod CLI commands
     let short_name = fixture.short_name();
 
-    // Run a simple command via exec -W (workspace container)
-    let output = run_devaipod(&["exec", "-W", short_name, "--", "echo", "hello-from-shared"])?;
+    // Run a simple command via exec (agent container)
+    let output = run_devaipod(&["exec", short_name, "--", "echo", "hello-from-shared"])?;
     output.assert_success("devaipod exec echo");
     assert!(
         output.stdout.contains("hello-from-shared"),
@@ -217,7 +219,7 @@ fn test_readonly_can_exec(fixture: &SharedFixture) -> Result<()> {
     );
 
     // Verify we can see the workspace
-    let ls_output = run_devaipod(&["exec", "-W", short_name, "--", "ls", "/workspaces"])?;
+    let ls_output = run_devaipod(&["exec", short_name, "--", "ls", "/workspaces"])?;
     ls_output.assert_success("devaipod exec ls");
     assert!(
         ls_output.stdout.contains("shared-test-repo"),
@@ -278,11 +280,6 @@ fn test_readonly_containers_exist(fixture: &SharedFixture) -> Result<()> {
     )
     .read()?;
 
-    assert!(
-        ps_output.contains("workspace"),
-        "Pod should have workspace container: {}",
-        ps_output
-    );
     assert!(
         ps_output.contains("agent"),
         "Pod should have agent container: {}",
@@ -544,11 +541,6 @@ fn test_pod_creation_and_deletion() -> Result<()> {
     )
     .read()?;
     assert!(
-        ps_output.contains("workspace"),
-        "Pod should have workspace container: {}",
-        ps_output
-    );
-    assert!(
         ps_output.contains("agent"),
         "Pod should have agent container: {}",
         ps_output
@@ -580,45 +572,6 @@ fn test_pod_creation_and_deletion() -> Result<()> {
 }
 podman_integration_test!(test_pod_creation_and_deletion);
 
-fn test_workspace_container_has_repo() -> Result<()> {
-    let repo = TestRepo::new()?;
-    let pod_name = unique_test_name("test-repo");
-
-    let mut pods = PodGuard::new();
-    pods.add(&pod_name);
-
-    // Create pod (pass short name, devaipod adds prefix)
-    let output = run_devaipod_in(
-        &repo.repo_path,
-        &["up", ".", "--name", short_name(&pod_name)],
-    )?;
-    if !output.success() {
-        bail!("devaipod up failed: {}", output.combined());
-    }
-
-    let workspace_container = format!("{}-workspace", pod_name);
-
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&workspace_container, Duration::from_secs(30))?;
-
-    let sh = shell()?;
-
-    // Verify workspace container has the repository cloned
-    let ls_output = cmd!(
-        sh,
-        "podman exec {workspace_container} ls /workspaces/test-repo"
-    )
-    .read()?;
-    assert!(
-        ls_output.contains("README.md"),
-        "Workspace should have README.md: {}",
-        ls_output
-    );
-
-    Ok(())
-}
-podman_integration_test!(test_workspace_container_has_repo);
-
 fn test_stop_and_start_pod() -> Result<()> {
     let repo = TestRepo::new()?;
     let pod_name = unique_test_name("test-stop");
@@ -641,12 +594,22 @@ fn test_stop_and_start_pod() -> Result<()> {
 
     let sh = shell()?;
 
-    // Verify pod is stopped (containers should not be running)
-    let ps_output = cmd!(sh, "podman ps -q --filter pod={pod_name}").read()?;
+    // Verify pod is stopped. Give podman a moment to tear down containers,
+    // then check that no application containers are still running (the infra
+    // container may linger briefly).
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let format_filter = "{{.Names}}";
+    let ps_output = cmd!(
+        sh,
+        "podman ps --filter pod={pod_name} --format {format_filter}"
+    )
+    .read()?;
+    let running_app_containers: Vec<&str> =
+        ps_output.lines().filter(|l| !l.contains("infra")).collect();
     assert!(
-        ps_output.trim().is_empty(),
-        "No containers should be running after stop: {}",
-        ps_output
+        running_app_containers.is_empty(),
+        "No app containers should be running after stop: {:?}",
+        running_app_containers
     );
 
     // Start pod again via podman (devaipod up would create a new pod now)
@@ -702,7 +665,7 @@ fn test_image_override_creates_pod() -> Result<()> {
         pod_name
     );
 
-    // Verify workspace container is running
+    // Verify agent container is running
     let format_names = "{{.Names}}";
     let ps_output = cmd!(
         sh,
@@ -710,8 +673,8 @@ fn test_image_override_creates_pod() -> Result<()> {
     )
     .read()?;
     assert!(
-        ps_output.contains("workspace"),
-        "Pod should have workspace container: {}",
+        ps_output.contains("agent"),
+        "Pod should have agent container: {}",
         ps_output
     );
 
@@ -735,8 +698,8 @@ fn test_logs_command() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // Get logs (should not error even if empty) - use short name for CLI
     let logs_output = run_devaipod(&["logs", short_name(&pod_name)])?;
@@ -763,8 +726,8 @@ fn test_exec_runs_command() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // Run a command via exec (defaults to agent container)
     let exec_output = run_devaipod(&["exec", short_name(&pod_name), "--", "echo", "hello"])?;
@@ -782,22 +745,6 @@ fn test_exec_runs_command() -> Result<()> {
         ls_output.stdout.contains("test-repo"),
         "Should see workspace directory: {}",
         ls_output.stdout
-    );
-
-    // Also verify exec -W works (workspace container)
-    let ws_output = run_devaipod(&[
-        "exec",
-        "-W",
-        short_name(&pod_name),
-        "--",
-        "echo",
-        "workspace",
-    ])?;
-    ws_output.assert_success("devaipod exec -W echo");
-    assert!(
-        ws_output.stdout.contains("workspace"),
-        "exec -W should run command in workspace container: {}",
-        ws_output.combined()
     );
 
     Ok(())
@@ -923,31 +870,13 @@ fn test_api_authentication_works() -> Result<()> {
 }
 podman_integration_test!(test_api_authentication_works);
 
-/// Verify agent container has matching security settings to workspace.
+/// Verify agent container has appropriate security settings for nested containers.
 ///
-/// In rootless podman, capabilities are relative to the user namespace, so both
-/// containers should have the same security settings to enable nested containers.
-fn test_agent_matches_workspace_security(fixture: &SharedFixture) -> Result<()> {
+/// In rootless podman, capabilities are relative to the user namespace, so the
+/// agent container needs the right security settings to enable nested containers.
+fn test_agent_security_settings(fixture: &SharedFixture) -> Result<()> {
     let sh = shell()?;
-    let workspace = fixture.workspace_container();
     let agent = fixture.agent_container();
-
-    // Check that both containers have SELinux disabled (label=disable) if workspace does
-    // We check this by looking at the security options in the container inspect output
-    let format_security = "{{json .HostConfig.SecurityOpt}}";
-    let workspace_security =
-        cmd!(sh, "podman inspect {workspace} --format {format_security}").read()?;
-    let agent_security = cmd!(sh, "podman inspect {agent} --format {format_security}").read()?;
-
-    // If workspace has label:disable, agent should too
-    if workspace_security.contains("label") {
-        assert!(
-            agent_security.contains("label"),
-            "Agent should have same SELinux settings as workspace.\nWorkspace: {}\nAgent: {}",
-            workspace_security,
-            agent_security
-        );
-    }
 
     // Check that agent doesn't have no-new-privileges (which would block nested containers)
     let format_nnp = "{{.HostConfig.SecurityOpt}}";
@@ -960,42 +889,30 @@ fn test_agent_matches_workspace_security(fixture: &SharedFixture) -> Result<()> 
 
     Ok(())
 }
-readonly_test!(test_agent_matches_workspace_security);
+readonly_test!(test_agent_security_settings);
 
-/// Verify both workspace and agent containers can run commands that require user namespaces.
+/// Verify the agent container can run commands that require user namespaces.
 ///
 /// This tests that newuidmap/newgidmap work, which is required for nested containers.
 /// We test by checking if unshare --user works (creates a user namespace).
-fn test_containers_support_user_namespaces(fixture: &SharedFixture) -> Result<()> {
+fn test_agent_supports_user_namespaces(fixture: &SharedFixture) -> Result<()> {
     let sh = shell()?;
-    let workspace = fixture.workspace_container();
     let agent = fixture.agent_container();
-
-    // Test workspace can create user namespace
-    let workspace_unshare = cmd!(
-        sh,
-        "podman exec {workspace} unshare --user --map-root-user id"
-    )
-    .ignore_status()
-    .output()?;
 
     // Test agent can create user namespace
     let agent_unshare = cmd!(sh, "podman exec {agent} unshare --user --map-root-user id")
         .ignore_status()
         .output()?;
 
-    // If workspace supports user namespaces, agent should too
-    if workspace_unshare.status.success() {
-        assert!(
-            agent_unshare.status.success(),
-            "Agent should support user namespaces like workspace.\nWorkspace: success\nAgent stderr: {}",
-            String::from_utf8_lossy(&agent_unshare.stderr)
-        );
-    }
+    assert!(
+        agent_unshare.status.success(),
+        "Agent should support user namespaces.\nAgent stderr: {}",
+        String::from_utf8_lossy(&agent_unshare.stderr)
+    );
 
     Ok(())
 }
-readonly_test!(test_containers_support_user_namespaces);
+readonly_test!(test_agent_supports_user_namespaces);
 
 /// Verify agent container has access to devices when devcontainer.json specifies them.
 ///
@@ -1033,38 +950,24 @@ fn test_agent_device_passthrough() -> Result<()> {
 
     let sh = shell()?;
     let agent_container = format!("{}-agent", pod_name);
-    let workspace_container = format!("{}-workspace", pod_name);
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&workspace_container, Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&agent_container, Duration::from_secs(30))?;
 
-    // Verify workspace has /dev/kvm
-    let workspace_kvm = cmd!(sh, "podman exec {workspace_container} test -e /dev/kvm")
-        .ignore_status()
-        .output()?;
-    assert!(
-        workspace_kvm.status.success(),
-        "Workspace should have /dev/kvm"
-    );
-
-    // Verify agent also has /dev/kvm
+    // Verify agent has /dev/kvm
     let agent_kvm = cmd!(sh, "podman exec {agent_container} test -e /dev/kvm")
         .ignore_status()
         .output()?;
-    assert!(
-        agent_kvm.status.success(),
-        "Agent should have /dev/kvm like workspace"
-    );
+    assert!(agent_kvm.status.success(), "Agent should have /dev/kvm");
 
     Ok(())
 }
 podman_integration_test!(test_agent_device_passthrough);
 
-/// Verify lifecycle commands (postCreateCommand) run in BOTH workspace and agent containers.
+/// Verify lifecycle commands (postCreateCommand) run in the agent container.
 ///
 /// This is critical for init scripts that configure nested podman, subuid mappings, etc.
-/// Both containers need these configurations for nested containers to work.
-fn test_lifecycle_commands_run_in_both_containers() -> Result<()> {
+fn test_lifecycle_commands_run_in_agent() -> Result<()> {
     // Create a devcontainer with a postCreateCommand that creates a marker file
     let marker_path = "/tmp/lifecycle-test-marker";
     let devcontainer_json = format!(
@@ -1093,23 +996,8 @@ fn test_lifecycle_commands_run_in_both_containers() -> Result<()> {
 
     let sh = shell()?;
     let agent_container = format!("{}-agent", pod_name);
-    let workspace_container = format!("{}-workspace", pod_name);
 
     let timeout = Duration::from_secs(60);
-
-    // Poll for marker file in workspace container
-    let workspace_marker = wait_for_file_content(
-        &sh,
-        &workspace_container,
-        marker_path,
-        "lifecycle-ran",
-        timeout,
-    )?;
-    assert!(
-        workspace_marker.contains("lifecycle-ran"),
-        "Workspace should have marker file from postCreateCommand: {}",
-        workspace_marker
-    );
 
     // Poll for marker file in agent container
     let agent_marker =
@@ -1122,13 +1010,13 @@ fn test_lifecycle_commands_run_in_both_containers() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_lifecycle_commands_run_in_both_containers);
+podman_integration_test!(test_lifecycle_commands_run_in_agent);
 
-/// Verify that a more complex init script runs in both containers.
+/// Verify that a more complex init script runs in the agent container.
 ///
 /// This simulates what devenv-init.sh does: creates config files that are needed
 /// for nested container operations.
-fn test_init_script_configures_both_containers() -> Result<()> {
+fn test_init_script_configures_agent() -> Result<()> {
     // Create a devcontainer with an init script that creates a config file
     let config_path = "/tmp/nested-container-config";
     let devcontainer_json = format!(
@@ -1157,23 +1045,8 @@ fn test_init_script_configures_both_containers() -> Result<()> {
 
     let sh = shell()?;
     let agent_container = format!("{}-agent", pod_name);
-    let workspace_container = format!("{}-workspace", pod_name);
 
     let timeout = Duration::from_secs(60);
-
-    // Poll for config file in workspace container
-    let workspace_config = wait_for_file_content(
-        &sh,
-        &workspace_container,
-        config_path,
-        "subuid_configured=true",
-        timeout,
-    )?;
-    assert!(
-        workspace_config.contains("subuid_configured=true"),
-        "Workspace should have config from init script: {}",
-        workspace_config
-    );
 
     // Poll for config file in agent container
     let agent_config = wait_for_file_content(
@@ -1191,17 +1064,16 @@ fn test_init_script_configures_both_containers() -> Result<()> {
 
     Ok(())
 }
-podman_integration_test!(test_init_script_configures_both_containers);
+podman_integration_test!(test_init_script_configures_agent);
 
 // =============================================================================
 // Agent workspace isolation tests
 // =============================================================================
 
-/// Verify that the agent container has its own /workspaces directory that is separate
-/// from the workspace container's /workspaces.
+/// Verify that the agent container has its own /workspaces directory with a clone
+/// of the repository.
 ///
-/// This tests the core workspace isolation feature: the agent gets a git clone with
-/// --reference to share objects, but has its own working tree.
+/// The agent gets a git clone of the repo at /workspaces/<project>.
 fn test_agent_has_separate_workspace() -> Result<()> {
     let repo = TestRepo::new()?;
     let pod_name = unique_test_name("test-agent-ws");
@@ -1219,49 +1091,32 @@ fn test_agent_has_separate_workspace() -> Result<()> {
     }
 
     let sh = shell()?;
-    let workspace_container = format!("{}-workspace", pod_name);
     let agent_container = format!("{}-agent", pod_name);
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&workspace_container, Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&agent_container, Duration::from_secs(30))?;
 
-    // Create a unique marker file in the workspace container
-    let workspace_marker = "workspace-unique-marker-12345";
-    let ws_marker_cmd = format!(
-        "echo '{}' > /workspaces/test-repo/workspace-marker.txt",
-        workspace_marker
+    // Verify agent has /workspaces with the project
+    let ls_output = cmd!(sh, "podman exec {agent_container} ls /workspaces").read()?;
+    assert!(
+        ls_output.contains("test-repo"),
+        "Agent should have test-repo in /workspaces: {}",
+        ls_output
     );
-    cmd!(
-        sh,
-        "podman exec {workspace_container} sh -c {ws_marker_cmd}"
-    )
-    .run()?;
 
-    // Verify the workspace container can see its marker
-    let ws_check = cmd!(
+    // Verify the clone has the expected content
+    let readme_check = cmd!(
         sh,
-        "podman exec {workspace_container} cat /workspaces/test-repo/workspace-marker.txt"
+        "podman exec {agent_container} cat /workspaces/test-repo/README.md"
     )
     .read()?;
     assert!(
-        ws_check.contains(workspace_marker),
-        "Workspace should see its own marker: {}",
-        ws_check
+        readme_check.contains("Test Repo") || readme_check.contains('#'),
+        "Agent workspace should have README.md: {}",
+        readme_check
     );
 
-    // Verify the agent container does NOT see the workspace marker
-    let agent_check_ws = cmd!(
-        sh,
-        "podman exec {agent_container} cat /workspaces/test-repo/workspace-marker.txt"
-    )
-    .ignore_status()
-    .output()?;
-    assert!(
-        !agent_check_ws.status.success(),
-        "Agent should NOT see workspace's marker file (has separate workspace)"
-    );
-
-    // Create a unique marker file in the agent container
+    // Create a marker file to verify the workspace is writable
     let agent_marker = "agent-unique-marker-67890";
     let agent_marker_cmd = format!(
         "echo '{}' > /workspaces/test-repo/agent-marker.txt",
@@ -1279,18 +1134,6 @@ fn test_agent_has_separate_workspace() -> Result<()> {
         agent_check.contains(agent_marker),
         "Agent should see its own marker: {}",
         agent_check
-    );
-
-    // Verify the workspace container does NOT see the agent marker
-    let ws_check_agent = cmd!(
-        sh,
-        "podman exec {workspace_container} cat /workspaces/test-repo/agent-marker.txt"
-    )
-    .ignore_status()
-    .output()?;
-    assert!(
-        !ws_check_agent.status.success(),
-        "Workspace should NOT see agent's marker file (has separate workspace)"
     );
 
     Ok(())
@@ -1320,8 +1163,8 @@ fn test_agent_cannot_write_to_main_workspace() -> Result<()> {
     let sh = shell()?;
     let agent_container = format!("{}-agent", pod_name);
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // First verify the mount point exists and is accessible for reading
     let read_check = cmd!(
@@ -1396,8 +1239,8 @@ fn test_agent_workspace_shares_git_objects() -> Result<()> {
     let sh = shell()?;
     let agent_container = format!("{}-agent", pod_name);
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // Check that the alternates file exists in the agent's git repo
     let alternates_check = cmd!(
@@ -1426,24 +1269,15 @@ fn test_agent_workspace_shares_git_objects() -> Result<()> {
 }
 podman_integration_test!(test_agent_workspace_shares_git_objects);
 
-/// Readonly test: Verify the agent workspace isolation volumes are set up correctly.
+/// Readonly test: Verify the agent workspace mounts are set up correctly.
 ///
-/// This is a lightweight check that uses the shared fixture to verify the volume
+/// This is a lightweight check that uses the shared fixture to verify the mount
 /// configuration without modifying state.
 fn test_readonly_agent_has_separate_workspace(fixture: &SharedFixture) -> Result<()> {
     let sh = shell()?;
-    let workspace = fixture.workspace_container();
     let agent = fixture.agent_container();
 
-    // Verify both containers have /workspaces mounted
-    let ws_workspaces = cmd!(sh, "podman exec {workspace} ls /workspaces")
-        .ignore_status()
-        .output()?;
-    assert!(
-        ws_workspaces.status.success(),
-        "Workspace container should have /workspaces"
-    );
-
+    // Verify agent has /workspaces mounted
     let agent_workspaces = cmd!(sh, "podman exec {agent} ls /workspaces")
         .ignore_status()
         .output()?;
@@ -1501,7 +1335,7 @@ readonly_test!(test_readonly_agent_has_separate_workspace);
 /// Verify that the gator container can access the agent's workspace.
 ///
 /// With agent isolation, the gator needs to read from /workspaces/<project>
-/// which is mounted from the agent-workspace volume (not main workspace).
+/// which is bind-mounted from the host agent directory (not main workspace).
 /// This is required for git_push_local to read the agent's commits.
 fn test_gator_can_access_agent_workspace() -> Result<()> {
     let repo = TestRepo::new()?;
@@ -1697,8 +1531,8 @@ fn test_gator_scopes_configuration() -> Result<()> {
         bail!("devaipod up failed: {}", output.combined());
     }
 
-    // Wait for workspace container to be ready
-    crate::wait_for_container_running(&format!("{}-workspace", pod_name), Duration::from_secs(30))?;
+    // Wait for agent container to be ready
+    crate::wait_for_container_running(&format!("{}-agent", pod_name), Duration::from_secs(30))?;
 
     // 1. Verify pod has service-gator label with scope config
     let labels_str = podman_pod_inspect(&pod_name, "{{json .Labels}}")?;
@@ -1939,7 +1773,7 @@ fn test_forward_ports_published() -> Result<()> {
 }
 podman_integration_test!(test_forward_ports_published);
 
-/// Verify that rebuild reads devcontainer.json from the workspace volume
+/// Verify that rebuild reads devcontainer.json from the workspace
 /// rather than cloning the remote. Modifying devcontainer.json inside the
 /// workspace (adding forwardPorts) should be reflected after rebuild.
 fn test_rebuild_reads_workspace_devcontainer() -> Result<()> {
@@ -1964,20 +1798,20 @@ fn test_rebuild_reads_workspace_devcontainer() -> Result<()> {
         "Port 9877 should not be published before rebuild"
     );
 
-    // Wait for the workspace container to have the cloned repo ready
-    let workspace_container = format!("{}-workspace", pod_name);
+    // Wait for the agent container to have the cloned repo ready
+    let agent_container = format!("{}-agent", pod_name);
     let sh = shell()?;
     let dc_path = "/workspaces/test-repo/.devcontainer/devcontainer.json";
     wait_for_file_content(
         &sh,
-        &workspace_container,
+        &agent_container,
         dc_path,
         "image",
         Duration::from_secs(30),
     )
-    .context("devcontainer.json should appear in workspace")?;
+    .context("devcontainer.json should appear in agent workspace")?;
 
-    // Modify devcontainer.json inside the workspace container to add forwardPorts
+    // Modify devcontainer.json inside the agent container to add forwardPorts
     let image = std::env::var("DEVAIPOD_TEST_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/bootc-dev/devenv-debian:latest".to_string());
     let new_dc = format!(
@@ -1986,7 +1820,7 @@ fn test_rebuild_reads_workspace_devcontainer() -> Result<()> {
     );
     let write_script = format!("printf '%s' '{}' > {}", new_dc, dc_path);
     let write_output = Command::new("podman")
-        .args(["exec", &workspace_container, "sh", "-c", &write_script])
+        .args(["exec", &agent_container, "sh", "-c", &write_script])
         .output()
         .context("Failed to write updated devcontainer.json")?;
     assert!(

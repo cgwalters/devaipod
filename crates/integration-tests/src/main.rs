@@ -72,8 +72,8 @@ impl Drop for PodmanServiceGuard {
 // Re-export from lib for test registration
 pub(crate) use integration_tests::{
     INTEGRATION_TESTS, READONLY_INTEGRATION_TESTS, SharedFixture, container_integration_test,
-    integration_test, podman_integration_test, poll_until, readonly_test,
-    wait_for_container_running, wait_for_file,
+    integration_test, podman_integration_test, readonly_test, wait_for_container_running,
+    wait_for_file,
 };
 
 mod tests;
@@ -325,9 +325,9 @@ impl CapturedOutput {
 /// outside its own container image (needed for local dev and devaipod-in-devaipod).
 ///
 /// Honors `DEVAIPOD_PATH` to locate the binary (useful for local dev where
-/// the binary is at `./target/debug/devaipod` instead of on `$PATH`).
+/// the binary is at `./target/debug/devaipod-server` instead of on `$PATH`).
 fn devaipod_command() -> Command {
-    let binary = std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod".to_string());
+    let binary = std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod-server".to_string());
     let mut cmd = Command::new(binary);
     cmd.env(
         "DEVAIPOD_INSTANCE",
@@ -391,13 +391,13 @@ pub(crate) fn run_devaipod_with_env(
 
 /// Get the path to the devaipod binary.
 ///
-/// In the containerized test runner, devaipod is at /usr/bin/devaipod.
+/// In the containerized test runner, devaipod-server is at /usr/bin/devaipod-server.
 /// Override with DEVAIPOD_PATH for local development.
 pub(crate) fn get_devaipod_binary_path() -> Result<String> {
     if let Ok(path) = std::env::var("DEVAIPOD_PATH") {
         return Ok(path);
     }
-    Ok("devaipod".to_string())
+    Ok("devaipod-server".to_string())
 }
 
 /// Create a temporary git repository for testing
@@ -575,6 +575,14 @@ impl PodGuard {
 
 impl Drop for PodGuard {
     fn drop(&mut self) {
+        let ws_base = std::env::var("DEVAIPOD_HOST_WORKDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share/devaipod/workspaces"))
+            })
+            .ok();
+
         for name in &self.names {
             // Best effort cleanup - remove pod which removes all containers in it
             let _ = Command::new("podman")
@@ -586,6 +594,17 @@ impl Drop for PodGuard {
                 let _ = Command::new("podman")
                     .args(["volume", "rm", "-f", &volume_name])
                     .output();
+            }
+            // Remove host-side workspace directory.
+            // Use `podman unshare` because files are owned by container subuids.
+            if let Some(ref base) = ws_base {
+                let ws_dir = base.join(name);
+                if ws_dir.exists() {
+                    let _ = Command::new("podman")
+                        .args(["unshare", "rm", "-rf"])
+                        .arg(&ws_dir)
+                        .output();
+                }
             }
         }
     }

@@ -59,7 +59,7 @@ jobs:
       - name: Debug failing tests (host mode)
         if: failure()
         run: |
-          DEVAIPOD_PATH="${PWD}/target/debug/devaipod" \
+          DEVAIPOD_PATH="${PWD}/target/debug/devaipod-server" \
           DEVAIPOD_HOST_MODE=1 \
           RUST_LOG=devaipod=debug \
             cargo test -p integration-tests -- test_harness_completion_status_e2e --nocapture 2>&1 || true

@@ -13,6 +13,7 @@
 //!
 //! See: git clone --reference, git clone --dissociate
 
+use color_eyre::eyre::{Context, Result, bail};
 use std::path::Path;
 use std::process::Command;
 
@@ -28,7 +29,10 @@ pub const REMOTE_FORK: &str = "fork";
 
 // Cross-container remotes for collaboration:
 
-/// In workspace container: points to agent's workspace git
+/// In workspace container: points to agent's workspace git.
+/// Currently unused since agent pods no longer have a workspace container,
+/// but retained for future standalone devcontainer mode.
+#[allow(dead_code)]
 pub const REMOTE_AGENT: &str = "agent";
 
 /// In agent container: points to human's workspace git
@@ -40,7 +44,14 @@ pub const REMOTE_WORKER: &str = "worker";
 /// In worker container: points to task owner's workspace git
 pub const REMOTE_OWNER: &str = "owner";
 
-use color_eyre::eyre::{Context, Result, bail};
+/// Generate a branch name for an agent workspace.
+///
+/// Uses the `devaipod/` namespace so agent branches are easily
+/// identifiable via `git branch --list 'devaipod/*'` after
+/// `devaipod fetch`.
+pub fn agent_branch_name(slug: &str) -> String {
+    format!("devaipod/{}", slug)
+}
 
 /// Get a GitHub token from the environment (checks GH_TOKEN and GITHUB_TOKEN)
 pub fn get_github_token() -> Option<String> {
@@ -295,12 +306,20 @@ fn get_current_branch(project_path: &Path) -> Option<String> {
 /// (or reset) a local branch at the given commit. This avoids detached HEAD state,
 /// which is confusing for agents and users working in the container.
 ///
-/// When no branch is known, creates a `devaipod-work` branch rather than
-/// leaving HEAD detached, since detached HEAD confuses agents that need
-/// to commit.
-fn checkout_cmd(commit: &str, branch: Option<&str>) -> String {
-    let branch = branch.unwrap_or("devaipod-work");
-    format!(r#"git checkout -B "{branch}" "{commit}" 2>&1"#)
+/// When `slug` is provided, uses `devaipod/<slug>` as the branch name (for agent
+/// workspaces). This makes agent branches discoverable via
+/// `git branch --list 'devaipod/*'` after `devaipod fetch`.
+///
+/// When no branch is known and no slug is provided, creates a `devaipod-work`
+/// branch rather than leaving HEAD detached, since detached HEAD confuses
+/// agents that need to commit.
+fn checkout_cmd(commit: &str, branch: Option<&str>, slug: Option<&str>) -> String {
+    let branch_name = if let Some(slug) = slug {
+        agent_branch_name(slug)
+    } else {
+        branch.unwrap_or("devaipod-work").to_string()
+    };
+    format!(r#"git checkout -B "{branch_name}" "{commit}" 2>&1"#)
 }
 
 /// Generate a shell script to clone and checkout a repository from remote
@@ -322,7 +341,7 @@ pub fn clone_script(git_info: &GitRepoInfo, workspace_folder: &str) -> Result<St
         )
     })?;
 
-    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref(), None);
 
     let script = format!(
         r#"
@@ -396,7 +415,7 @@ git remote add {REMOTE_FORK} "{fork_url}" 2>/dev/null || git remote set-url {REM
         String::new()
     };
 
-    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref(), None);
 
     format!(
         r#"
@@ -469,7 +488,7 @@ git remote add {REMOTE_FORK} "{fork_url}" 2>/dev/null || git remote set-url {REM
         String::new()
     };
 
-    let checkout = checkout_cmd(&pr_info.head_sha, Some(&pr_info.head_ref));
+    let checkout = checkout_cmd(&pr_info.head_sha, Some(&pr_info.head_ref), None);
 
     format!(
         r#"
@@ -652,6 +671,7 @@ pub fn clone_agent_workspace_script(
     reference_git_path: &str,
     git_info: &GitRepoInfo,
     target_user: Option<&str>,
+    slug: Option<&str>,
 ) -> String {
     // Clone from the local reference repository's .git directory using --shared.
     // This is much faster than cloning from remote since all objects are local.
@@ -677,7 +697,7 @@ git remote set-url origin "{url}" 2>/dev/null || git remote add origin "{url}"
         String::new()
     };
 
-    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref(), slug);
 
     format!(
         r#"
@@ -786,7 +806,7 @@ git remote add {REMOTE_OWNER} "{reference}/.git" 2>/dev/null || git remote set-u
         )
     };
 
-    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref());
+    let checkout = checkout_cmd(&git_info.commit_sha, git_info.branch.as_deref(), None);
 
     format!(
         r#"
@@ -1283,6 +1303,7 @@ mod tests {
             "/mnt/main-workspace",
             &info,
             Some("devenv"),
+            Some("my-workspace"),
         );
 
         // Should clone from local reference with shared objects
@@ -1304,6 +1325,11 @@ mod tests {
         assert!(
             script.contains("abc123def456789"),
             "should checkout the commit"
+        );
+        // Should use devaipod/<slug> branch naming
+        assert!(
+            script.contains("devaipod/my-workspace"),
+            "should use devaipod/<slug> branch naming"
         );
         // Should set up origin remote
         assert!(
@@ -1335,8 +1361,13 @@ mod tests {
             fork_url: None,
         };
 
-        let script =
-            clone_agent_workspace_script("/workspaces/project", "/mnt/main-workspace", &info, None);
+        let script = clone_agent_workspace_script(
+            "/workspaces/project",
+            "/mnt/main-workspace",
+            &info,
+            None,
+            Some("test-pod"),
+        );
 
         // Should clone directly from reference with shared objects
         assert!(
@@ -1347,6 +1378,11 @@ mod tests {
         assert!(
             script.contains("abc123def456789"),
             "should checkout the commit"
+        );
+        // Should use devaipod/<slug> branch naming even without source branch
+        assert!(
+            script.contains("devaipod/test-pod"),
+            "should use devaipod/<slug> branch naming"
         );
         // Should NOT have chown (no target user)
         assert!(
@@ -1372,10 +1408,16 @@ mod tests {
             "/mnt/main-workspace",
             &info,
             None, // No target user
+            Some("feat-ws"),
         );
 
         // Should still clone from local reference with shared objects
         assert!(script.contains("--shared"));
+        // Should use devaipod/<slug> branch naming
+        assert!(
+            script.contains("devaipod/feat-ws"),
+            "should use devaipod/<slug> branch naming"
+        );
         // Should NOT have chown
         assert!(
             !script.contains("chown"),
@@ -1487,6 +1529,15 @@ mod tests {
         assert!(
             !script.contains("chown"),
             "should not chown without target user"
+        );
+    }
+
+    #[test]
+    fn test_agent_branch_name() {
+        assert_eq!(agent_branch_name("fix-auth"), "devaipod/fix-auth");
+        assert_eq!(
+            agent_branch_name("add-metrics-abc123"),
+            "devaipod/add-metrics-abc123"
         );
     }
 }

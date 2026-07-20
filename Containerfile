@@ -35,9 +35,9 @@
 #     ghcr.io/cgwalters/devaipod
 #
 # Interact via CLI:
-#   podman exec devaipod devaipod run https://github.com/org/repo -c 'fix bug'
-#   podman exec -ti devaipod devaipod attach -l
-#   podman exec -ti devaipod devaipod tui
+#   podman exec devaipod devaipod-server run https://github.com/org/repo -c 'fix bug'
+#   podman exec -ti devaipod devaipod-server attach -l
+#   podman exec -ti devaipod devaipod-server tui
 #
 # Note: --privileged is required for socket access and for spawning privileged
 # workspace containers (needed for nested podman in devcontainers).
@@ -145,7 +145,7 @@ RUN --network=none \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo build --release -p devaipod && \
-    cp /src/target/release/devaipod /usr/bin/devaipod
+    cp /src/target/release/devaipod-server /usr/bin/devaipod-server
 
 # -- unit tests (built from the build stage, run via `just test-container`) --
 FROM build AS units
@@ -167,7 +167,7 @@ RUN --network=none \
 # to exercise the full workflow including container orchestration.
 FROM build AS integration
 # Build integration test binaries in release mode. The devaipod release binary
-# is already at /usr/bin/devaipod from the build stage.
+# is already at /usr/bin/devaipod-server from the build stage.
 # First compile with normal output so errors are visible and fail the build,
 # then re-run with --message-format=json to extract the binary paths.
 RUN --network=none \
@@ -199,7 +199,7 @@ RUN dnf install -y \
 
 COPY --from=integration /usr/lib/devaipod/integration /usr/lib/devaipod/integration
 COPY --from=integration /usr/bin/devaipod-integration /usr/bin/devaipod-integration
-COPY --from=integration /usr/bin/devaipod /usr/bin/devaipod
+COPY --from=integration /usr/bin/devaipod-server /usr/bin/devaipod-server
 
 ENV DEVAIPOD_CONTAINER=1
 ENV CONTAINER_HOST=unix:///run/docker.sock
@@ -220,8 +220,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/podman-remote /usr/bin/podman \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# The devaipod binary + SPA assets (needed for serving the web UI)
-COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
+# The devaipod-server binary + SPA assets (needed for serving the web UI)
+COPY --from=build /usr/bin/devaipod-server /usr/bin/devaipod-server
 COPY --from=opencode-web /build/packages/app/dist /usr/share/devaipod/opencode
 COPY --from=mdbook /src/docs/book /usr/share/devaipod/docs
 
@@ -254,7 +254,7 @@ RUN dnf install -y \
 # Create config and state directories
 RUN mkdir -p /root/.config /var/lib/devaipod
 
-COPY --from=build /usr/bin/devaipod /usr/bin/devaipod
+COPY --from=build /usr/bin/devaipod-server /usr/bin/devaipod-server
 
 # Install the opencode CLI agent binary; needed when this image is used as
 # the agent container for advisor pods.
@@ -287,4 +287,4 @@ WORKDIR /usr/share/devaipod
 #   # Copy the URL with token from logs:
 #   podman logs <container> | grep "Web UI"
 EXPOSE 8080
-CMD ["devaipod", "web", "--port", "8080"]
+CMD ["devaipod-server", "web", "--port", "8080"]

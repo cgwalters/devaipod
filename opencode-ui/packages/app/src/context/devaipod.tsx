@@ -78,6 +78,52 @@ export interface LaunchWorkspaceParams {
   title?: string
 }
 
+/** A recently-used source from the server (local path or remote URL). */
+export interface RecentSource {
+  source: string
+  last_used: string
+}
+
+/** Pod info from the devcontainer list endpoint. */
+export interface DevcontainerPod {
+  name: string
+  status: string
+  created: string
+  labels?: Record<string, string>
+  containers?: { Names: string; Status: string }[]
+}
+
+// ---------------------------------------------------------------------------
+// Control-plane types (repo-grouped view)
+// ---------------------------------------------------------------------------
+
+export interface ControlPlaneAgent {
+  name: string
+  short_name: string
+  status: string
+  task?: string
+  title?: string
+  completion_status?: string
+  last_active?: string
+  is_running: boolean
+  created: string
+}
+
+export interface ControlPlaneDevcontainer {
+  name: string
+  short_name: string
+  status: string
+  created: string
+  is_running: boolean
+}
+
+export interface ControlPlaneRepo {
+  repo: string
+  active_count: number
+  agents: ControlPlaneAgent[]
+  devcontainers: ControlPlaneDevcontainer[]
+}
+
 /** GitHub repo permission flags from the gator config */
 export interface GhRepoPermission {
   read?: boolean
@@ -158,9 +204,9 @@ export function effectiveTimestamp(pod: PodInfo): number {
  */
 export function frecencySortPods(pods: PodInfo[]): PodInfo[] {
   return [...pods].sort((a, b) => {
-    // Advisor always first
-    const aAdvisor = a.Name === ADVISOR_POD_NAME ? 1 : 0
-    const bAdvisor = b.Name === ADVISOR_POD_NAME ? 1 : 0
+    // Advisor always first (name ends with -advisor for multi-instance support)
+    const aAdvisor = a.Name.endsWith("-advisor") ? 1 : 0
+    const bAdvisor = b.Name.endsWith("-advisor") ? 1 : 0
     if (aAdvisor !== bAdvisor) return bAdvisor - aAdvisor
 
     // Running before stopped
@@ -322,6 +368,9 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       agentStatus: {} as Record<string, AgentStatus>,
       enrichment: {} as Record<string, { needs_update: boolean }>,
       proposals: [] as Proposal[],
+      recentSources: [] as RecentSource[],
+      devcontainers: [] as DevcontainerPod[],
+      controlPlane: [] as ControlPlaneRepo[],
       connected: undefined as boolean | undefined,
       error: undefined as string | undefined,
     })
@@ -411,6 +460,39 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       }
     }
 
+    // -- Recent sources (fetched once, refreshed on launch) ------------------
+
+    async function fetchRecentSources() {
+      try {
+        const sources = await apiFetch<RecentSource[]>("/api/devaipod/recent-sources")
+        setStore("recentSources", reconcile(sources, { key: "source", merge: true }))
+      } catch {
+        // Ignore — not critical
+      }
+    }
+
+    // -- Devcontainer list ---------------------------------------------------
+
+    async function fetchDevcontainers() {
+      try {
+        const list = await apiFetch<DevcontainerPod[]>("/api/devaipod/devcontainer/list")
+        setStore("devcontainers", reconcile(list, { key: "name", merge: true }))
+      } catch {
+        // Ignore — endpoint may not exist on older backends
+      }
+    }
+
+    // -- Control plane (repo-grouped view) -----------------------------------
+
+    async function fetchControlPlane() {
+      try {
+        const data = await apiFetch<{ repos: ControlPlaneRepo[] }>("/api/devaipod/control-plane")
+        setStore("controlPlane", reconcile(data.repos, { key: "repo", merge: true }))
+      } catch {
+        // Ignore — endpoint may not exist on older backends
+      }
+    }
+
     // -- Polling setup ------------------------------------------------------
     // Use self-scheduling setTimeout loops instead of setInterval so the next
     // poll is only queued after the current one finishes.  This makes request
@@ -454,6 +536,28 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
     scheduleProposalPoll()
     onCleanup(() => clearTimeout(proposalTimer))
 
+    let devcontainerTimer: ReturnType<typeof setTimeout> | undefined
+    function scheduleDevcontainerPoll() {
+      if (disposed) return
+      devcontainerTimer = setTimeout(async () => {
+        await fetchDevcontainers()
+        scheduleDevcontainerPoll()
+      }, POD_POLL_MS)
+    }
+    scheduleDevcontainerPoll()
+    onCleanup(() => clearTimeout(devcontainerTimer))
+
+    let controlPlaneTimer: ReturnType<typeof setTimeout> | undefined
+    function scheduleControlPlanePoll() {
+      if (disposed) return
+      controlPlaneTimer = setTimeout(async () => {
+        await fetchControlPlane()
+        scheduleControlPlanePoll()
+      }, POD_POLL_MS)
+    }
+    scheduleControlPlanePoll()
+    onCleanup(() => clearTimeout(controlPlaneTimer))
+
     // Initial fetch — the effect tracks only refreshCounter; the async bodies
     // read store state (e.g. store.pods, store.launches) which must NOT be tracked
     // here or we'd create a feedback loop (fetch updates store → effect re-fires).
@@ -463,6 +567,9 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         fetchPods()
         fetchLaunches()
         fetchProposals()
+        fetchRecentSources()
+        fetchDevcontainers()
+        fetchControlPlane()
       })
     })
 
@@ -519,6 +626,8 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         setStore("launches", result.pod_name, { state: "launching" })
       }
       refresh()
+      // Refresh recent sources so the launcher picks up the new entry
+      fetchRecentSources()
       return result
     }
 
@@ -561,6 +670,42 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
         // ignore
       }
       fetchProposals()
+    }
+
+    async function launchDevcontainer(source: string, opts?: { name?: string; image?: string }) {
+      const body: Record<string, string> = { source }
+      if (opts?.name) body.name = opts.name
+      if (opts?.image) body.image = opts.image
+      const result = await apiFetch<{ success: boolean; message?: string }>(
+        "/api/devaipod/devcontainer/run",
+        { method: "POST", body: JSON.stringify(body) },
+      )
+      if (!result.success) {
+        throw new Error(result.message ?? "Devcontainer launch failed")
+      }
+      fetchDevcontainers()
+      return result
+    }
+
+    async function deleteDevcontainer(name: string) {
+      await apiFetch<void>(`/api/devaipod/devcontainer/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+      })
+      fetchDevcontainers()
+    }
+
+    async function stopDevcontainer(name: string) {
+      await apiFetch<void>(`${PODMAN_PODS}/${encodeURIComponent(name)}/stop`, {
+        method: "POST",
+      })
+      fetchDevcontainers()
+    }
+
+    async function startDevcontainer(name: string) {
+      await apiFetch<void>(`${PODMAN_PODS}/${encodeURIComponent(name)}/start`, {
+        method: "POST",
+      })
+      fetchDevcontainers()
     }
 
     async function getTitle(fullName: string): Promise<{ title: string | null }> {
@@ -606,7 +751,7 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
 
     // -- Derived state ------------------------------------------------------
 
-    const hasAdvisor = createMemo(() => store.pods.some((p) => p.Name === ADVISOR_POD_NAME))
+    const hasAdvisor = createMemo(() => store.pods.some((p) => p.Name.endsWith("-advisor")))
 
     const hasActiveLaunches = createMemo(
       () => Object.values(store.launches).some((l) => l.state === "launching"),
@@ -630,6 +775,15 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       get proposals() {
         return store.proposals
       },
+      get recentSources() {
+        return store.recentSources
+      },
+      get devcontainers() {
+        return store.devcontainers
+      },
+      get controlPlane() {
+        return store.controlPlane
+      },
       get connected() {
         return store.connected
       },
@@ -648,6 +802,10 @@ export const { use: useDevaipod, provider: DevaipodProvider } = createSimpleCont
       launchAdvisor,
       dismissLaunch,
       dismissProposal,
+      launchDevcontainer,
+      deleteDevcontainer,
+      stopDevcontainer,
+      startDevcontainer,
       getTitle,
       updateTitle,
       getGatorScopes,

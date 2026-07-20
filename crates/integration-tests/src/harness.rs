@@ -63,7 +63,8 @@ impl DevaipodHarness {
 
     fn start_inner(mock_agent: bool) -> Result<Self> {
         let port = find_free_port()?;
-        let binary = std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod".to_string());
+        let binary =
+            std::env::var("DEVAIPOD_PATH").unwrap_or_else(|_| "devaipod-server".to_string());
 
         let mut cmd = Command::new(&binary);
         cmd.args(["web", "--port", &port.to_string()])
@@ -192,6 +193,26 @@ impl DevaipodHarness {
         buf[start..].join("\n")
     }
 
+    /// Fetch structured diagnostics for a pod via the API.
+    pub fn pod_diagnostics(&self, pod_name: &str) -> Result<String> {
+        let full_name = if pod_name.starts_with("devaipod-") {
+            pod_name.to_string()
+        } else {
+            format!("devaipod-{pod_name}")
+        };
+        let (status, body) = self.get(&format!("/api/devaipod/pods/{full_name}/diagnostics"))?;
+        if status == 200 {
+            // Pretty-print the JSON for readability in error messages
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(serde_json::to_string_pretty(&json).unwrap_or(body))
+            } else {
+                Ok(body)
+            }
+        } else {
+            Ok(format!("(diagnostics returned HTTP {status}: {body})"))
+        }
+    }
+
     /// Create a pod from a local repo path and wait for it to appear in the
     /// pod list as "Running".
     ///
@@ -225,9 +246,20 @@ impl DevaipodHarness {
         // server spawns `devaipod run` in the background), so we need to
         // wait for it to complete.
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last_status = String::new();
         loop {
             if Instant::now() > deadline {
-                bail!("Pod '{full_name}' did not become Running within 120s");
+                // Gather diagnostics before bailing
+                let diag = self
+                    .pod_diagnostics(&full_name)
+                    .unwrap_or_else(|_| "(failed to fetch diagnostics)".to_string());
+                let stderr = self.recent_stderr(30);
+                bail!(
+                    "Pod '{full_name}' did not become Running within 120s\n\
+                     Last seen status: {last_status}\n\
+                     === pod diagnostics ===\n{diag}\n\
+                     === web server stderr ===\n{stderr}"
+                );
             }
 
             if let Ok((200, body)) = self.get("/api/devaipod/pods")
@@ -240,8 +272,13 @@ impl DevaipodHarness {
                 })
             {
                 let status = pod.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                if status.eq_ignore_ascii_case("running") {
-                    tracing::info!("Pod '{full_name}' is Running");
+                last_status = status.to_string();
+                // Accept both "Running" and "Degraded" — the latter happens when
+                // the service-gator container exits (expected for test repos with
+                // fake remote URLs), but the agent and api containers are healthy.
+                if status.eq_ignore_ascii_case("running") || status.eq_ignore_ascii_case("degraded")
+                {
+                    tracing::info!("Pod '{full_name}' is {status}");
                     return Ok(());
                 }
             }
@@ -285,12 +322,18 @@ impl DevaipodHarness {
         // This takes longer than Running because we need to wait for the
         // agent container to start and then exit.
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last_status = String::new();
         loop {
             if Instant::now() > deadline {
+                let diag = self
+                    .pod_diagnostics(&full_name)
+                    .unwrap_or_else(|_| "(failed to fetch diagnostics)".to_string());
                 let stderr = self.recent_stderr(30);
                 bail!(
                     "Pod '{full_name}' did not become Degraded within 120s\n\
-                     === web stderr ===\n{stderr}"
+                     Last seen status: {last_status}\n\
+                     === pod diagnostics ===\n{diag}\n\
+                     === web server stderr ===\n{stderr}"
                 );
             }
 
@@ -304,6 +347,7 @@ impl DevaipodHarness {
                 })
             {
                 let pod_status = pod.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                last_status = pod_status.to_string();
                 if pod_status.eq_ignore_ascii_case("degraded")
                     || pod_status.eq_ignore_ascii_case("exited")
                 {
@@ -321,6 +365,15 @@ impl DevaipodHarness {
 impl Drop for DevaipodHarness {
     fn drop(&mut self) {
         // Clean up tracked pods and their volumes.
+        // Compute workspace base dir for host-side cleanup
+        let ws_base = std::env::var("DEVAIPOD_HOST_WORKDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share/devaipod/workspaces"))
+            })
+            .ok();
+
         for pod in &self.pods {
             let _ = Command::new("podman")
                 .args(["pod", "rm", "-f", pod])
@@ -330,6 +383,17 @@ impl Drop for DevaipodHarness {
                 let _ = Command::new("podman")
                     .args(["volume", "rm", "-f", &vol])
                     .output();
+            }
+            // Remove host-side workspace directory.
+            // Use `podman unshare` because files are owned by container subuids.
+            if let Some(ref base) = ws_base {
+                let ws_dir = base.join(pod);
+                if ws_dir.exists() {
+                    let _ = Command::new("podman")
+                        .args(["unshare", "rm", "-rf"])
+                        .arg(&ws_dir)
+                        .output();
+                }
             }
         }
 
